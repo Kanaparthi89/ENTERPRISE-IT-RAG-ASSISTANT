@@ -219,3 +219,36 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .DS_Store
+
+# Python virtual environments and generated files
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Local databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Node dependencies and build output
+node_modules/
+dist/
+build/
+
+# Local uploads and private documents
+uploads/*
+!uploads/.gitkeep
+
+# Temporary editor and backup files
+*.bak
+*.bak2
+*~
+.DS_Store
+*.save

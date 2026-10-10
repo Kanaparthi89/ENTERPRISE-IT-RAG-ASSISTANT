@@ -24,15 +24,13 @@ def get_embedding_dimension(model_name: str | None = None) -> int:
     if not name:
         raise RuntimeError("Embedding model is not configured.")
 
-    normalized = name.lower()
+    if name.lower() not in EMBEDDING_DIMENSIONS:
+        raise ValueError(
+            f"Unsupported embedding model '{name}'. "
+            "Add its correct dimension to EMBEDDING_DIMENSIONS."
+        )
 
-    if normalized in EMBEDDING_DIMENSIONS:
-        return EMBEDDING_DIMENSIONS[normalized]
-
-    raise ValueError(
-        f"Unsupported embedding model '{name}'. "
-        "Add its correct dimension to EMBEDDING_DIMENSIONS."
-    )
+    return EMBEDDING_DIMENSIONS[name.lower()]
 
 
 def get_embeddings():
@@ -44,7 +42,7 @@ def get_embeddings():
 
         _embeddings = OpenAIEmbeddings(
             model=settings.embedding_model,
-           api_key=settings.openai_api_key.get_secret_value(),
+            api_key=settings.openai_api_key.get_secret_value(),
         )
 
     return _embeddings
@@ -57,20 +55,22 @@ def ensure_index():
     if not settings.pinecone_index_name:
         raise RuntimeError("Pinecone index name is not configured.")
 
-    desired_dimension = get_embedding_dimension()
-    pc = Pinecone(api_key=settings.pinecone_api_key.get_secret_value())
+    dimension = get_embedding_dimension()
+
+    pc = Pinecone(
+        api_key=settings.pinecone_api_key.get_secret_value()
+    )
 
     index_names = [item["name"] for item in pc.list_indexes()]
 
     if settings.pinecone_index_name in index_names:
         index_info = pc.describe_index(settings.pinecone_index_name)
 
-        if index_info.dimension != desired_dimension:
+        if index_info.dimension != dimension:
             raise RuntimeError(
                 f"Index dimension is {index_info.dimension}, but model "
-                f"'{settings.embedding_model}' requires "
-                f"{desired_dimension}. Use a matching index or model. "
-                "The existing index was not deleted."
+                f"'{settings.embedding_model}' requires {dimension}. "
+                "Use a matching index or model. The index was not deleted."
             )
 
         if not index_info.status["ready"]:
@@ -79,18 +79,13 @@ def ensure_index():
     else:
         pc.create_index(
             name=settings.pinecone_index_name,
-            dimension=desired_dimension,
+            dimension=dimension,
             metric="cosine",
-            spec=ServerlessSpec(
-                cloud="aws",
-                region="us-east-1",
-            ),
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
         )
 
         for _ in range(60):
-            index_info = pc.describe_index(
-                settings.pinecone_index_name
-            )
+            index_info = pc.describe_index(settings.pinecone_index_name)
 
             if index_info.status["ready"]:
                 break
@@ -123,8 +118,17 @@ def get_retriever():
     )
 
 
-def add_documents(chunks):
+def add_documents(chunks, ids=None):
+    """Add document chunks to Pinecone with optional stable IDs."""
     if not chunks:
         return []
+
+    if ids is not None and len(ids) != len(chunks):
+        raise ValueError(
+            "The number of IDs must match the number of document chunks."
+        )
+
+    if ids is not None:
+        return get_vectorstore().add_documents(chunks, ids=ids)
 
     return get_vectorstore().add_documents(chunks)
