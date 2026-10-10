@@ -1,76 +1,76 @@
-# ENTERPRISE-IT-RAG-ASSISTANT
+# Enterprise IT Support Agentic RAG Copilot
 
-# Enterprise ITL RAG Assistant
+An end-to-end **Forward Deployed Engineer (FDE) project** that transforms an Agentic Retrieval-Augmented Generation (RAG) workflow into a deployable enterprise IT support application.
 
-An end-to-end **Forward Deployed Engineer (FDE) project** that transforms an Agentic Retrieval-Augmented Generation (RAG) workflow into a practical enterprise IT support assistant. The application combines private knowledge retrieval, evidence evaluation, conditional web search, query rewriting, grounded answer generation, and a user-facing interface.
+The system combines private knowledge retrieval, evidence grading, conditional web search, query rewriting, grounded answer generation, source citations, workflow tracing, and a FastAPI backend. It is designed to help employees find reliable IT support information while giving engineers visibility into how answers are produced.
 
-The project is designed around a fictional enterprise environment and demonstrates how AI engineering can solve a real operational problem through workflow orchestration, backend development, knowledge integration, security, and user experience.
+The project uses a fictional enterprise environment to demonstrate how AI engineering, application development, retrieval systems, and security-conscious design can address practical business problems.
 
-**Core technologies:** Python, LangGraph, FastAPI, Pinecone, Hugging Face, Groq, Tavily, HTML, CSS, JavaScript, and SQLite.
+**Technology stack:** Python, FastAPI, LangGraph, OpenAI, Pinecone, Tavily, SQLite, HTML, CSS, JavaScript, and Pydantic Settings.
+
+**Project status:** Core workflow and API behavior have been exercised locally. Production deployment, comprehensive automated evaluation, and enterprise security certification remain separate milestones.
 
 ---
 
-## 1. Business Problem and Customer Context
+## 1. Business Problem
 
 ### Customer: BluePeak Technologies
 
-BluePeak Technologies is a fictional enterprise technology and retail operations company with approximately **5,000 employees** distributed across offices, warehouses, and remote locations.
+BluePeak Technologies is a fictional enterprise with approximately 5,000 employees working across offices, warehouses, and remote locations.
 
-The company's internal IT department maintains documentation covering account access, VPN configuration, multifactor authentication (MFA), approved software, device troubleshooting, network connectivity, and service-desk procedures.
+Its IT department maintains documentation covering VPN access, authentication, approved software, account troubleshooting, network connectivity, security procedures, and service-desk processes.
 
-As the organization grows, employees increasingly depend on the IT help desk for routine questions. Although answers may already exist in internal documentation, employees often struggle to find the correct procedure or determine whether an outdated document is still applicable.
+As the organization grows, employees repeatedly ask support teams questions whose answers may already exist in internal documentation.
 
-### The problem we are solving
+### Challenges
 
-The existing support process creates several operational challenges.
+- **Scattered knowledge:** Employees struggle to locate the correct procedure across multiple documents.
+- **Weak search relevance:** Keyword searches may return documents that mention a topic without answering the actual question.
+- **Unsupported AI answers:** A general-purpose LLM can generate plausible but unverified technical instructions.
+- **Changing external guidance:** Public cybersecurity recommendations and vendor documentation can change over time.
+- **Repeated support requests:** IT staff spend time answering routine questions instead of investigating complex incidents.
+- **Limited transparency:** Engineers need to understand why a source was selected, why retrieval failed, and when the system used external information.
 
-- **Scattered documentation:** Employees must search across multiple documents to find the right instructions.
-- **Poor search relevance:** Traditional keyword search can return documents that contain similar words but do not answer the actual question.
-- **Unreliable chatbot answers:** A general-purpose LLM may generate a plausible response without sufficient supporting evidence.
-- **Changing information:** Internal policies and external vendor guidance can change over time.
-- **Repeated support requests:** IT staff spend time answering common questions instead of resolving more complex incidents.
-- **Limited transparency:** Without a visible decision path, engineers may struggle to understand why an answer was produced or why retrieval failed.
+### Proposed solution
 
-### Example business scenario
+Build an AI-powered IT support assistant that:
+
+1. Prioritizes internal knowledge for company-specific questions.
+2. Evaluates retrieved evidence before generating an answer.
+3. Uses public search when appropriate and when internal evidence is insufficient.
+4. Rewrites unsuccessful queries and retries retrieval within controlled limits.
+5. Generates answers grounded in available evidence.
+6. Returns source citations and a workflow trace where supported.
+7. Provides REST API endpoints for application integration.
+8. Supports a path toward controlled document ingestion and ongoing knowledge-base maintenance.
+
+### Example scenario
 
 An employee asks:
 
-> "My company laptop connects to Wi-Fi, but I cannot access internal applications from home. How should I troubleshoot it?"
+> My company laptop connects to Wi-Fi, but I cannot access internal applications from home. How should I troubleshoot it?
 
-The assistant should first retrieve relevant private IT documentation, such as VPN setup and connectivity troubleshooting procedures. If the retrieved documents sufficiently answer the question, it should respond using that internal evidence without unnecessarily calling an external search service.
+The assistant searches the private IT knowledge base first. If the retrieved VPN and connectivity instructions are sufficient, it generates an answer from that evidence.
 
-Now consider another question:
+For another question:
 
-> "Has the vendor published any new guidance for the authentication issue affecting its latest desktop application release?"
+> According to NIST, what are the main steps in incident response?
 
-If the internal knowledge base does not contain sufficient evidence, the assistant should evaluate whether an external search is appropriate. It can then retrieve public information, assess its relevance, and answer with a clear indication that the information came from external sources.
+The system can route the request to official public sources, evaluate the returned evidence, and produce an answer with references to relevant NIST publications.
 
-The important distinction is that the assistant does not automatically search the web or generate an answer simply because a question was submitted. It makes retrieval and evidence decisions before responding.
+The objective is not to make every answer depend on a web search. It is to choose an appropriate information source and respond transparently when reliable evidence is unavailable.
 
-### Business goal
+### Business objective
 
-The goal is to build an enterprise IT support assistant that helps employees find reliable answers faster while giving engineers control over how information is retrieved and used.
-
-The system is designed to:
-
-1. Prioritize approved company documentation for internal IT questions.
-2. Evaluate retrieved evidence before generating an answer.
-3. Use external search when private documentation is insufficient and the question warrants public information.
-4. Rewrite unclear or unsuccessful queries and retry retrieval within a controlled limit.
-5. Avoid presenting unsupported information as established fact.
-6. Display the retrieval source and decision trace for debugging and auditing.
-7. Allow authorized personnel to upload additional company documents without modifying the application code.
-8. Expose the workflow through a web interface and REST API.
-
-**XYZ approach:** By combining private document retrieval, evidence grading, conditional search, and grounded generation in one workflow, the project aims to reduce repetitive information-search effort while improving answer traceability and the consistency of IT support responses. Actual reductions in ticket volume or response time would need to be measured through a pilot rather than assumed.
+By combining semantic retrieval, evidence evaluation, and source-aware generation, the project aims to reduce the effort required to find IT support information and improve answer traceability. Any reduction in support tickets, resolution time, or operating costs must be measured during a controlled pilot rather than assumed.
 
 ---
 
-## 2. Why This Is a Forward Deployed Engineer (FDE) Project
+## 2. Why This Is a Forward Deployed Engineer Project
 
-A Forward Deployed Engineer works at the intersection of customer requirements, software engineering, AI systems, and operational delivery. The objective is not simply to demonstrate that an LLM can answer questions; it is to build a solution that addresses a customer's workflow and can be integrated into a usable application.
+A Forward Deployed Engineer connects customer problems with working software. The role involves understanding operational requirements, integrating data sources, developing AI-enabled applications, validating behavior, and iterating based on real-world results.
 
-This project follows that approach by starting with BluePeak Technologies' IT support challenges and translating them into a working AI application design.
+This project demonstrates that approach by translating a fictional enterprise's IT support challenges into an application architecture and an agentic workflow.
 
 ### FDE delivery lifecycle
 
@@ -78,420 +78,523 @@ This project follows that approach by starting with BluePeak Technologies' IT su
 Customer Discovery
         |
         v
-Identify Support Bottlenecks
+Identify Operational Bottlenecks
         |
         v
-Define Requirements and Success Metrics
+Define Requirements and Test Scenarios
         |
         v
-Connect Internal Knowledge Sources
+Integrate Private Knowledge
         |
         v
 Build the Agentic RAG Workflow
         |
         v
-Expose the Workflow Through an API
+Expose Capabilities Through FastAPI
         |
         v
-Develop the Employee Interface
+Evaluate Retrieval and Answer Quality
         |
         v
-Add Access Controls and Audit Logging
+Improve Source Attribution and Reliability
         |
         v
-Test Retrieval, Routing, and Failure Cases
-        |
-        v
-Deploy, Monitor, and Improve
+Prepare Deployment and Monitoring
 ```
 
-### How the project demonstrates FDE skills
+### Engineering responsibilities demonstrated
 
-**Customer discovery and requirements:** The project translates repetitive IT support requests into specific system requirements, including private knowledge retrieval, source-aware responses, and controlled fallback behavior.
+- **Requirements engineering:** Translate repetitive IT questions into retrieval, routing, and response requirements.
+- **AI workflow engineering:** Coordinate classification, retrieval, evidence grading, query rewriting, and generation.
+- **Backend development:** Expose the AI workflow through a FastAPI application.
+- **Knowledge integration:** Connect private document retrieval with a vector database.
+- **External data integration:** Retrieve public information through Tavily when required.
+- **Reliability engineering:** Exercise routing, evidence sufficiency, and fallback behavior.
+- **Debugging and observability:** Use workflow traces and source metadata to understand execution decisions.
+- **Security-conscious development:** Identify controls needed for credentials, document uploads, access permissions, and audit records.
+- **Iterative validation:** Test realistic scenarios and use observed weaknesses to guide improvements.
 
-**Solution architecture:** LangGraph coordinates the retrieval and decision-making process, while FastAPI exposes the workflow through application endpoints. The frontend provides a practical way for employees to interact with the system.
+**STAR summary**
 
-**Knowledge integration:** Internal documentation is loaded, split into manageable chunks, embedded, and indexed for semantic retrieval. New documents can be added through a protected ingestion workflow.
-
-**Application engineering:** The notebook-style AI workflow is organized into backend modules and connected to a web interface, moving the project toward a maintainable application rather than an isolated experiment.
-
-**Reliability and security:** Evidence grading, retry limits, input validation, access controls, and audit logging help engineers understand the system's behavior and manage common failure cases.
-
-**Customer feedback and iteration:** Demo scenarios expose retrieval errors, weak evidence, and confusing responses. These findings can guide improvements to document quality, chunking, retrieval settings, prompts, and workflow decisions.
-
-**STAR summary:** The situation is an enterprise with repetitive IT support requests and scattered documentation. The task is to build a trustworthy assistant that uses internal knowledge first and handles missing evidence responsibly. The action is to integrate semantic retrieval, conditional agent routing, query rewriting, an API, and a user interface. The intended result is a more accessible and traceable support experience, with measurable operational improvements to be validated during testing.
+- **Situation:** Employees need reliable answers from internal IT documentation and public technical guidance.
+- **Task:** Build an assistant that selects appropriate sources, evaluates evidence, and avoids treating unsupported responses as verified facts.
+- **Action:** Implement a LangGraph-based workflow, connect retrieval and search services, expose API endpoints, and test representative security and troubleshooting questions.
+- **Result:** A working local application that has returned responses and source metadata for tested scenarios, with additional evaluation and production hardening identified as next steps.
 
 ---
 
-## 3. High-Level Architecture
+## 3. System Architecture
 
-The application separates the employee interface, request handling, AI orchestration, retrieval services, and audit storage. This modular design makes it easier to test individual components and replace infrastructure choices as requirements change.
+The application separates API handling, workflow orchestration, knowledge retrieval, external search, answer generation, and audit storage.
 
 ```text
-                 ┌────────────────────────┐
-                 │   BluePeak Employee    │
-                 └────────────┬───────────┘
-                              |
-                              v
-                 ┌────────────────────────┐
-                 │  Support Portal        │
-                 │  HTML / CSS / JS       │
-                 └────────────┬───────────┘
-                              |
-                       HTTPS / JSON
-                              |
-                              v
-                 ┌────────────────────────┐
-                 │  FastAPI Request Layer │
-                 │  Validation / Auth     │
-                 └────────────┬───────────┘
-                              |
-                              v
-                 ┌────────────────────────┐
-                 │  LangGraph Controller  │
-                 │  State + Routing       │
-                 └────────────┬───────────┘
-                              |
-                ┌─────────────┼─────────────┐
-                |             |             |
-                v             v             v
-       ┌────────────────┐ ┌─────────────┐ ┌────────────────┐
-       │ Private Search │ │ Public Web  │ │ Direct Reply   │
-       │ Pinecone +     │ │ Tavily      │ │ Simple Chat    │
-       │ Embeddings     │ │ Search      │ │                │
-       └───────┬────────┘ └──────┬──────┘ └────────────────┘
-               |                 |
-               └────────┬────────┘
-                        |
-                        v
-              ┌─────────────────────┐
-              │ Evidence Evaluation │
-              │ and Answer Synthesis│
-              │ Groq LLM             │
-              └──────────┬──────────┘
-                         |
-                         v
-              ┌─────────────────────┐
-              │ Response + Sources  │
-              │ + Workflow Trace    │
-              └──────────┬──────────┘
-                         |
-                         v
-              ┌─────────────────────┐
-              │ SQLite Audit Store  │
-              └─────────────────────┘
+                 Employee / API Client
+                          |
+                          v
+                 FastAPI Application
+                          |
+                          v
+                 LangGraph Workflow
+                          |
+              +-----------+-----------+
+              |           |           |
+              v           v           v
+         Private KB   Public Web   Direct Reply
+         Retrieval     Search      (when needed)
+              |           |
+              v           v
+          Pinecone      Tavily
+              |           |
+              +-----+-----+
+                    |
+                    v
+             Evidence Evaluation
+                    |
+                    v
+             Query Rewrite / Retry
+                    |
+                    v
+             Grounded Answer
+                    |
+                    v
+         Answer + Source Metadata
+                    |
+                    v
+          API Response / Trace
+                    |
+                    v
+            SQLite Audit Store
 ```
 
-The browser sends a question to FastAPI. The backend validates the request and passes it to LangGraph, which manages the workflow state and decides what action to take next. Retrieval services return candidate evidence, the grading steps evaluate whether that evidence is useful, and the LLM generates a response from the selected context. The API returns the answer along with source information and a workflow trace, while the audit service records appropriate execution metadata.
+The diagram describes the logical design. The exact execution path depends on the implemented graph and request type.
 
-The diagram represents the logical design. The exact execution order and persistence behavior depend on the implemented graph and API code.
+### Main components
+
+| Component             | Responsibility                                                     |
+| --------------------- | ------------------------------------------------------------------ |
+| FastAPI               | Receives requests, validates input, and returns API responses      |
+| LangGraph             | Coordinates workflow state and conditional transitions             |
+| OpenAI                | Provides configured LLM and embedding capabilities                 |
+| Pinecone              | Stores and retrieves document vectors                              |
+| Tavily                | Searches publicly available information                            |
+| SQLite                | Supports lightweight local audit persistence                       |
+| Pydantic Settings     | Loads and validates application configuration                      |
+| HTML, CSS, JavaScript | Provide the user-facing interface where enabled by the application |
+
+### Current provider configuration
+
+The project configuration uses OpenAI's `gpt-4o-mini` for chat and `text-embedding-3-small` for embeddings, along with Pinecone and Tavily. Confirm the active environment settings before deploying, because model availability and provider configuration can change.
+
+The embedding model used for indexing must match the model and vector dimensions used during retrieval.
 
 ---
 
 ## 4. Agentic RAG Workflow
 
-### Why use Agentic RAG?
+### Traditional RAG versus Agentic RAG
 
-Traditional RAG generally retrieves documents and sends the resulting context to an LLM for answer generation.
+A basic RAG pipeline usually follows:
 
 ```text
 Question → Retrieve Documents → Generate Answer
 ```
 
-This approach can work well when retrieval consistently returns relevant information. However, enterprise support questions can be ambiguous, the knowledge base may be incomplete, and some requests require current external information.
+This is useful when retrieval consistently returns relevant evidence. Enterprise questions, however, can be ambiguous, documentation can be incomplete, and some questions require public information.
 
-Agentic RAG introduces explicit decision points. Instead of assuming that the first retrieval result is sufficient, the workflow evaluates evidence and selects the next action based on the current state.
+Agentic RAG adds explicit decision-making and evaluation steps:
 
 ```text
-Employee Question
-        |
-        v
-Classify the Request
-        |
-        +------ Greeting / Simple Chat ------> Direct Response
-        |
-        v
-Search Private Knowledge Base
-        |
-        v
-Evaluate Retrieved Evidence
-        |
-        +------ Sufficient Evidence ---------> Internal Answer
-        |
-        v
-Determine Whether External Search Is Needed
-        |
-        v
+Question
+   |
+   v
+Route Request
+   |
+   +---- Simple Conversation ----> Direct Response
+   |
+   v
+Retrieve Private Knowledge
+   |
+   v
+Grade Retrieved Evidence
+   |
+   +---- Sufficient Evidence ---> Generate Answer
+   |
+   v
+Evaluate Need for Web Search
+   |
+   v
 Search Public Sources
-        |
-        v
-Evaluate External Evidence
-        |
-        +------ Sufficient Evidence ---------> External Answer
-        |
-        v
-Rewrite the Search Query
-        |
-        v
-Retry Private Retrieval
-        |
-        v
-Retry Limit / Evidence Check
-        |
-        +------ Evidence Found --------------> Grounded Answer
-        |
-        +------ Still Insufficient ----------> Safe Fallback
+   |
+   v
+Grade Web Evidence
+   |
+   +---- Sufficient Evidence ---> Generate Answer
+   |
+   v
+Rewrite Query / Retry
+   |
+   v
+Evidence Check
+   |
+   +---- Sufficient Evidence ---> Grounded Answer
+   |
+   +---- Insufficient Evidence -> Safe Fallback
 ```
 
-### Step 1 — Route the question
+### Workflow stages
 
-The workflow first identifies whether the message is a greeting or a request that needs knowledge retrieval. A simple greeting can receive a direct response without invoking vector search or public web search.
+**1. Request routing**
 
-For an IT support request, the workflow continues to private knowledge retrieval. This avoids unnecessary retrieval operations for messages that do not need them.
+The workflow classifies incoming questions and selects an appropriate path. Simple conversational requests can bypass unnecessary retrieval, while technical questions continue through the knowledge workflow.
 
-### Step 2 — Retrieve internal documentation
+**2. Private knowledge retrieval**
 
-The system converts the question into an embedding and searches the Pinecone index for semantically related chunks. This helps match questions to relevant documents even when employees use different wording from the original documentation.
+The system embeds the question and searches Pinecone for semantically related document chunks. Semantic retrieval helps identify relevant content even when the employee's wording differs from the wording in the original document.
 
-For example, a question about "getting into the office network from home" might retrieve a VPN setup document even if the document uses the phrase "remote access configuration."
+**3. Evidence grading**
 
-### Step 3 — Grade the private evidence
+The retrieved content is evaluated for relevance and sufficiency. A document mentioning a subject is not automatically sufficient evidence for a detailed technical answer.
 
-The workflow evaluates whether the retrieved content actually addresses the question. A document that merely mentions VPNs is not necessarily sufficient to explain how to configure a VPN connection.
+**4. Conditional web search**
 
-If the evidence is sufficient, the system generates an answer grounded in the internal documents. If the evidence is weak, the workflow determines whether external search is appropriate.
+When internal evidence is insufficient and external information is appropriate, the workflow can use Tavily to retrieve public sources. Official-source requests, such as questions explicitly asking for CISA or NIST guidance, can be routed to the external-search path.
 
-### Step 4 — Search public information when needed
+**5. Web evidence evaluation**
 
-Tavily searches publicly available sources for information relevant to the question. This branch is useful for questions about current vendor guidance, public service announcements, or information not covered by internal documentation.
+The workflow evaluates retrieved web evidence before using it to generate an answer. An official domain is useful for source selection, but the content must still be relevant to the actual question.
 
-External evidence is evaluated separately before being used for generation. A search result should not automatically be treated as correct simply because it is available online.
+**6. Query rewriting**
 
-### Step 5 — Rewrite the query and retry
+If evidence is insufficient, the workflow can rewrite the question into a more targeted search query. For example:
 
-If retrieval does not provide sufficient evidence, the workflow can rewrite the question into a more specific search query.
+- Original: "My login stopped working after the update."
+- Rewritten: "Troubleshooting enterprise application sign-in failures after a client software update."
 
-For example:
+The rewritten query can be used in another retrieval attempt according to the configured graph logic.
 
-- Original question: "My login keeps failing after the change. What now?"
-- Rewritten query: "Troubleshooting enterprise SSO login failures after an identity-provider configuration change."
+**7. Grounded answer generation**
 
-The rewritten query can be used to retry retrieval according to the implemented graph. Retry limits prevent the workflow from looping indefinitely.
+The model generates a response from the selected evidence. For external answers, the workflow is designed to associate inline numbered references with the source list returned by the API.
 
-### Step 6 — Generate a grounded response
+**8. Safe fallback**
 
-When sufficient evidence is available, the LLM generates an answer based on the selected context. The response should distinguish internal company guidance from public information and avoid adding unsupported technical instructions.
+When reliable evidence is unavailable, the application should explain the limitation rather than inventing a procedure, policy, or approval code.
 
-If sufficient evidence remains unavailable, the assistant should say that it could not verify the answer and recommend an appropriate next step, such as contacting the service desk.
+**9. Workflow tracing**
 
-### Step 7 — Return the decision trace
-
-The response can include the selected source, retrieval outcome, evidence grade, and relevant workflow steps. This makes it easier for engineers to understand why the system answered, searched externally, retried retrieval, or returned an insufficient-evidence response.
-
-**Important:** A workflow trace is not the same as a guarantee of correctness. Evidence quality, citation accuracy, access permissions, and answer faithfulness must still be tested.
-
----
-
-## 5. Technology Stack, Purpose, and Alternatives
-
-The technologies below are selected to support the project's current architecture. Alternatives are included to explain which components could be replaced if a customer's infrastructure, cost, latency, or security requirements change.
-
-| Layer | Selected technology | Purpose | Possible alternatives |
-|---|---|---|---|
-| Agent orchestration | LangGraph | Manages workflow state, conditional routing, evidence checks, and retries | LangChain chains, LlamaIndex workflows, custom Python state machine |
-| LLM inference | Groq | Runs supported LLMs for classification, grading, rewriting, and answer generation | OpenAI, Anthropic, Google Gemini, self-hosted models through vLLM |
-| Embeddings | Hugging Face `all-MiniLM-L6-v2` or configured embedding provider | Converts questions and document chunks into numerical vectors | OpenAI embeddings, BGE, E5, Cohere embeddings |
-| Vector database | Pinecone | Stores document vectors and supports semantic similarity retrieval | Qdrant, Weaviate, Chroma, Milvus, pgvector |
-| External search | Tavily | Retrieves relevant public web information when required | Bing Web Search, Brave Search, approved enterprise search APIs |
-| API framework | FastAPI | Exposes chat, health, and document-ingestion endpoints | Flask, Django REST Framework |
-| Frontend | HTML, CSS, JavaScript | Provides the employee chat experience and document-upload controls | React, Vue, Next.js |
-| Audit storage | SQLite | Stores lightweight execution and decision metadata | PostgreSQL, MySQL, a centralized logging platform |
-| Document processing | Python document loaders and chunking utilities | Extracts text from supported files and prepares searchable chunks | Unstructured, Apache Tika, cloud document-processing services |
-| Packaging | Docker | Packages the application and its runtime dependencies | Podman, virtual-machine deployment, managed containers |
-| Configuration | Environment variables and `.env` for local development | Separates configuration and credentials from source code | Cloud secret managers and platform-managed configuration |
-
-### Why these technologies?
-
-**LangGraph:** The core requirement is conditional decision-making rather than a single retrieval call. LangGraph provides explicit graph nodes, state transitions, and conditional edges, making the workflow easier to inspect and extend. A custom Python state machine could be sufficient for a smaller workflow, while LlamaIndex workflows are another option for retrieval-oriented applications.
-
-**Groq:** The project needs an LLM for routing, relevance grading, query rewriting, and answer generation. Groq provides access to supported models through an API. OpenAI, Anthropic, Gemini, and self-hosted inference are alternatives, depending on model quality, data-handling requirements, cost, and latency.
-
-**Embeddings:** Semantic retrieval requires a consistent method of converting documents and questions into vectors. The `all-MiniLM-L6-v2` model is a lightweight option that generates 384-dimensional embeddings and can run locally. OpenAI embeddings or BGE/E5 models are alternatives. The embedding model used during indexing must match the one used during query retrieval.
-
-**Pinecone:** A managed vector database reduces the operational work required to host and scale semantic search infrastructure. Qdrant, Weaviate, and pgvector are alternatives when self-hosting, infrastructure consolidation, or deployment control is important.
-
-**Tavily:** Public search is a fallback for questions that internal documentation cannot sufficiently answer. It helps the workflow access potentially current public information, which is then evaluated before use. Another approved search provider can be substituted if its API, licensing, and security requirements fit the deployment.
-
-**FastAPI:** The project needs a lightweight API layer between the browser and the AI workflow. FastAPI supports typed request models, validation, and API documentation. Flask is a viable alternative for a smaller application.
-
-**SQLite:** A local database is sufficient for a basic demonstration of query and decision-path logging. PostgreSQL or a centralized logging system is a better choice when multiple application instances, concurrent writes, retention policies, and production operations become important.
-
-**Docker:** Containerization helps make development and deployment environments more consistent. It is useful when the customer wants a reproducible application package that can be deployed on a laptop, virtual machine, or container platform.
-
-### Technology selection principle
-
-The purpose of this stack is not to use as many AI technologies as possible. Each component addresses a specific engineering requirement: orchestration, retrieval, generation, external information access, API delivery, user interaction, or observability.
-
-A production deployment should select providers based on the customer's security policies, data residency, cost, availability, operational requirements, and existing infrastructure.
-
----
-
-## 6. Project Structure
-
-*This section will be completed after the implementation is finalized. The directory tree, modules, tests, configuration files, and deployment assets will be documented to match the actual repository.*
+The API response can include trace entries such as:
 
 ```text
-[Project structure to be added after implementation]
+Router → OFFICIAL EXTERNAL SOURCES
+Web fallback → Tavily search
+Web evidence grade → GOOD
+Answer generation → WEB SEARCH
 ```
+
+These traces help developers inspect the application's decision path. They do not, by themselves, prove that the final answer is correct.
 
 ---
 
-## 7. Setup and Installation
+## 5. Source Attribution and Citation Handling
 
-The following setup describes the intended local development workflow. Verify the final dependency versions and configuration names against the implemented code before treating these commands as a tested installation guide.
+Source attribution is important because enterprise users need to distinguish verified evidence from unsupported generated text.
+
+The external-answer workflow has been updated to:
+
+- Filter out search results that lack usable HTTP(S) URLs or content.
+- Restrict results to explicitly requested official domains when those domains are detected.
+- Deduplicate identical URLs after basic URL normalization.
+- Limit the number of sources included in the evidence context.
+- Present numbered source evidence to the answer-generation model.
+- Ask the model to use inline references such as `[1]` and `[2]`.
+- Return only source entries whose reference numbers appear in the generated answer.
+
+### Citation validation
+
+The application has been exercised with official-source questions about:
+
+- Remote-access security using CISA guidance.
+- Incident response using NIST resources.
+- Phishing protection using CISA resources.
+
+The observed responses included official source URLs and inline numbered references.
+
+These tests demonstrate that source retrieval and citation generation are functioning for the tested examples. They do not establish that every individual claim is fully supported by its cited source.
+
+### Known citation-quality improvements
+
+Further work should include:
+
+1. More robust URL canonicalization to eliminate duplicate pages with different URL forms.
+2. Claim-level citation evaluation to confirm that each recommendation is supported by the source attached to it.
+3. Validation that every inline reference maps to an existing source entry.
+4. Tests for fabricated, invalid, or unused reference numbers.
+5. More precise source filtering when a question explicitly requests one authority, such as NIST.
+6. Automated evaluation of source relevance and answer faithfulness.
+
+**Important distinction:** Citation presence is not the same as citation correctness. The goal is to establish both a valid reference and a clear relationship between the cited source and the statement it supports.
+
+---
+
+## 6. Technology Stack
+
+| Technology                      | Purpose                  | Why it is used                                                    |
+| ------------------------------- | ------------------------ | ----------------------------------------------------------------- |
+| Python                          | Application language     | Supports AI integration, retrieval, and backend development       |
+| FastAPI                         | REST API framework       | Provides request validation and API endpoints                     |
+| LangGraph                       | Workflow orchestration   | Supports stateful routing, conditional transitions, and retries   |
+| OpenAI `gpt-4o-mini`            | LLM inference            | Supports configured workflow tasks such as grading and generation |
+| OpenAI `text-embedding-3-small` | Embeddings               | Converts text into vectors for semantic retrieval                 |
+| Pinecone                        | Vector database          | Stores and searches embedded document chunks                      |
+| Tavily                          | External web search      | Retrieves public evidence when needed                             |
+| SQLite                          | Local audit storage      | Provides lightweight persistence for development                  |
+| Pydantic Settings               | Configuration management | Loads typed application settings                                  |
+| HTML / CSS / JavaScript         | Frontend                 | Supports employee interaction through a web interface             |
+| Uvicorn                         | ASGI server              | Runs the FastAPI application locally                              |
+| Pytest                          | Testing framework        | Supports automated tests where implemented                        |
+
+### Alternatives
+
+- **Vector databases:** Qdrant, Weaviate, pgvector, and Milvus.
+- **LLM providers:** Other hosted providers or self-hosted inference, depending on customer requirements.
+- **Workflow orchestration:** Custom Python state machines or other workflow frameworks.
+- **Audit storage:** PostgreSQL or a centralized logging platform for larger deployments.
+- **Frontend:** React, Vue, or Next.js for a richer user experience.
+
+Technology selection should reflect customer requirements for privacy, data residency, cost, latency, availability, and operational complexity.
+
+---
+
+## 7. Repository Structure
+
+The project is organized around a modular application architecture. The tree below illustrates the principal components; verify optional scripts and filenames against the final repository before using them.
+
+```text
+ENTERPRISE-IT-RAG-ASSISTANT/
+├── app/
+│   ├── main.py                 # FastAPI application entry point
+│   ├── api/
+│   │   └── routes.py           # API routes
+│   ├── rag/
+│   │   ├── workflow.py         # Agentic RAG workflow
+│   │   └── state.py            # Workflow state and schemas
+│   ├── services/
+│   │   └── audit.py            # Audit persistence
+│   ├── ingestion/              # Document ingestion components
+│   ├── vectorstore/             # Pinecone integration
+│   ├── templates/
+│   │   └── index.html          # Frontend template, if enabled
+│   └── static/                  # Static frontend assets
+├── data/
+│   └── sample_kb/               # Sample knowledge-base documents
+├── tests/                       # Automated tests, if present
+├── .env.example                 # Example configuration
+├── .gitignore
+├── requirements.txt
+├── run.py                       # Optional application entry point
+└── README.md
+```
+
+The workflow module coordinates routing, retrieval, evidence grading, external search, query rewriting, and response generation. The API layer exposes application functionality, while configuration and service modules keep infrastructure details separate from the main workflow.
+
+---
+
+## 8. Local Setup
 
 ### Prerequisites
 
-Install the following before starting:
+- Python version compatible with the pinned dependencies.
+- Git.
+- OpenAI API access for the configured model and embedding provider.
+- Pinecone credentials and a correctly configured vector index.
+- Tavily credentials if external search is enabled.
 
-- Python 3.11 or another Python version supported by the project's dependencies.
-- Git for repository management.
-- A Pinecone account and API key.
-- A Groq API key.
-- A Tavily API key if external search is enabled.
-- An embedding provider and credentials if the configured embedding model uses a hosted API.
-- Docker, optionally, if you want to run the containerized application.
-
-If the project uses a local Hugging Face embedding model, it can download model files during initial setup. Make sure your machine has internet access for the first download and enough disk space for the model and document index.
-
-### Step 1 — Clone the repository
-
-Replace the placeholder repository URL with the actual GitHub repository URL.
+### Step 1: Navigate to the repository
 
 ```bash
-git clone <YOUR_REPOSITORY_URL>
-cd <YOUR_REPOSITORY_DIRECTORY>
+cd /Users/Downloads/projects/enterprise-ai-projects/ENTERPRISE-IT-RAG-ASSISTANT
 ```
 
-If the repository already exists locally, open a terminal in its root directory instead.
+### Step 2: Activate the virtual environment
 
-### Step 2 — Create a virtual environment
+```bash
+source .venv/bin/activate
+```
 
-Create an isolated Python environment so the project's dependencies do not interfere with other Python projects.
-
-**macOS/Linux**
+If the virtual environment does not exist, create it:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-**Windows PowerShell**
-
-```powershell
-py -m venv .venv
-.venv\Scripts\Activate.ps1
-```
-
-Verify the active Python interpreter:
-
-```bash
-python --version
-python -m pip --version
-```
-
-### Step 3 — Install dependencies
-
-Install the packages listed in the project's dependency file.
+### Step 3: Install dependencies
 
 ```bash
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-If a dependency fails to install, check the Python version and package compatibility before changing package versions. Once the project works, pin compatible versions in `requirements.txt` to improve reproducibility.
+### Step 4: Configure environment variables
 
-### Step 4 — Configure API credentials
+Create a local `.env` file based on `.env.example`. Use the actual variable names expected by the application's settings module.
 
-Create a `.env` file in the project root. Use the following as a configuration template, and remove variables that the final implementation does not use.
+Typical configuration categories include:
 
 ```dotenv
-# --------------------------------------------------
-# Application
-# --------------------------------------------------
-APP_NAME="Enterprise ITL RAG Assistant"
-APP_ENV=development
-APP_HOST=127.0.0.1
-APP_PORT=8000
-LOG_LEVEL=INFO
-
-# --------------------------------------------------
-# LLM Provider: Groq
-# --------------------------------------------------
-GROQ_API_KEY=your_groq_api_key
-GROQ_MODEL=your_supported_groq_model
-
-# --------------------------------------------------
-# Embeddings
-# --------------------------------------------------
-EMBEDDING_PROVIDER=huggingface
-EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-EMBEDDING_DIMENSION=384
-
-# Optional hosted embedding provider
-OPENAI_API_KEY=
+OPENAI_API_KEY=your_openai_api_key
 OPENAI_MODEL=gpt-4o-mini
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 
-# --------------------------------------------------
-# Pinecone Vector Database
-# --------------------------------------------------
 PINECONE_API_KEY=your_pinecone_api_key
-PINECONE_INDEX_NAME=enterprise-itl-rag
-PINECONE_NAMESPACE=bluepeak-it-support
+PINECONE_INDEX_NAME=fde-it-support-rag
+PINECONE_NAMESPACE=company-it-kb
 
-# --------------------------------------------------
-# Public Web Search
-# --------------------------------------------------
 TAVILY_API_KEY=your_tavily_api_key
-ENABLE_WEB_SEARCH=true
-
-# --------------------------------------------------
-# Document Ingestion and Access Control
-# --------------------------------------------------
-ADMIN_API_KEY=replace_with_a_long_random_secret
-MAX_UPLOAD_MB=10
-UPLOAD_DIR=uploads
-
-# --------------------------------------------------
-# Retrieval and Workflow
-# --------------------------------------------------
-TOP_K=4
-MAX_RETRIES=2
-
-# --------------------------------------------------
-# Audit Logging
-# --------------------------------------------------
-AUDIT_DB_PATH=./audit.db
 ```
 
-**Configuration notes:**
+These are representative names, not a substitute for checking the project's actual settings definitions. Add other variables only when the implementation uses them.
 
-- The fictional customer name appears in the namespace for demonstration purposes. Change it if the application is configured for another customer.
-- `GROQ_MODEL` must contain a model identifier supported by the Groq account and API at deployment time.
-- `EMBEDDING_PROVIDER` is illustrative unless the implementation explicitly supports provider selection.
-- `OPENAI_API_KEY` and `OPENAI_EMBEDDING_MODEL` are only needed if the code actually uses OpenAI services. A local Hugging Face embedding model does not require an OpenAI API key.
-- `EMBEDDING_DIMENSION` must match the selected embedding model and the Pinecone index dimension.
-- `TOP_K` controls the number of candidate chunks retrieved, if this setting is supported by the code.
-- `MAX_RETRIES` should align with the graph's actual retry logic. It should not be assumed to represent the exact number of graph transitions without inspecting the implementation.
-- `ENABLE_WEB_SEARCH` should be enforced by the backend if it is intended to disable public search.
-- `MAX_UPLOAD_MB` should be enforced by the API, not merely declared in configuration.
+Never commit real credentials to version control.
 
-### Step 5 — Protect secrets
+### Step 5: Configure the vector index
 
-Never commit `.env` or real API keys to GitHub.
+Ensure the Pinecone index exists and its vector dimension matches the configured embedding model. Use the same index and namespace during ingestion and retrieval.
 
-Add these entries to `.gitignore` if they are not already present:
+If the application has an ingestion script, follow its instructions to index the sample knowledge-base documents. Verify successful ingestion before evaluating retrieval quality.
+
+### Step 6: Start the API
+
+The project can be started with Uvicorn when `app.main` exposes the FastAPI application:
+
+```bash
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Alternatively, use the repository's `run.py` if that is the configured entry point.
+
+### Step 7: Open the application
+
+- API documentation: `http://127.0.0.1:8000/docs`
+- Health endpoint: `http://127.0.0.1:8000/health`
+- API health endpoint: `http://127.0.0.1:8000/api/health`
+- Chat endpoint: `http://127.0.0.1:8000/api/chat`
+
+The homepage and frontend availability depend on the current application configuration.
+
+---
+
+## 9. API Usage
+
+### Health check
+
+```bash
+curl -s http://127.0.0.1:8000/api/health
+```
+
+The local health endpoint has returned:
+
+```json
+{
+  "status": "ok",
+  "service": "Enterprise IT Support Agentic RAG Copilot"
+}
+```
+
+### Submit a chat question
+
+```bash
+curl -s --max-time 60 -X POST http://127.0.0.1:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"question":"According to NIST, what are the main steps in incident response? Cite official NIST sources."}'
+```
+
+The tested API response contains fields such as:
+
+- `request_id`: Identifier for the request.
+- `answer`: Generated response.
+- `source_used`: Selected source path.
+- `trace`: Workflow execution summary.
+- `citations`: Returned source titles and URLs.
+- `rewritten_query`: Search query metadata when available.
+
+The exact fields can vary with the API schema and execution path.
+
+### Example source-aware response
+
+A tested NIST incident-response question returned official NIST resources, including the *Computer Security Incident Handling Guide* and the NIST Computer Security Resource Center incident-response page.
+
+A tested CISA phishing question returned CISA-related source URLs and inline numbered references.
+
+These examples confirm that the application can retrieve public security information and return source metadata for the tested scenarios. They are not a substitute for comprehensive citation-faithfulness testing.
+
+---
+
+## 10. Validation and Testing
+
+Testing is necessary to establish that the workflow makes appropriate decisions and handles failures safely.
+
+### Checks performed
+
+| Check                           | Observed result                     | Interpretation                                                                            |
+| ------------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------- |
+| Python syntax compilation       | Passed for `app/rag/workflow.py`    | The tested module compiled without a syntax error                                         |
+| Remote-access security question | Successful response                 | CISA-related results and inline citations were returned                                   |
+| NIST incident-response question | Successful response                 | Official NIST source URLs were returned                                                   |
+| CISA phishing question          | Successful response                 | CISA-related source URLs and inline citations were returned                               |
+| Workflow trace                  | Present in the tested API responses | The response exposed routing, search, grading, and generation steps                       |
+| Citation deduplication          | Needs improvement                   | Some CISA pages appeared under different URL forms                                        |
+| Claim-to-source alignment       | Needs further testing               | Inline references were present, but claim-level support was not independently established |
+
+### Syntax check
+
+The following command was executed successfully:
+
+```bash
+python -m py_compile app/rag/workflow.py
+```
+
+A successful syntax compilation confirms that Python can compile the module. It does not validate external service connectivity, answer accuracy, authorization controls, or overall application correctness.
+
+### Recommended automated test suite
+
+The next stage is to build repeatable tests covering:
+
+- Routing for greetings, internal IT questions, and official-source requests.
+- Retrieval relevance and expected document selection.
+- Evidence grading for both relevant and irrelevant documents.
+- Query rewriting and retry-limit enforcement.
+- Behavior when private and public evidence are both insufficient.
+- Citation-number validity and URL deduplication.
+- API input validation and error handling.
+- Missing credentials, timeouts, and provider failures.
+- Authorized and unauthorized document ingestion.
+- Audit-record completeness and protection of sensitive data.
+
+Run the automated tests when the suite is present:
+
+```bash
+pytest -q
+```
+
+This command is a recommended validation step; do not interpret it as evidence that all tests have already passed.
+
+---
+
+## 11. Security and Integrity Considerations
+
+Security is particularly important when an AI assistant can access private enterprise documentation or accept uploaded files.
+
+The current project demonstrates source-aware workflow behavior and basic local validation. A formal security audit, penetration test, or production-readiness certification should not be claimed without separate evidence.
+
+### Secrets management
+
+- Keep `.env` out of version control.
+- Use `.env.example` to document required configuration without exposing credentials.
+- Rotate any credential accidentally committed to a repository.
+- Use a managed secret store for production deployments.
+
+Example `.gitignore` entries:
 
 ```gitignore
 .env
@@ -500,420 +603,188 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 audit.db
-uploads/*
-!uploads/.gitkeep
 ```
 
-Use strong, randomly generated secrets for administrative access. In production, prefer a managed secret store and proper authentication rather than a shared static API key.
+Review the existing `.gitignore` before modifying it.
 
-### Step 6 — Create and configure the Pinecone index
+### Input validation
 
-Create a Pinecone index with the vector dimension and similarity configuration required by the selected embedding model.
+The API should validate incoming request schemas, impose reasonable question-length limits, and handle malformed input without exposing internal exceptions.
 
-For `sentence-transformers/all-MiniLM-L6-v2`, the usual embedding dimension is 384. If the implementation uses `text-embedding-3-small` instead, its configured output dimension must match the index and embedding request.
+Document-ingestion endpoints should enforce file-size limits, supported file types, content validation, and safe file handling.
 
-Use the configured index name and namespace consistently during document ingestion and retrieval. The namespace helps organize vectors, but it is not a substitute for authorization or tenant-level data isolation.
+### Authentication and authorization
 
-If the application creates indexes programmatically, follow the implementation's initialization logic rather than creating a conflicting index manually.
+Administrative operations such as document ingestion should require appropriate authentication and authorization. A shared API key can serve as a basic prototype control but is not equivalent to enterprise identity management.
 
-### Step 7 — Load the sample knowledge base
+For production use, consider an identity provider, role-based access control, and document-level authorization.
 
-After placing the sample IT documents in the configured data directory, run the project's ingestion script if one is provided.
+### Retrieval and tenant isolation
 
-```bash
-python ingest_sample_kb.py
-```
+Pinecone namespaces help organize vectors, but they do not independently guarantee that users can only access authorized documents.
 
-The intended ingestion pipeline is:
+A production system must enforce access permissions at retrieval time and prevent cross-tenant data exposure.
 
-```text
-Internal IT Documents
-        |
-        v
-File Validation and Text Extraction
-        |
-        v
-Text Cleaning and Chunking
-        |
-        v
-Embedding Generation
-        |
-        v
-Pinecone Vector Indexing
-        |
-        v
-Knowledge Available for Retrieval
-```
+### Prompt injection and untrusted content
 
-Check the script output and Pinecone index statistics to verify that the documents were indexed successfully. The script name and directory must match the final repository.
+Retrieved documents and web pages may contain malicious or misleading instructions. The application should treat retrieved content as untrusted evidence, not as instructions that can override system behavior or grant new permissions.
 
-### Step 8 — Start the application
+Future hardening should include adversarial tests involving prompt injection in documents and search results.
 
-If `run.py` is the entry point in the completed repository:
+### Citation integrity
 
-```bash
-python run.py
-```
+The workflow is designed to associate numbered inline references with retrieved sources. Further validation is needed to ensure that every reference is valid, every returned URL is normalized, and every cited source supports the claim it accompanies.
 
-Alternatively, if the application exposes `app` from `app.main`, start it with Uvicorn:
+### Audit logging and privacy
 
-```bash
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-```
+Audit records can support debugging and operational investigation. They should capture only the information necessary for the stated purpose.
 
-Use the command that matches the actual project entry point. Do not run both commands simultaneously unless the application is deliberately designed for that setup.
+Avoid unnecessarily storing API keys, authentication tokens, sensitive document contents, or personal information in logs. Define access controls, retention periods, and deletion procedures before production use.
 
-Open the local application:
+### Dependency and deployment security
 
-- Web interface: `http://127.0.0.1:8000`
-- API documentation: `http://127.0.0.1:8000/docs`
-- Health check: `http://127.0.0.1:8000/api/health`
+Recommended checks include dependency vulnerability scanning, secret scanning, code review, container image scanning, and restricting network access to required services.
 
-These addresses assume that the app serves its frontend at `/` and exposes the documented health endpoint.
-
-### Step 9 — Run tests
-
-Run the project's available test suite:
-
-```bash
-pytest -q
-```
-
-Start with document-ingestion tests, then add tests for routing, retrieval, evidence grading, query rewriting, retry limits, source attribution, API validation, and protected document uploads.
-
-Tests that call hosted LLMs or external search APIs may require credentials and incur usage costs. Where practical, use mocks and deterministic test fixtures for unit tests.
-
-### Step 10 — Run with Docker (optional)
-
-If a Dockerfile is included in the completed project:
-
-```bash
-docker build -t enterprise-itl-rag-assistant .
-docker run --rm -p 8000:8000 --env-file .env \
-  enterprise-itl-rag-assistant
-```
-
-This example assumes the Docker image starts the application and listens on port 8000. Verify the final `Dockerfile` before using these commands. Never bake secrets into the image.
+These are recommended hardening measures, not claims that a full security assessment has already been completed.
 
 ---
 
-## 8. Environment Variable Reference
+## 12. Cybersecurity Knowledge Demonstration: CISA and NIST
 
-The following table explains the purpose of the configuration variables and when they are required. It reflects the proposed configuration template; the final table should be reconciled with the variables read by the actual application.
+The project has been exercised with questions about public cybersecurity guidance, demonstrating how the external-source workflow can retrieve relevant official material.
 
-| Variable | Purpose | Required? |
-|---|---|---|
-| `APP_NAME` | Identifies the application in logs and metadata | Optional |
-| `APP_ENV` | Selects the runtime environment, such as development or production | Optional |
-| `APP_HOST` | Configures the server bind address if supported by the entry point | Optional |
-| `APP_PORT` | Configures the server port if supported by the entry point | Optional |
-| `LOG_LEVEL` | Controls logging verbosity | Optional |
-| `GROQ_API_KEY` | Authenticates requests to Groq | Required when Groq is used |
-| `GROQ_MODEL` | Selects the model used for workflow tasks | Required by the configured provider client |
-| `EMBEDDING_PROVIDER` | Selects a supported embedding implementation, if provider switching is implemented | Conditional |
-| `EMBEDDING_MODEL` | Identifies the local or configured embedding model | Required |
-| `EMBEDDING_DIMENSION` | Documents or configures the vector dimension expected by the application | Conditional |
-| `OPENAI_API_KEY` | Authenticates OpenAI API requests | Conditional |
-| `OPENAI_MODEL` | Configures the OpenAI chat model if used | Conditional |
-| `OPENAI_EMBEDDING_MODEL` | Configures OpenAI embeddings if used | Conditional |
-| `PINECONE_API_KEY` | Authenticates Pinecone requests | Required when Pinecone is used |
-| `PINECONE_INDEX_NAME` | Identifies the vector index | Required or defaulted |
-| `PINECONE_NAMESPACE` | Organizes vectors within the index | Optional or defaulted |
-| `TAVILY_API_KEY` | Authenticates public search requests | Required when Tavily search is enabled |
-| `ENABLE_WEB_SEARCH` | Enables or disables the external-search path if implemented | Optional |
-| `ADMIN_API_KEY` | Protects administrative endpoints in a basic demonstration | Required if this authentication method is used |
-| `MAX_UPLOAD_MB` | Sets an upload-size limit if enforced by the API | Optional |
-| `UPLOAD_DIR` | Defines the location for temporary or stored uploads | Optional |
-| `TOP_K` | Sets the candidate retrieval count if supported | Optional |
-| `MAX_RETRIES` | Controls retry behavior if read by the workflow | Optional |
-| `AUDIT_DB_PATH` | Defines the SQLite audit database location | Optional |
+### CISA: Remote-access security
 
-**Important implementation detail:** Environment variables do not automatically change application behavior. Every setting that is intended to be configurable must be read, validated, and used by the relevant code. Keep `.env.example` synchronized with the actual settings so developers do not configure variables that the application ignores.
+A test asked for three important practices for securing remote access to a corporate network.
+
+The application returned CISA resources related to securing remote-access software, with inline numbered references and source metadata.
+
+This scenario demonstrates external search, evidence evaluation, and source-aware generation.
+
+### NIST: Incident response
+
+A test asked:
+
+> According to NIST, what are the main steps in incident response?
+
+The application returned a response discussing preparation, detection and analysis, containment, eradication, recovery, and post-incident activity, with official NIST references.
+
+**Important versioning note:** The cited *Computer Security Incident Handling Guide*, NIST SP 800-61 Rev. 2, describes the traditional incident-handling lifecycle. NIST has since published Rev. 3, which reframes incident response within the Cybersecurity Framework 2.0. The appropriate reference depends on the question and the version of guidance being discussed.
+
+### CISA: Phishing protection
+
+A test asked how an organization should protect against phishing attacks.
+
+The application returned CISA-related material discussing phishing awareness, verification of suspicious messages, education, and reporting.
+
+The observed response also revealed an improvement opportunity: the same underlying pages appeared through multiple URL formats, and the references were not yet verified at the individual-claim level.
+
+### What these tests demonstrate
+
+- The application can route official-source requests to web search.
+- External evidence can be evaluated before answer generation.
+- The API can return public source URLs and inline references.
+- Workflow traces can expose the selected search and generation path.
+- Realistic cybersecurity questions can be used to identify weaknesses in citation quality and retrieval relevance.
+
+These tests are application behavior checks. They do not certify that the system is compliant with NIST, CISA, HIPAA, SOC 2, or any other security or regulatory framework.
 
 ---
 
-## 9. Demo Scenarios and Expected Behavior
-
-These scenarios are designed to demonstrate the assistant's decisions, not merely the quality of its final answers. Exact traces depend on the documents indexed, retrieval settings, grading prompts, and workflow implementation.
-
-### Demo A — Internal VPN troubleshooting
-
-**Question**
-
-> "I am working from home. How do I connect my laptop to the company network?"
-
-**Expected behavior**
-
-The router identifies an IT support request. The workflow retrieves the company's VPN instructions, grades the retrieved evidence, and generates an answer from the private knowledge base when the evidence is sufficient.
-
-**Illustrative trace**
-
-```text
-Question Received
-→ IT Support Route
-→ Private Knowledge Retrieval
-→ Evidence Grade: GOOD
-→ Generate Internal Answer
-→ Return Private-KB Source
-```
-
-**Teaching point:** Internal company guidance is the preferred source for internal procedures. A successful private retrieval should not require a public web search.
-
-**XYZ perspective:** By retrieving the approved procedure directly, the assistant aims to reduce the effort employees spend locating internal instructions.
-
-### Demo B — Security policy and MFA
-
-**Question**
-
-> "A support technician asked me to read out my one-time MFA code. Is that allowed?"
-
-**Expected behavior**
-
-The assistant retrieves the internal security policy and uses its explicit instructions to answer. If the policy says that employees must never disclose MFA codes, the answer should state that rule and advise the employee to follow the company's reporting procedure if the request appears suspicious.
-
-**Illustrative trace**
-
-```text
-Question Received
-→ Private-KB Retrieval
-→ Security Policy Retrieved
-→ Evidence Grade: GOOD
-→ Generate Policy-Based Answer
-→ Return Internal Source
-```
-
-**Teaching point:** A general LLM may know common security advice, but retrieval allows the answer to reflect the fictional company's own documented policy.
-
-**Testing note:** Verify that the expected policy actually exists in the indexed sample documents before presenting this as a successful retrieval demonstration.
-
-### Demo C — Current vendor guidance
-
-**Question**
-
-> "Where can I find the latest public guidance for a Microsoft Teams connectivity incident?"
-
-**Expected behavior**
-
-If the internal knowledge base does not contain sufficient evidence and the question requires current public information, the workflow can use Tavily to retrieve relevant public sources. The evidence-grading step determines whether the returned material is suitable for an answer.
-
-**Illustrative trace**
-
-```text
-Question Received
-→ Private-KB Retrieval
-→ Evidence Grade: WEAK
-→ Tavily Search
-→ External Evidence Evaluation
-→ Generate Answer with Public Sources
-→ Label Source as External
-```
-
-**Teaching point:** The assistant can change its information source instead of presenting incomplete internal documentation as the latest public guidance.
-
-**Testing note:** This is an expected behavior, not a guarantee that Tavily will return relevant results every time. The demo should display actual retrieved source titles or URLs when available.
-
-### Demo D — Ambiguous troubleshooting question
-
-**Question**
-
-> "My work apps stopped signing in after an update. How do I fix this?"
-
-**Expected behavior**
-
-The initial question may be too broad to retrieve the right instructions. The workflow evaluates the first results, rewrites the query into a more specific search phrase, and retries according to the configured graph logic.
-
-**Illustrative trace**
-
-```text
-Question Received
-→ Initial Private Retrieval
-→ Evidence Grade: WEAK
-→ Query Rewriting
-→ Retry Retrieval
-→ Grade New Evidence
-→ Grounded Answer or Safe Fallback
-```
-
-A possible rewritten query is:
-
-> "Troubleshooting corporate application sign-in failures following a client software update."
-
-**Teaching point:** Query rewriting can improve retrieval when the employee's wording differs from the language used in the documentation. Retry limits help prevent repeated, unproductive search attempts.
-
-**Testing note:** To demonstrate this reliably, use a controlled dataset and verify that the initial query retrieves weak evidence while the rewritten query retrieves the intended document.
-
-### Demo E — Simple greeting
-
-**Question**
-
-> "Hi, can you help me?"
-
-**Expected behavior**
-
-The router classifies the message as a greeting or simple conversational request and returns a direct response.
-
-**Illustrative trace**
-
-```text
-Question Received
-→ Direct Conversation Route
-→ Generate Short Response
-→ Return to User
-```
-
-**Teaching point:** Not every message requires vector retrieval, web search, or a complex agent workflow. Routing simple requests directly can reduce unnecessary latency and API usage.
-
-### Demo F — No sufficient evidence
-
-**Question**
-
-> "What is the internal approval code for a new hardware procurement exception?"
-
-Assume that the available internal documents and permitted external sources do not contain the answer.
-
-**Expected behavior**
-
-The workflow should not invent an approval code. After its allowed retrieval attempts, it should explain that the answer could not be verified and recommend contacting the appropriate internal team.
-
-**Illustrative trace**
-
-```text
-Question Received
-→ Private-KB Retrieval
-→ Evidence Grade: WEAK
-→ Permitted Fallback / Retry
-→ Evidence Still Insufficient
-→ Safe Fallback Response
-```
-
-**Teaching point:** A reliable enterprise assistant must know when it lacks enough evidence to answer. A transparent failure is preferable to an unsupported answer presented with confidence.
-
-### Demo G — Upload a new policy
-
-**Action**
-
-An authorized administrator uploads a new company IT policy in a supported format.
-
-**Expected behavior**
-
-The API validates the upload, extracts the document's text, splits it into chunks, generates embeddings, and stores the vectors in the configured Pinecone namespace. After indexing is verified, a new question can test whether the document is retrievable.
-
-**Illustrative ingestion flow**
-
-```text
-Authorized Upload
-→ Validate Type and Size
-→ Extract Text
-→ Split into Chunks
-→ Generate Embeddings
-→ Index in Pinecone
-→ Verify Ingestion
-→ Test Retrieval
-```
-
-**Teaching point:** An FDE solution must support the customer's data-maintenance process. Adding a policy should not require an engineer to rewrite the application.
-
-**Security note:** The upload endpoint should authenticate the caller, enforce size and file-type restrictions, validate the document contents, and prevent unauthorized users from modifying the knowledge base. A shared API key is only a basic demonstration control, not a complete enterprise identity solution.
+## 13. Evaluation Metrics
+
+The following metrics can be used to evaluate the system as the test dataset grows.
+
+| Metric                     | What it measures                                                      |
+| -------------------------- | --------------------------------------------------------------------- |
+| Retrieval Recall\@K        | Whether relevant documents appear among the top K retrieved results   |
+| Retrieval Precision\@K     | How many of the top K retrieved results are relevant                  |
+| Answer Faithfulness        | Whether generated statements are supported by the available evidence  |
+| Citation Precision         | Whether cited sources directly support the claims they accompany      |
+| Citation Coverage          | Whether claims that need evidence have appropriate citations          |
+| Routing Accuracy           | Whether the workflow selects the correct execution path               |
+| Fallback Accuracy          | Whether the system declines to answer when evidence is insufficient   |
+| Retry Effectiveness        | Whether rewritten queries improve retrieval outcomes                  |
+| Latency                    | Time spent in retrieval, search, generation, and the complete request |
+| Provider Error Rate        | Frequency of API errors, timeouts, and unavailable services           |
+| Estimated Cost per Request | Model and search usage cost per completed request                     |
+
+These metrics should be measured using a representative, labeled test set. Do not report numerical performance improvements until they have been calculated from actual test results.
 
 ---
 
-## 10. API Endpoints
+## 14. Known Limitations
 
-The following endpoint contract is a proposed interface. Confirm the exact routes, authentication mechanism, and response fields against the final FastAPI implementation.
+The current implementation and observed tests identify several areas that need further validation:
 
-### `GET /api/health`
+1. **Citation relevance:** An inline reference may exist without fully supporting the associated claim.
+2. **URL normalization:** Different URL formats can represent the same underlying page.
+3. **Search completeness:** Public search may return incomplete or irrelevant evidence.
+4. **Model variability:** LLM responses can differ between requests and model versions.
+5. **Dependency on external providers:** Hosted model, vector database, and search failures can affect response availability.
+6. **Production authorization:** Enterprise identity, fine-grained document access, and administrative permissions require dedicated validation.
+7. **Evaluation coverage:** A few successful manual requests do not establish overall retrieval or answer accuracy.
+8. **Operational readiness:** Deployment, monitoring, scaling, retention, and incident-management procedures need to be verified separately.
 
-Checks whether the application is responding.
-
-A production readiness endpoint may additionally check critical dependencies, such as Pinecone connectivity, without exposing secrets or internal infrastructure details.
-
-### `POST /api/chat`
-
-Accepts an employee's question and returns an answer with its source and workflow trace.
-
-**Example request**
-
-```json
-{
-  "question": "How do I troubleshoot my company VPN connection?"
-}
-```
-
-**Illustrative response**
-
-```json
-{
-  "answer": "Follow the approved company VPN troubleshooting steps...",
-  "source_used": "private_kb",
-  "trace": [
-    "Question routed to IT support",
-    "Private knowledge retrieval completed",
-    "Evidence grade: GOOD",
-    "Answer generated from internal documentation"
-  ],
-  "citations": []
-}
-```
-
-The response is illustrative. In the completed implementation, populate `citations` with actual document identifiers, titles, page references, or other source metadata when available. Do not claim source-level citations if the retrieval layer does not return them.
-
-### `POST /api/ingest`
-
-Accepts a supported document upload and indexes its extracted content.
-
-If the endpoint uses a shared administrative key, the request may include:
-
-```http
-X-Admin-Key: your_configured_admin_secret
-```
-
-The endpoint should reject unauthorized requests, unsupported file types, oversized uploads, and invalid documents. It should return an ingestion status and a useful error message without revealing credentials or sensitive implementation details.
+Documenting these limitations makes the project more useful to engineers and reviewers by distinguishing working behavior from remaining engineering work.
 
 ---
 
-## 11. Security, Reliability, and Evaluation
-
-Enterprise AI applications need more than successful demo responses. They must handle poor retrieval results, invalid input, provider failures, and unauthorized access in a controlled way.
-
-The project should be evaluated in the following areas:
-
-- **Retrieval quality:** Check whether the expected document appears in the retrieved top-k results.
-- **Answer faithfulness:** Verify that the generated answer is supported by retrieved evidence.
-- **Routing accuracy:** Test greetings, internal policy questions, current-information requests, and ambiguous questions.
-- **Retry behavior:** Confirm that query rewriting improves retrieval in selected test cases and that retries terminate at the configured limit.
-- **Source attribution:** Ensure that internal and external information are identified correctly.
-- **Failure handling:** Test missing API keys, provider timeouts, empty documents, invalid uploads, and insufficient evidence.
-- **Access control:** Confirm that unauthorized callers cannot upload or alter company knowledge.
-- **Auditability:** Record appropriate workflow metadata without unnecessarily storing sensitive questions, credentials, or confidential document content.
-- **Operational performance:** Measure response latency, retrieval latency, provider errors, token usage, and estimated cost per request.
-
-Because the sample customer and business environment are fictional, any improvement in ticket deflection, response time, or employee satisfaction should be reported only after a controlled evaluation or pilot.
-
----
-
-## 12. Future Enhancements
+## 15. Future Enhancements
 
 Potential next steps include:
 
-1. Add authenticated employee access using the customer's identity provider.
-2. Implement document-level permissions and tenant-aware retrieval.
-3. Add source citations with document titles and page-level references.
-4. Introduce automated retrieval and answer-quality evaluation.
-5. Add a reranker to improve the ordering of retrieved chunks.
-6. Build a monitoring dashboard for latency, errors, and retrieval outcomes.
-7. Add document versioning, deletion, re-indexing, and scheduled refresh.
-8. Introduce PostgreSQL or a centralized audit platform for multi-user production deployments.
-9. Deploy through a container platform with managed secrets and health monitoring.
-10. Establish a feedback mechanism so employees can report incorrect or incomplete answers.
-
-These enhancements would move the project from a local engineering demonstration toward a more complete enterprise application.
+- Improve citation deduplication and claim-level source validation.
+- Add automated evaluation using a curated question-and-evidence dataset.
+- Benchmark a reranker against the existing retrieval pipeline.
+- Add retrieval and answer-quality metrics to continuous integration.
+- Implement enterprise identity integration and document-level permissions.
+- Add document versioning, deletion, and controlled re-indexing.
+- Add observability for latency, retrieval failures, model usage, and costs.
+- Introduce a production-grade audit database and retention policy.
+- Containerize and deploy the application using managed secrets and health monitoring.
+- Add adversarial tests for prompt injection, malformed documents, and untrusted external content.
+- Collect user feedback and measure real operational outcomes during a pilot.
 
 ---
 
-## 13. Project Summary
+## 16. Deployment Readiness Checklist
 
-Enterprise ITL RAG Assistant demonstrates how an Agentic RAG workflow can be developed into a practical IT support application. It combines private semantic search, evidence grading, conditional public search, query rewriting, grounded generation, an API, and a web interface.
+Before publishing or deploying the project, verify the following:
 
-Its main FDE value is the connection between the customer's operational problem and the technical solution. The project demonstrates not only how to retrieve information with an LLM, but also how to decide which source to use, respond when evidence is insufficient, expose system behavior, and support changes to the customer's knowledge base.
+- [ ] The application starts from a clean environment.
+- [ ] Dependency versions are pinned and documented.
+- [ ] Required settings are listed in `.env.example`.
+- [ ] Real credentials and local databases are excluded from Git.
+- [ ] The configured vector index matches the embedding dimensions.
+- [ ] Sample document ingestion completes successfully.
+- [ ] Health and chat endpoints behave as expected.
+- [ ] Routing, grading, and retry behavior have automated tests.
+- [ ] Citation references are valid and duplicate URLs are handled.
+- [ ] Insufficient-evidence scenarios return a safe fallback.
+- [ ] Upload and administrative endpoints enforce authorization.
+- [ ] Logs avoid exposing credentials and unnecessary sensitive content.
+- [ ] Dependency and secret scans have been reviewed.
+- [ ] Production deployment and monitoring have been tested.
 
-The intended outcome is a more accessible and traceable IT support experience, with operational impact validated through measurable testing rather than assumed in advance.
+---
+
+## 17. Project Summary
+
+The Enterprise IT Support Agentic RAG Copilot demonstrates how an AI workflow can be developed into a practical enterprise support application.
+
+It brings together semantic retrieval, conditional routing, evidence grading, external search, query rewriting, grounded generation, API delivery, source metadata, and workflow tracing.
+
+The project has been tested with representative remote-access security, NIST incident-response, and CISA phishing questions. Those tests confirmed that the application returned answers and official-source metadata for the tested cases. They also identified citation deduplication and claim-level source validation as areas for further improvement.
+
+The central engineering objective is to make the assistant useful, traceable, and cautious when evidence is incomplete—not merely to generate fluent responses.
+
+**The intended outcome:** a foundation for a more accessible and auditable IT support experience, with production readiness and business impact established through repeatable evaluation rather than assumptions.
+
+---
+
+## Disclaimer
+
+BluePeak Technologies is a fictional customer used for demonstration purposes. Public cybersecurity examples are provided for educational and software-engineering demonstration purposes and should be checked against the latest official guidance before operational use.
+
+This project is not a substitute for an organization's approved security policies, incident-response procedures, or professional security assessment.
