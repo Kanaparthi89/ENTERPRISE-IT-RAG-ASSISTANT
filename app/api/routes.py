@@ -2,10 +2,11 @@
 import logging
 import secrets
 from pathlib import Path
+from typing import Annotated
 from uuid import uuid4
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Header
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, StringConstraints
 
 from app.core.config import get_settings
 from app.rag.workflow import ask
@@ -21,12 +22,31 @@ logger = logging.getLogger(__name__)
 MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
+def _strip_whitespace(value):
+    """Strip with Python's str.strip(), matching the handler and workflow.
+
+    Pydantic's built-in strip_whitespace keeps U+001C to U+001F, which
+    str.strip() removes; a question made only of those characters would pass
+    validation and then become empty downstream.
+    """
+    return value.strip() if isinstance(value, str) else value
+
+
+# Leading and trailing whitespace is stripped before the length limits are
+# checked, so whitespace-only questions are rejected with HTTP 422.
+# Internal whitespace, such as line breaks in pasted logs, is preserved.
+# BeforeValidator is listed last so it wraps the constrained string schema:
+# it still runs first, and the limits keep Pydantic's native
+# string_too_short/string_too_long errors.
+Question = Annotated[
+    str,
+    StringConstraints(min_length=2, max_length=3000),
+    BeforeValidator(_strip_whitespace),
+]
+
+
 class ChatRequest(BaseModel):
-    question: str = Field(
-        min_length=2,
-        max_length=3000,
-        strip_whitespace=True,
-    )
+    question: Question
 
 
 @router.get("/health")

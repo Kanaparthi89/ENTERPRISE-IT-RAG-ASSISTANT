@@ -4,6 +4,8 @@
 import json
 import logging
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -48,9 +50,25 @@ def _connect() -> sqlite3.Connection:
     return connection
 
 
+@contextmanager
+def _transaction() -> Iterator[sqlite3.Connection]:
+    """Run one transaction on a fresh connection and always close it.
+
+    The connection's own context manager commits on success and rolls back
+    on error, but it does not close the connection. Closing explicitly keeps
+    file handles from accumulating until garbage collection.
+    """
+    connection = _connect()
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
 def init_db() -> None:
     """Create the audit table and add supported columns to older databases."""
-    with _connect() as connection:
+    with _transaction() as connection:
         connection.execute(_SCHEMA)
 
         existing_columns = {
@@ -125,7 +143,7 @@ def write_audit(
     except (TypeError, ValueError) as exc:
         raise ValueError("Trace and citations must be JSON serializable.") from exc
 
-    with _connect() as connection:
+    with _transaction() as connection:
         cursor = connection.execute(
             """
             INSERT INTO query_audit (
@@ -168,7 +186,7 @@ def get_recent_audits(limit: int = 20) -> list[dict[str, Any]]:
     if not 1 <= limit <= 500:
         raise ValueError("limit must be between 1 and 500.")
 
-    with _connect() as connection:
+    with _transaction() as connection:
         rows = connection.execute(
             """
             SELECT id, request_id, created_at, question, source_used,

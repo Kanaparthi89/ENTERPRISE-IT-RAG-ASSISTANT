@@ -4,15 +4,21 @@ import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from app.core.config import get_settings
+
 
 def configure_logging() -> None:
     """
     Configure application-wide logging.
 
     Supports configurable log levels, console output, and rotating log files.
+    A LOG_LEVEL process environment variable takes precedence; otherwise the
+    level comes from settings, which also reads LOG_LEVEL from .env.
     """
 
-    log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_level_name = (
+        os.getenv("LOG_LEVEL") or get_settings().log_level
+    ).upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
 
     log_format = (
