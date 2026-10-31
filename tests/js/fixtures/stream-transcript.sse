@@ -1,0 +1,23 @@
+event: start
+data: {"request_id":"req-1","version":1}
+
+event: trace
+data: {"index":0,"step":"Router → KB"}
+
+event: delta
+data: {"text":"\n Install GlobalProtect — "}
+
+: keepalive
+
+event: delta
+data: {"text":"then sign in.\nGrüße ✓"}
+
+event: delta
+data: {"text":"  \n"}
+
+event: trace
+data: {"index":1,"step":"Answer generation → PRIVATE KB"}
+
+event: done
+data: {"request_id":"req-1","answer":"Install GlobalProtect — then sign in.\nGrüße ✓","source_used":"private_kb","trace":["Router → KB","Answer generation → PRIVATE KB"],"citations":[{"title":"handbook.md","url":"","type":"private_kb"}],"rewritten_query":"How do I connect to the VPN?"}
+

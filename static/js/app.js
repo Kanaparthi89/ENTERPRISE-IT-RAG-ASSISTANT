@@ -403,6 +403,53 @@
     return "The final source was reported by the agent workflow.";
   }
 
+  // The final answer view, shared by /api/chat and the stream's "done" event.
+  function renderFinalAnswer(data, question) {
+    const citations = Array.isArray(data.citations)
+      ? data.citations
+      : [];
+
+    const assistantMessage = addAssistantAnswer(
+      data.answer,
+      citations
+    );
+
+    const source = getText(data.source_used, "unknown");
+
+    updateSource(source, describeSource(source, citations));
+    renderTrace(data.trace, "Completed");
+
+    if (
+      data.rewritten_query &&
+      data.rewritten_query !== question
+    ) {
+      const note = document.createElement("p");
+      note.className = "rewritten-query-note";
+      note.textContent =
+        `Refined search query: ${data.rewritten_query}`;
+
+      const bubble = $(".bubble", assistantMessage);
+
+      if (bubble) {
+        bubble.appendChild(note);
+      }
+    }
+  }
+
+  function renderFailure(message) {
+    addMessage(
+      "assistant",
+      `I couldn't complete that request. ${message}`
+    );
+
+    setRunState("Request failed", 100, 0);
+
+    updateSource(
+      "Error",
+      "The request did not complete successfully. Check the application logs for details."
+    );
+  }
+
   async function submitQuestion(forcedQuestion) {
     if (isChatting) return;
 
@@ -425,105 +472,186 @@
       return;
     }
 
+    if (!chatController) {
+      renderFailure("Please refresh the page and try again.");
+      return;
+    }
+
     isChatting = true;
 
-    clearWelcomeState();
-    addMessage("user", question);
-
-    const loadingMessage = addMessage("assistant", "", {
-      loading: true,
-    });
-
-    el.question.value = "";
-    updateCharacterCount();
-
-    setButtonBusy(
-      el.sendBtn,
-      true,
-      "Thinking…",
-      "Ask agent"
-    );
-
-    setRunState("Processing question", 15, 0);
-
-    updateSource(
-      "Processing",
-      "The agent is routing your question and evaluating available evidence."
-    );
-
     try {
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: JSON.stringify({ question }),
-      });
-
-      const data = await response.json().catch(() => ({}));
-
-      if (!response.ok) {
-        throw new Error(
-          getText(
-            data.detail || data.message,
-            `Request failed (HTTP ${response.status}).`
-          )
-        );
-      }
-
-      loadingMessage.message.remove();
-
-      const citations = Array.isArray(data.citations)
-        ? data.citations
-        : [];
-
-      const assistantMessage = addAssistantAnswer(
-        data.answer,
-        citations
-      );
-
-      const source = getText(data.source_used, "unknown");
-
-      updateSource(source, describeSource(source, citations));
-      renderTrace(data.trace, "Completed");
-
-      if (
-        data.rewritten_query &&
-        data.rewritten_query !== question
-      ) {
-        const note = document.createElement("p");
-        note.className = "rewritten-query-note";
-        note.textContent =
-          `Refined search query: ${data.rewritten_query}`;
-
-        const bubble = $(".bubble", assistantMessage);
-
-        if (bubble) {
-          bubble.appendChild(note);
-        }
-      }
-    } catch (error) {
-      loadingMessage.message.remove();
-
-      addMessage(
-        "assistant",
-        `I couldn't complete that request. ${
-          error instanceof Error
-            ? error.message
-            : "Please try again."
-        }`
-      );
-
-      setRunState("Request failed", 100, 0);
-
-      updateSource(
-        "Error",
-        "The request did not complete successfully. Check the application logs for details."
-      );
+      // Streams when the backend allows it, otherwise uses /api/chat; one
+      // answer per question either way (see static/js/chat-stream.js).
+      await chatController.submit(question);
     } finally {
       isChatting = false;
+    }
+  }
 
+  // -------------------------------------------------------------------
+  // Streaming view: the DOM side of BluePeakChat.createChatController
+  // -------------------------------------------------------------------
+
+  const NEAR_BOTTOM_PX = 80;
+
+  const scheduleFrame =
+    typeof window.requestAnimationFrame === "function"
+      ? (callback) => window.requestAnimationFrame(callback)
+      : (callback) => window.setTimeout(callback, 16);
+
+  const cancelFrame =
+    typeof window.cancelAnimationFrame === "function"
+      ? (id) => window.cancelAnimationFrame(id)
+      : (id) => window.clearTimeout(id);
+
+  function isChatNearBottom() {
+    if (!el.chat) return true;
+
+    return (
+      el.chat.scrollHeight - el.chat.scrollTop - el.chat.clientHeight <=
+      NEAR_BOTTOM_PX
+    );
+  }
+
+  function appendTraceStep(step, count) {
+    if (!el.trace) return;
+
+    const item = document.createElement("div");
+    item.className = "trace-item";
+
+    const marker = document.createElement("span");
+    marker.className = "trace-marker";
+    marker.textContent = String(count).padStart(2, "0");
+
+    const content = document.createElement("div");
+    content.className = "trace-step";
+
+    const heading = document.createElement("strong");
+    heading.textContent = normalizeTraceStep(step);
+
+    const description = document.createElement("span");
+    description.textContent = "Completed";
+
+    content.append(heading, description);
+    item.append(marker, content);
+    el.trace.appendChild(item);
+  }
+
+  const chatView = {
+    begin(question) {
+      clearWelcomeState();
+      addMessage("user", question);
+
+      const loadingMessage = addMessage("assistant", "", {
+        loading: true,
+      });
+      // Announce the answer once it is complete, not every streamed chunk.
+      loadingMessage.message.setAttribute("aria-busy", "true");
+
+      el.question.value = "";
+      updateCharacterCount();
+
+      setButtonBusy(
+        el.sendBtn,
+        true,
+        "Thinking…",
+        "Ask agent"
+      );
+
+      setRunState("Processing question", 15, 0);
+
+      updateSource(
+        "Processing",
+        "The agent is routing your question and evaluating available evidence."
+      );
+
+      let answerText = null;
+      let pendingText = "";
+      let frameId = null;
+      let traceSteps = 0;
+
+      const flush = () => {
+        frameId = null;
+        if (!answerText || !pendingText) return;
+
+        const stickToBottom = isChatNearBottom();
+        answerText.appendData(pendingText);
+        pendingText = "";
+
+        if (stickToBottom) scrollChatToBottom();
+      };
+
+      const finish = () => {
+        if (frameId !== null) cancelFrame(frameId);
+        frameId = null;
+        pendingText = "";
+        loadingMessage.message.remove();
+        el.trace?.removeAttribute("aria-busy");
+      };
+
+      return {
+        trace(step) {
+          if (!el.trace) return;
+
+          if (traceSteps === 0) {
+            el.trace.replaceChildren();
+            el.trace.setAttribute("aria-busy", "true");
+          }
+
+          traceSteps += 1;
+          appendTraceStep(step, traceSteps);
+
+          if (el.traceCount) {
+            el.traceCount.textContent = String(traceSteps);
+          }
+
+          setRunState(
+            "Processing question",
+            Math.min(90, 15 + traceSteps * 10),
+            traceSteps
+          );
+        },
+
+        delta(text) {
+          if (!answerText) {
+            const paragraph = document.createElement("p");
+            paragraph.className = "answer-text streaming";
+            // Plain text only while streaming; the sanitized Markdown
+            // rendering replaces it when the answer is complete.
+            answerText = document.createTextNode("");
+            paragraph.appendChild(answerText);
+            loadingMessage.bubble.replaceChildren(paragraph);
+
+            setButtonBusy(
+              el.sendBtn,
+              true,
+              "Responding…",
+              "Ask agent"
+            );
+          }
+
+          pendingText += text;
+          if (frameId === null) frameId = scheduleFrame(flush);
+        },
+
+        complete(data) {
+          finish();
+          renderFinalAnswer(data, question);
+        },
+
+        fail(message) {
+          finish();
+          renderFailure(message);
+
+          if (traceSteps > 0) {
+            // Keep the steps that did run consistent with the panel.
+            setRunState("Request failed", 100, traceSteps);
+          }
+        },
+      };
+    },
+
+    end() {
       setButtonBusy(
         el.sendBtn,
         false,
@@ -532,8 +660,34 @@
       );
 
       el.question.focus();
-    }
-  }
+    },
+  };
+
+  let pageAbort = new AbortController();
+
+  window.addEventListener("pagehide", () => pageAbort.abort());
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted) pageAbort = new AbortController();
+  });
+
+  const streamingSupported =
+    typeof window.fetch === "function" &&
+    typeof window.ReadableStream === "function" &&
+    typeof window.TextDecoder === "function" &&
+    typeof window.AbortController === "function" &&
+    typeof window.Response === "function" &&
+    "body" in window.Response.prototype;
+
+  const chatController = window.BluePeakChat
+    ? window.BluePeakChat.createChatController({
+        view: chatView,
+        fetchImpl: (url, init) => window.fetch(url, init),
+        availability: new window.BluePeakChat.StreamAvailability({
+          supported: streamingSupported,
+        }),
+        signal: () => pageAbort.signal,
+      })
+    : null;
 
   function resetConversation() {
     if (isChatting) return;

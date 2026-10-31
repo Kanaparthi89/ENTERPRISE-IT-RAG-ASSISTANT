@@ -473,6 +473,10 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 Alternatively, use the repository's `run.py` if that is the configured entry point.
 
+**Port note:** the Uvicorn command above listens on port **8000**, which the URLs in this README use. `python run.py` listens on port **8080** (`http://127.0.0.1:8080`) instead; replace `8000` with `8080` in the URLs and examples when using it.
+
+Streaming chat is disabled by default. To try it locally, see [Streaming chat](#streaming-chat-controlled-prototype-disabled-by-default).
+
 ### Step 7: Open the application
 
 - API documentation: `http://127.0.0.1:8000/docs`
@@ -527,6 +531,129 @@ A tested NIST incident-response question returned official NIST resources, inclu
 A tested CISA phishing question returned CISA-related source URLs and inline numbered references.
 
 These examples confirm that the application can retrieve public security information and return source metadata for the tested scenarios. They are not a substitute for comprehensive citation-faithfulness testing.
+
+### Streaming chat (controlled prototype, disabled by default)
+
+`POST /api/chat/stream` returns the same answer as `/api/chat`, delivered progressively as Server-Sent Events (SSE). It is a **controlled prototype**: it is disabled by default and must not be enabled in production until the blockers listed under [Production-readiness blockers](#production-readiness-blockers) are resolved.
+
+#### Enabling streaming
+
+| Setting | Default | Allowed | Purpose |
+| ------- | ------- | ------- | ------- |
+| `STREAM_ENABLED` | `false` | boolean | Enables the streaming endpoint. While disabled, it returns `404 Not Found` for any request body, including malformed JSON. |
+| `STREAM_HEARTBEAT_SECONDS` | `15` | > 0, ≤ 300 | Idle interval after which the server sends a `: keepalive` comment. |
+| `STREAM_TIMEOUT_SECONDS` | `120` | > 0, ≤ 3600 | Deadline for one streamed request, measured from admission. |
+| `MAX_CONCURRENT_STREAMS` | `8` | 1–64 | Streams admitted at once, **per server process**. |
+| `STREAM_RETRY_AFTER_SECONDS` | `5` | 1–300 | `Retry-After` value sent with `503` when capacity is full. |
+| `OPENAI_TIMEOUT_SECONDS` | `60` | > 0, ≤ 600 | OpenAI timeout per HTTP operation (not per request). Also applies to `/api/chat` and ingestion. |
+| `OPENAI_MAX_RETRIES` | `2` | 0–10 | OpenAI retries. Also applies to `/api/chat` and ingestion. |
+
+Settings are read once at startup, so a change requires a server restart. An environment variable takes precedence over `.env`, so streaming can be enabled for a single local run without editing any file:
+
+```bash
+# Uvicorn directly, on port 8000:
+STREAM_ENABLED=true uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+
+# Or with run.py, on port 8080:
+STREAM_ENABLED=true python run.py
+```
+
+After restarting, reload the browser page: the frontend remembers a `404` from the streaming endpoint for the rest of the page session.
+
+#### Request and responses
+
+The request body is the same as `/api/chat`, with the same validation (use port `8080` with `run.py`):
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/api/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"question":"How do I connect to the company VPN?"}'
+```
+
+| Status | Meaning |
+| ------ | ------- |
+| `200` | An SSE stream (`Content-Type: text/event-stream; charset=utf-8`, `Cache-Control: no-cache, no-transform`, `X-Accel-Buffering: no`). |
+| `404` | Streaming is disabled. |
+| `422` | Invalid question, with the same error format as `/api/chat`. |
+| `503` | No streaming capacity. The body is `{"detail": {"message": "The server is busy. Please retry shortly."}}` with a `Retry-After` header. |
+| `500` (plain text) | The deadline passed before the response headers could be sent. This is sent by the server (Uvicorn), not by the application. |
+
+#### SSE event contract (version 1)
+
+Every event has one `event:` line and one single-line JSON `data:` line.
+
+| Event | Data | When |
+| ----- | ---- | ---- |
+| `start` | `{"request_id": "...", "version": 1}` | First event of every stream. |
+| `trace` | `{"index": 0, "step": "Router → KB"}` | Each workflow step, in order. |
+| `delta` | `{"text": "..."}` | A piece of the answer text, in order. |
+| `done` | The complete `/api/chat` response object (`request_id`, `answer`, `source_used`, `trace`, `citations`, `rewritten_query`) | The answer is complete. |
+| `error` | `{"request_id": "...", "code": "internal_error" \| "timeout", "message": "..."}` | The request failed. Messages are always generic; exception details are never sent. |
+
+Contract rules:
+
+- A stream that stays connected ends with **exactly one** `done` or **exactly one** `error`, never both.
+- The `delta` texts, joined and stripped of surrounding whitespace, equal `done.answer`. Routing, grading, and query-rewriting model calls never produce `delta` events.
+- `done` is identical to the `/api/chat` response for the same result, apart from `request_id`.
+- `: keepalive` comment lines are sent when no event has been sent for `STREAM_HEARTBEAT_SECONDS`.
+- If the client disconnects, the stream ends without a terminal event and the workflow is stopped at the next opportunity.
+
+Each streamed request writes exactly one audit row: `success` or `insufficient_evidence` only when `done` was sent successfully; `failed` with an error type (for example `TimeoutError`) on errors and timeouts; and `cancelled` (for example `ClientDisconnected`) when the client went away.
+
+#### Frontend behavior and fallback
+
+The web interface tries the streaming endpoint first and renders the answer progressively as plain text. When `done` arrives, the existing Markdown, citation, source, and trace rendering replaces it, exactly as for `/api/chat`.
+
+| Situation | Frontend behavior |
+| --------- | ----------------- |
+| `404` | Uses `/api/chat`, and does not try streaming again for the rest of the page session. |
+| `503` | Uses `/api/chat`, and does not try streaming again until `Retry-After` has passed. |
+| Network failure before response headers, or a `200` response that is not an event stream | Uses `/api/chat` once. |
+| `500` or any other error status | Shows a generic error. **No fallback** (see limitations). |
+| The stream has started, then is interrupted, malformed, or ends without `done`/`error` | Shows "The response was interrupted. Please try again." **No fallback**; partial text is removed. |
+| Joined deltas do not match `done.answer` | Treated as interrupted. |
+| `error` event | Shows a generic message for the error code; server text is never displayed. |
+| No bytes received for 45 seconds (keepalive comments count) | Treated as interrupted. |
+| Stream still running after 180 seconds | Treated as interrupted. |
+| The user leaves the page (`pagehide`) | The stream is cancelled. Switching tabs or minimizing does not cancel it. |
+
+Each question produces exactly one assistant message and at most one `/api/chat` request. Browsers without streaming `fetch` support use `/api/chat` directly.
+
+Limitations of the fallback design:
+
+- **Possible duplicate execution:** a network failure before response headers does not prove the server never received the request. The single fallback can therefore occasionally run a question twice on the server, producing two audit records.
+- **No fallback on `500`:** intentional, to avoid running a question the server has already handled a second time. Do not change this without a separate review.
+- **No fallback after a stream starts:** the user is asked to try again instead, so a partially processed question is not silently re-run.
+- **`503` fallback moves load to `/api/chat`:** the streaming capacity limit protects streaming workers, but it does not limit total load. Plan capacity for both endpoints together.
+- **While streaming is disabled,** each page load makes one extra request that returns `404` before using `/api/chat`.
+
+#### Heartbeat and timeout coupling
+
+The frontend's limits are fixed: 45 seconds without any received bytes, and 180 seconds overall. The server settings must stay compatible with them:
+
+- Keep `STREAM_HEARTBEAT_SECONDS` at or below **30**, so keepalive comments arrive well within the 45-second idle limit.
+- Keep `STREAM_TIMEOUT_SECONDS` at or below **170**, so the server's own timeout error (sent within about 2 seconds after the deadline) arrives before the 180-second limit.
+
+These limits are **not enforced by configuration validation**. Values outside them make the browser cancel healthy streams or report "interrupted" instead of the server's timeout error, and the audit row then shows `cancelled`.
+
+#### Production-readiness blockers
+
+Streaming must remain disabled in production until these are resolved:
+
+| ID | Blocker | Impact |
+| -- | ------- | ------ |
+| H1 | Pinecone and Tavily calls have no finite timeout. | A stalled call holds a streaming slot and a worker thread until the process restarts. The client receives a timeout error, but capacity is not recovered. `/api/chat` has the same exposure. |
+| H2 | The streaming service is not shut down with the application, and the container start command sets no graceful-shutdown timeout. | During deploys or restarts, in-flight streams can be terminated before their audit rows are written, and a stalled worker can delay process exit. |
+| H3 | Disconnect, timeout, and flow-control behavior is tested with the `asyncio` event loop and `h11`, while production Uvicorn uses `uvloop` and `httptools`. | Local use with the default runtime has shown correct successful streaming, but disconnect and timeout behavior under the production runtime is not yet verified. |
+
+Related operational risks:
+
+- **OpenAI timeouts** (`OPENAI_TIMEOUT_SECONDS`, `OPENAI_MAX_RETRIES`) also apply to `/api/chat` and ingestion. A non-streaming answer that takes longer than the timeout now fails. Validate the values against real latency.
+- **Capacity is held beyond the deadline:** after a timeout or disconnect, a slot is released only when the current workflow step returns. Retries of slow external calls can keep slots busy for minutes, and new streams then receive `503`.
+- **No per-client limits:** a few slow or idle clients can occupy all streaming slots until their deadline. Apply connection and rate limits at the proxy.
+- **Per-process capacity:** `MAX_CONCURRENT_STREAMS` applies to each server process separately.
+- **Audit writes are attempted exactly once:** a failed SQLite write (for example, a lock held for more than 10 seconds) is logged but not retried.
+- **Limited observability:** streaming failures are logged by error type only, and there is no per-request outcome log or capacity metric yet.
 
 ---
 
@@ -725,6 +852,7 @@ The current implementation and observed tests identify several areas that need f
 6. **Production authorization:** Enterprise identity, fine-grained document access, and administrative permissions require dedicated validation.
 7. **Evaluation coverage:** A few successful manual requests do not establish overall retrieval or answer accuracy.
 8. **Operational readiness:** Deployment, monitoring, scaling, retention, and incident-management procedures need to be verified separately.
+9. **Streaming prototype:** Streaming chat is disabled by default and is not production-ready. See [Production-readiness blockers](#production-readiness-blockers).
 
 Documenting these limitations makes the project more useful to engineers and reviewers by distinguishing working behavior from remaining engineering work.
 
@@ -766,6 +894,8 @@ Before publishing or deploying the project, verify the following:
 - [ ] Logs avoid exposing credentials and unnecessary sensitive content.
 - [ ] Dependency and secret scans have been reviewed.
 - [ ] Production deployment and monitoring have been tested.
+- [ ] Streaming remains disabled (`STREAM_ENABLED=false`) unless blockers H1–H3 are resolved.
+- [ ] If streaming is enabled, heartbeat and timeout settings stay within the frontend limits, and capacity is planned for `/api/chat` and streaming together.
 
 ---
 

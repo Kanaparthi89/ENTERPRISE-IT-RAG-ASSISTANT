@@ -3,12 +3,17 @@
 
 import logging
 import re
-from typing import Literal
+import threading
+from collections.abc import Callable, Iterator
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessageChunk
+from langgraph.constants import TAG_NOSTREAM
 from langgraph.graph import StateGraph, START, END
 
 from app.core.config import get_settings
@@ -19,7 +24,15 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 _llm = None
+_internal_llm = None
 _web_search = {}
+
+# Nodes whose model output is the user-facing answer. They are terminal:
+# each has a single edge to END, so their text is never discarded or retried.
+ANSWER_NODES = frozenset({"generate_from_kb", "generate_from_web", "direct_answer"})
+
+# Internal calls (routing, grading, rewriting) are never streamed or emitted.
+_INTERNAL_CALL_CONFIG = {"tags": [TAG_NOSTREAM]}
 
 
 def _secret_value(value) -> str:
@@ -31,22 +44,48 @@ def _secret_value(value) -> str:
     return str(value)
 
 
+def _chat_model(**overrides):
+    api_key = _secret_value(settings.openai_api_key)
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is missing.")
+
+    return ChatOpenAI(
+        model=settings.openai_model,
+        temperature=0,
+        api_key=api_key,
+        timeout=settings.openai_timeout_seconds,
+        max_retries=settings.openai_max_retries,
+        **overrides,
+    )
+
+
 def llm():
-    """Create the chat model once and reuse it."""
+    """Create the answer-generation chat model once and reuse it.
+
+    It streams only when a streaming callback handler is attached (the
+    streaming endpoint); ``ask()`` and ``/api/chat`` never attach one.
+    """
     global _llm
 
     if _llm is None:
-        api_key = _secret_value(settings.openai_api_key)
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing.")
-
-        _llm = ChatOpenAI(
-            model=settings.openai_model,
-            temperature=0,
-            api_key=api_key,
-        )
+        _llm = _chat_model()
 
     return _llm
+
+
+def internal_llm():
+    """Create the chat model for routing, grading, and rewriting once.
+
+    ``disable_streaming=True`` keeps these calls on the non-streaming API even
+    when the graph runs in streaming mode; callers also pass the ``nostream``
+    tag so their output is never emitted.
+    """
+    global _internal_llm
+
+    if _internal_llm is None:
+        _internal_llm = _chat_model(disable_streaming=True)
+
+    return _internal_llm
 
 
 def web_search_tool(include_domains: list[str] | None = None):
@@ -90,12 +129,10 @@ def add_trace(state: AgentState, message: str) -> list[str]:
     return [*state.get("trace", []), message]
 
 
-def _message_text(message) -> str:
-    """Normalize model output to plain text."""
-    content = getattr(message, "content", message)
-
+def _joined_text(content) -> str:
+    """Join message content into text, before any stripping."""
     if isinstance(content, str):
-        return content.strip()
+        return content
 
     if isinstance(content, list):
         parts = []
@@ -104,9 +141,14 @@ def _message_text(message) -> str:
                 parts.append(item.get("text", ""))
             elif isinstance(item, str):
                 parts.append(item)
-        return "\n".join(parts).strip()
+        return "\n".join(parts)
 
-    return str(content).strip()
+    return str(content)
+
+
+def _message_text(message) -> str:
+    """Normalize model output to plain text."""
+    return _joined_text(getattr(message, "content", message)).strip()
 
 
 def _document_source(doc: Document) -> str:
@@ -182,7 +224,7 @@ def route_question(state: AgentState):
             ),
         }
 
-    router = llm().with_structured_output(
+    router = internal_llm().with_structured_output(
         RouteDecision,
         method="json_mode",
     )
@@ -210,7 +252,8 @@ Question:
 {question}
 
 Return JSON with a single field: route.
-"""
+""",
+        config=_INTERNAL_CALL_CONFIG,
     )
 
     logger.info("Question routed to %s", decision.route)
@@ -260,7 +303,7 @@ def grade_kb(state: AgentState):
             ),
         }
 
-    grader = llm().with_structured_output(
+    grader = internal_llm().with_structured_output(
         EvidenceGrade,
         method="json_mode",
     )
@@ -281,7 +324,8 @@ Grade "good" only when the evidence directly and sufficiently supports
 a reliable answer. Otherwise grade "weak".
 
 Return JSON with a "grade" field: "good" or "weak".
-"""
+""",
+        config=_INTERNAL_CALL_CONFIG,
     )
 
     logger.info("Private KB evidence grade: %s", grade.grade)
@@ -404,7 +448,7 @@ def grade_web(state: AgentState):
             ),
         }
 
-    grader = llm().with_structured_output(
+    grader = internal_llm().with_structured_output(
         EvidenceGrade,
         method="json_mode",
     )
@@ -426,7 +470,8 @@ Reject generic landing pages and unrelated results when they do not
 support the question. External evidence is not verified company policy.
 
 Return JSON with a "grade" field: "good" or "weak".
-"""
+""",
+        config=_INTERNAL_CALL_CONFIG,
     )
 
     logger.info("Web evidence grade: %s", grade.grade)
@@ -456,7 +501,7 @@ def after_web(
 
 def rewrite_query(state: AgentState):
     """Rewrite the question before a bounded retrieval retry."""
-    response = llm().invoke(
+    response = internal_llm().invoke(
         f"""
 Rewrite the following question as a clear, self-contained search query
 for an enterprise IT support assistant.
@@ -470,7 +515,8 @@ Question:
 
 Previous search query:
 {state.get("current_query", state["question"])}
-"""
+""",
+        config=_INTERNAL_CALL_CONFIG,
     )
 
     rewritten = _message_text(response) or state["question"]
@@ -720,14 +766,14 @@ def build_graph():
 agent_graph = build_graph()
 
 
-def ask(question: str):
-    """Run the agent and return its final answer and execution trace."""
+def _initial_state(question: str) -> AgentState:
+    """Validate the question and build the workflow's starting state."""
     cleaned_question = question.strip()
 
     if not cleaned_question:
         raise ValueError("Question cannot be empty.")
 
-    initial_state: AgentState = {
+    return {
         "question": cleaned_question,
         "current_query": cleaned_question,
         "kb_docs": [],
@@ -741,4 +787,170 @@ def ask(question: str):
         "citations": [],
     }
 
-    return agent_graph.invoke(initial_state)
+
+def ask(question: str):
+    """Run the agent and return its final answer and execution trace."""
+    return agent_graph.invoke(_initial_state(question))
+
+
+# -------------------------------------------------------------------
+# Streaming support
+# -------------------------------------------------------------------
+
+class _AnswerTextTracker:
+    """Turn streamed chunk contents into append-only text deltas.
+
+    The concatenated deltas equal ``_joined_text`` of the aggregated message,
+    which is ``_message_text`` before stripping. While every chunk's content
+    is a plain string, each chunk's text is its delta (the common case). Once
+    list content appears, the tracker aggregates chunks with langchain-core's
+    own ``AIMessageChunk`` merge, exactly as the model builds its final
+    message, and emits whatever text was appended. Empty text blocks, block
+    indexes, unindexed blocks, and string/list transitions are therefore
+    handled exactly as the final message handles them.
+
+    If a chunk changes text that was already emitted (a provider writing
+    back into an earlier block), no append-only delta can represent it:
+    ``diverged`` is set and the stream continues from the new text. The
+    final answer remains authoritative.
+    """
+
+    def __init__(self):
+        self._string_pieces: list[str] | None = []
+        self._aggregate: AIMessageChunk | None = None
+        self._emitted = ""
+        self.diverged = False
+
+    def add(self, content) -> str:
+        if self._string_pieces is not None:
+            if isinstance(content, str):
+                self._string_pieces.append(content)
+                return content
+            if not isinstance(content, list):
+                return ""
+            # First list content: switch to exact aggregation.
+            if self._string_pieces:
+                self._emitted = "".join(self._string_pieces)
+                self._aggregate = AIMessageChunk(content=self._emitted)
+            self._string_pieces = None
+
+        if not isinstance(content, (str, list)):
+            return ""
+
+        chunk = AIMessageChunk(content=content)
+        self._aggregate = chunk if self._aggregate is None else self._aggregate + chunk
+        text = _joined_text(self._aggregate.content)
+
+        if text.startswith(self._emitted):
+            delta = text[len(self._emitted):]
+        else:
+            if not self.diverged:
+                logger.warning(
+                    "Streamed answer content changed already-sent text; "
+                    "the final answer will differ from the streamed preview."
+                )
+            self.diverged = True
+            delta = ""
+
+        self._emitted = text
+        return delta
+
+
+class AnswerChunkForwarder(BaseCallbackHandler):
+    """Forward answer-node model output chunks to a sink.
+
+    Runs on the model's thread. Only chat-model runs started by an answer
+    node and not tagged ``nostream`` are forwarded; routing, grading, and
+    rewriting calls are ignored. Text is read from ``chunk.message.content``
+    because langchain-core passes the chunk *content* as the token argument,
+    which is a list for content blocks. Empty chunks, including the final
+    empty chunk langchain-core appends, are not forwarded.
+
+    ``raise_error`` makes an exception from the sink (for example, a stopped
+    stream) abort the model call instead of being logged and ignored. The
+    sink may also block to apply backpressure to the model.
+    """
+
+    raise_error = True
+
+    def __init__(self, sink: Callable[[str], None]):
+        self._sink = sink
+        self._lock = threading.Lock()
+        self._runs: dict[Any, _AnswerTextTracker] = {}
+        self.forwarded_chunks = 0
+
+    def on_chat_model_start(
+        self, serialized, messages, *, run_id, tags=None, metadata=None, **kwargs
+    ):
+        node = (metadata or {}).get("langgraph_node")
+        if node in ANSWER_NODES and TAG_NOSTREAM not in (tags or []):
+            with self._lock:
+                self._runs[run_id] = _AnswerTextTracker()
+
+    def on_llm_new_token(self, token, *, chunk=None, run_id, **kwargs):
+        with self._lock:
+            tracker = self._runs.get(run_id)
+        if tracker is None:
+            return
+
+        content = chunk.message.content if chunk is not None else token
+        text = tracker.add(content)
+        if text:
+            self.forwarded_chunks += 1
+            self._sink(text)
+
+    def on_llm_end(self, response, *, run_id, **kwargs):
+        with self._lock:
+            self._runs.pop(run_id, None)
+
+    def on_llm_error(self, error, *, run_id, **kwargs):
+        with self._lock:
+            self._runs.pop(run_id, None)
+
+
+def stream_ask(
+    question: str, on_chunk: Callable[[str], None]
+) -> Iterator[tuple[str, Any]]:
+    """Run the agent for streaming.
+
+    Yields ``("trace", step)`` for each new trace entry, then
+    ``("final", state)``. Answer text is delivered through ``on_chunk`` on
+    the model's thread while it is generated; ``on_chunk`` may block to apply
+    backpressure, or raise to abort the model call. An answer produced
+    without model output (the fixed-text paths) is delivered as one chunk
+    before ``("final", state)``.
+
+    The graph's ``messages`` mode is requested only so that answer models
+    stream; its events are discarded here. Closing the generator stops the
+    graph once the in-flight node returns; no later node runs.
+    """
+    initial_state = _initial_state(question)
+    forwarder = AnswerChunkForwarder(on_chunk)
+    stream = agent_graph.stream(
+        initial_state,
+        config={"callbacks": [forwarder]},
+        stream_mode=["messages", "values"],
+    )
+
+    final = None
+    traced = 0
+    try:
+        for mode, payload in stream:
+            if mode != "values":
+                continue
+            final = payload
+            trace = payload.get("trace", [])
+            for step in trace[traced:]:
+                yield ("trace", step)
+            traced = len(trace)
+    finally:
+        stream.close()
+
+    if final is None:
+        raise RuntimeError("The workflow produced no final state.")
+
+    answer = final.get("answer", "")
+    if answer and forwarder.forwarded_chunks == 0:
+        on_chunk(answer)
+
+    yield ("final", final)

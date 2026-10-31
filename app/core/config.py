@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
     embedding_model: str = "text-embedding-3-small"
 
+    # OpenAI client limits for chat and embeddings. The timeout applies to
+    # each HTTP operation (connect, read, write, pool), not to a request's
+    # total duration. Proposed defaults; not validated in production.
+    openai_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    openai_max_retries: int = Field(default=2, ge=0, le=10)
+
     # Retrieval and search
     tavily_api_key: SecretStr = SecretStr("")
     pinecone_api_key: SecretStr = SecretStr("")
@@ -32,6 +38,15 @@ class Settings(BaseSettings):
     pinecone_namespace: str = "company-it-kb"
     top_k: int = Field(default=4, ge=1, le=50)
     max_retries: int = Field(default=2, ge=0, le=10)
+
+    # Streaming chat (POST /api/chat/stream). Disabled by default: a
+    # controlled prototype until Pinecone and Tavily calls have finite
+    # timeouts. The values below are proposals, not production-validated.
+    stream_enabled: bool = False
+    stream_heartbeat_seconds: float = Field(default=15.0, gt=0, le=300)
+    stream_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
+    max_concurrent_streams: int = Field(default=8, ge=1, le=64)
+    stream_retry_after_seconds: int = Field(default=5, ge=1, le=300)
 
     # Application authentication
     admin_api_key: SecretStr = SecretStr("")

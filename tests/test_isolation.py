@@ -1,5 +1,6 @@
 """Proves the suite is isolated from real configuration, storage and networks."""
 
+import asyncio
 import re
 import socket
 
@@ -165,6 +166,76 @@ def test_test_client_needs_no_network(client, blocked_network):
 
 
 # -------------------------------------------------------------------
+# Wildcard (bind) lookups
+# -------------------------------------------------------------------
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", ""])
+def test_passive_wildcard_lookup_is_allowed(host, blocked_network):
+    try:
+        socket.getaddrinfo(host, 0, flags=socket.AI_PASSIVE)
+    except NetworkAccessBlocked:
+        pytest.fail(f"AI_PASSIVE lookup for {host!r} was blocked")
+    except socket.gaierror:
+        pass  # The platform may reject the literal; only the guard matters here.
+
+    assert blocked_network() == []
+
+
+def test_passive_flag_as_positional_argument_is_honoured(blocked_network):
+    # getaddrinfo(host, port, family, type, proto, flags)
+    socket.getaddrinfo("0.0.0.0", 0, 0, 0, 0, socket.AI_PASSIVE)
+
+    assert blocked_network() == []
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", ""])
+def test_wildcard_lookup_without_passive_flag_is_blocked(host, blocked_network):
+    with pytest.raises(NetworkAccessBlocked):
+        socket.getaddrinfo(host, 80)
+
+    assert blocked_network() == [f"getaddrinfo {host!r}"]
+
+
+def test_passive_flag_does_not_allow_public_hosts(blocked_network):
+    with pytest.raises(NetworkAccessBlocked):
+        socket.getaddrinfo("api.openai.com", 443, flags=socket.AI_PASSIVE)
+
+    assert blocked_network() == ["getaddrinfo 'api.openai.com'"]
+
+
+def test_connect_to_wildcard_address_is_blocked(blocked_network):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        with pytest.raises(NetworkAccessBlocked):
+            sock.connect(("0.0.0.0", 9))
+
+    assert blocked_network() == ["connect ('0.0.0.0', 9)"]
+
+
+def test_send_to_wildcard_address_is_blocked(blocked_network):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        with pytest.raises(NetworkAccessBlocked):
+            sock.sendto(b"x", ("0.0.0.0", 53))
+
+    assert blocked_network() == ["sendto ('0.0.0.0', 53)"]
+
+
+# -------------------------------------------------------------------
+# Event loop
+# -------------------------------------------------------------------
+
+def test_anyio_backend_is_asyncio_without_uvloop(anyio_backend):
+    assert anyio_backend == ("asyncio", {"use_uvloop": False})
+
+
+@pytest.mark.anyio
+async def test_async_tests_run_on_the_standard_asyncio_loop():
+    loop = asyncio.get_running_loop()
+
+    assert type(loop).__module__.startswith("asyncio."), type(loop)
+    assert "uvloop" not in type(asyncio.get_event_loop_policy()).__module__
+
+
+# -------------------------------------------------------------------
 # External clients
 # -------------------------------------------------------------------
 
@@ -172,6 +243,7 @@ def test_test_client_needs_no_network(client, blocked_network):
     "factory",
     [
         workflow.llm,
+        workflow.internal_llm,
         workflow.web_search_tool,
         vectorstore.get_embeddings,
         vectorstore.ensure_index,
@@ -191,6 +263,7 @@ def test_client_caches_start_empty():
     assert vectorstore._embeddings is None
     assert vectorstore._vectorstore is None
     assert workflow._llm is None
+    assert workflow._internal_llm is None
     assert workflow._web_search == {}
 
 

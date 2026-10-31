@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS query_audit (
 )
 """
 
-_ALLOWED_STATUSES = {"success", "failed", "insufficient_evidence"}
+_ALLOWED_STATUSES = {"success", "failed", "insufficient_evidence", "cancelled"}
 
 
 def _database_path() -> Path:

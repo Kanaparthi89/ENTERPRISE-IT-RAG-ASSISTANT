@@ -43,6 +43,8 @@ def get_embeddings():
         _embeddings = OpenAIEmbeddings(
             model=settings.embedding_model,
             api_key=settings.openai_api_key.get_secret_value(),
+            timeout=settings.openai_timeout_seconds,
+            max_retries=settings.openai_max_retries,
         )
 
     return _embeddings

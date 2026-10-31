@@ -945,6 +945,12 @@ textarea:focus-visible,
   margin: 5px 0 0;
 }
 
+/* Plain text while an answer streams; Markdown replaces it when complete. */
+.bubble .answer-text.streaming {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .bubble a {
   color: var(--primary);
   text-decoration: underline;

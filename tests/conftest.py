@@ -9,12 +9,23 @@ Isolation guarantees (enforced here, verified in tests/test_isolation.py):
   gets its own ``tmp_path`` for the audit database and uploads.
 * Real OpenAI, Pinecone, and Tavily clients cannot be constructed.
 * Any non-loopback network access is blocked, recorded, and fails the
-  test, even if application code catches the exception.
+  test, even if application code catches the exception. Wildcard bind
+  lookups (``getaddrinfo`` with ``AI_PASSIVE``) are allowed; connecting or
+  sending to wildcard addresses is not.
+
+Event-loop limitation: the network guard wraps Python's ``socket`` module.
+uvloop (libuv) performs DNS resolution and connections in C and would bypass
+it. Async tests therefore run on the standard asyncio loop only
+(``anyio_backend`` below), ``tests/test_isolation.py`` asserts that uvloop is
+not active, and loopback servers are started with ``loop="asyncio"``.
+Production uvicorn may still choose uvloop; that path is not exercised here.
 """
 
 import ipaddress
 import os
 import socket
+import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -145,8 +156,22 @@ def _guarded_sendto(self, data, *args):
     return _REAL_SOCKET_FUNCTIONS["sendto"](self, data, *args)
 
 
+_WILDCARD_HOSTS = {"", "0.0.0.0", "::"}
+
+
+def _is_passive_wildcard_lookup(host, args, kwargs) -> bool:
+    """A lookup for binding a local server: wildcard host with AI_PASSIVE."""
+    if isinstance(host, bytes):
+        host = host.decode("ascii", "ignore")
+    if host not in _WILDCARD_HOSTS:
+        return False
+    # getaddrinfo(host, port, family=0, type=0, proto=0, flags=0)
+    flags = args[4] if len(args) > 4 else kwargs.get("flags", 0)
+    return bool(flags & socket.AI_PASSIVE)
+
+
 def _guarded_getaddrinfo(host, *args, **kwargs):
-    if not _is_loopback(host):
+    if not (_is_loopback(host) or _is_passive_wildcard_lookup(host, args, kwargs)):
         _block(f"getaddrinfo {host!r}")
     return _REAL_SOCKET_FUNCTIONS["getaddrinfo"](host, *args, **kwargs)
 
@@ -176,12 +201,15 @@ import ingest_sample_kb  # noqa: E402
 from app.api import routes  # noqa: E402
 from app.rag import vectorstore, workflow  # noqa: E402
 from app.services import audit  # noqa: E402
+from app.api import streaming  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from langchain_core.documents import Document  # noqa: E402
 from langchain_core.messages import AIMessage  # noqa: E402
 
+from tests.streaming_support import ChunkScript, ScriptedChatModel  # noqa: E402
+
 SETTINGS_CONSUMERS = (app.main, routes, workflow, vectorstore, audit)
-GET_SETTINGS_CONSUMERS = (app_logging, ingest_sample_kb)
+GET_SETTINGS_CONSUMERS = (app_logging, ingest_sample_kb, streaming)
 
 if any(module.settings is not TEST_SETTINGS for module in SETTINGS_CONSUMERS) or any(
     module.get_settings is not get_test_settings for module in GET_SETTINGS_CONSUMERS
@@ -320,6 +348,88 @@ def _blocked_client(name: str):
 
 
 @pytest.fixture(autouse=True)
+def stream_service_singleton(monkeypatch):
+    """Each test starts without a stream service; one created is shut down after.
+
+    A test that triggers ``get_stream_service()`` must release its runs;
+    leftover worker threads are joined with a guard so none leak.
+    """
+    monkeypatch.setattr(streaming, "_service", None)
+    yield
+    service = streaming._service
+    if service is not None:
+        service.shutdown(wait=False)
+        deadline = time.monotonic() + 5.0
+        while any(t.name.startswith(streaming.WORKER_THREAD_PREFIX) for t in threading.enumerate()):
+            if time.monotonic() > deadline:
+                pytest.fail("Stream worker threads leaked from the service singleton.")
+            time.sleep(0.01)
+
+
+STREAM_GUARD = 5.0
+
+
+def _stream_worker_threads():
+    return [t for t in threading.enumerate() if t.name.startswith(streaming.WORKER_THREAD_PREFIX)]
+
+
+@pytest.fixture
+def stream_app(monkeypatch, settings):
+    """Enable streaming and install a test service; returns a configurator.
+
+    After the test, every service created is checked: no worker threads
+    left, capacity released, one lease release and exactly one audit write
+    per started worker, and the defensive worker-exit claim never fired.
+    """
+    from tests.test_stream_run import AuditLog  # test helper; imported lazily
+
+    monkeypatch.setattr(settings, "stream_enabled", True)
+    created = []
+
+    def configure(workflow, *, max_concurrent=2, timeout=120.0, clock=time.monotonic, audit=None):
+        service = streaming.StreamService(
+            max_concurrent=max_concurrent,
+            timeout_seconds=timeout,
+            clock=clock,
+            poll_seconds=0.01,
+            workflow_stream=workflow,
+            audit_writer=audit if audit is not None else AuditLog(),
+        )
+        service.audit = service.audit_writer
+        service.started = []
+        real_start = service.start_run
+
+        def start_run(*args, **kwargs):
+            run = real_start(*args, **kwargs)
+            if run is not None:
+                service.started.append(run)
+            return run
+
+        service.start_run = start_run
+        monkeypatch.setattr(streaming, "get_stream_service", lambda: service)
+        created.append(service)
+        return service
+
+    yield configure
+
+    for service in created:
+        for run in service.started:
+            run.hooks["worker_exited"].wait(STREAM_GUARD)
+        service.shutdown(wait=False)
+    deadline = time.monotonic() + STREAM_GUARD
+    while _stream_worker_threads() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert _stream_worker_threads() == [], "leaked stream worker threads"
+    for service in created:
+        assert service.capacity.in_use == 0
+        assert service.capacity.acquired_total == service.capacity.released_total
+        for run in service.started:
+            assert run.lease.released
+            assert run.audit_writes == (1 if run.worker_started else 0)
+            assert not run.defensive_claim_fired
+
+
+@pytest.fixture(autouse=True)
 def isolate(monkeypatch, tmp_path):
     """Give each test its own storage and forbid real external clients."""
     monkeypatch.setattr(TEST_SETTINGS, "audit_db_path", tmp_path / "audit.db")
@@ -335,6 +445,7 @@ def isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(vectorstore, "_embeddings", None)
     monkeypatch.setattr(vectorstore, "_vectorstore", None)
     monkeypatch.setattr(workflow, "_llm", None)
+    monkeypatch.setattr(workflow, "_internal_llm", None)
     monkeypatch.setattr(workflow, "_web_search", {})
 
     return TEST_SETTINGS
@@ -352,6 +463,15 @@ def client():
         yield test_client
 
 
+@pytest.fixture
+def anyio_backend():
+    """Run async tests on the standard asyncio loop, never uvloop.
+
+    See the module docstring: the network guard cannot see uvloop sockets.
+    """
+    return ("asyncio", {"use_uvloop": False})
+
+
 # -------------------------------------------------------------------
 # Fakes for the LangGraph workflow
 # -------------------------------------------------------------------
@@ -361,25 +481,46 @@ class FakeLLM:
 
     ``structured`` maps a Pydantic schema class to a queue of responses
     (dicts or model instances) consumed by ``with_structured_output``.
-    ``text`` is a queue of strings returned by plain ``invoke`` calls.
+    ``text`` is a queue of plain ``invoke`` responses: strings, or
+    ``ChunkScript`` objects that are emitted as model output chunks through
+    LangChain callbacks. With ``stream=True``, strings are split into chunks
+    too. Every call is recorded in ``calls`` with the tags from its config.
     """
 
-    def __init__(self, structured=None, text=None):
+    def __init__(self, structured=None, text=None, *, stream=False):
         self.structured = {
             schema: deque(responses)
             for schema, responses in (structured or {}).items()
         }
         self.text = deque(text or [])
+        self.stream = stream
         self.prompts = []
+        self.calls = []
+
+    def _record(self, kind, prompt, config, schema=None):
+        self.prompts.append(prompt)
+        self.calls.append(
+            {
+                "kind": kind,
+                "schema": schema,
+                "prompt": prompt,
+                "tags": list((config or {}).get("tags", [])),
+            }
+        )
 
     def with_structured_output(self, schema, **kwargs):
         return _FakeStructured(self, schema)
 
-    def invoke(self, prompt):
-        self.prompts.append(prompt)
+    def invoke(self, prompt, config=None):
+        self._record("text", prompt, config)
         if not self.text:
             raise ScriptExhausted("FakeLLM ran out of text responses.")
-        return AIMessage(content=self.text.popleft())
+        response = self.text.popleft()
+        if self.stream and isinstance(response, str):
+            response = ChunkScript.from_text(response)
+        if isinstance(response, ChunkScript):
+            return ScriptedChatModel(script=response).invoke(prompt, config=config)
+        return AIMessage(content=response)
 
 
 class _FakeStructured:
@@ -387,8 +528,8 @@ class _FakeStructured:
         self.parent = parent
         self.schema = schema
 
-    def invoke(self, prompt):
-        self.parent.prompts.append(prompt)
+    def invoke(self, prompt, config=None):
+        self.parent._record("structured", prompt, config, schema=self.schema)
         queue = self.parent.structured.get(self.schema)
         if not queue:
             raise ScriptExhausted(
@@ -433,7 +574,12 @@ class FakeWebSearch:
 
 @pytest.fixture
 def fake_rag(monkeypatch):
-    """Install fakes into the workflow and return a configurator."""
+    """Install fakes into the workflow and return a configurator.
+
+    The same ``FakeLLM`` serves answer generation (``llm``) and internal
+    routing, grading, and rewriting calls (``internal_llm``); its ``calls``
+    record which tags each call carried.
+    """
 
     def install(llm=None, retriever=None, web=None):
         llm = llm or FakeLLM()
@@ -441,6 +587,7 @@ def fake_rag(monkeypatch):
         web = web or FakeWebSearch()
 
         monkeypatch.setattr(workflow, "llm", lambda: llm)
+        monkeypatch.setattr(workflow, "internal_llm", lambda: llm)
         monkeypatch.setattr(workflow, "get_retriever", lambda: retriever)
         monkeypatch.setattr(workflow, "web_search_tool", web.factory)
         return llm, retriever, web

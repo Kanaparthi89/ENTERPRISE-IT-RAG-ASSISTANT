@@ -1,4 +1,5 @@
 
+import asyncio
 import logging
 import secrets
 from pathlib import Path
@@ -6,8 +7,10 @@ from typing import Annotated
 from uuid import uuid4
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Header
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, BeforeValidator, StringConstraints
 
+from app.api import streaming
 from app.core.config import get_settings
 from app.rag.workflow import ask
 from app.rag.vectorstore import add_documents
@@ -58,6 +61,23 @@ def health():
     }
 
 
+def _audit_status(source_used: str) -> str:
+    """Audit status for a successfully answered question."""
+    return "insufficient_evidence" if source_used == "insufficient_evidence" else "success"
+
+
+def _chat_response(result: dict, request_id: str, question: str) -> dict:
+    """The /api/chat response body; also the payload of the stream's ``done`` event."""
+    return {
+        "request_id": request_id,
+        "answer": result.get("answer", ""),
+        "source_used": result.get("source_used", "unknown"),
+        "trace": result.get("trace", []),
+        "citations": result.get("citations", []),
+        "rewritten_query": result.get("current_query", question),
+    }
+
+
 @router.post("/chat")
 def chat(payload: ChatRequest):
     """Answer a question using the RAG workflow and record an audit event."""
@@ -66,13 +86,9 @@ def chat(payload: ChatRequest):
 
     try:
         result = ask(question)
+        response = _chat_response(result, request_id, question)
 
-        answer = result.get("answer", "")
-        source_used = result.get("source_used", "unknown")
-        trace = result.get("trace", [])
-        citations = result.get("citations", [])
-
-        if not answer:
+        if not response["answer"]:
             raise RuntimeError("The RAG workflow returned an empty answer.")
 
         # Audit failures should be visible in application logs.
@@ -80,15 +96,11 @@ def chat(payload: ChatRequest):
         try:
             write_audit(
                 question=question,
-                source_used=source_used,
-                trace=trace,
-                citations=citations,
+                source_used=response["source_used"],
+                trace=response["trace"],
+                citations=response["citations"],
                 request_id=request_id,
-                status=(
-                    "insufficient_evidence"
-                    if source_used == "insufficient_evidence"
-                    else "success"
-                ),
+                status=_audit_status(response["source_used"]),
             )
         except Exception:
             logger.exception(
@@ -96,14 +108,7 @@ def chat(payload: ChatRequest):
                 request_id,
             )
 
-        return {
-            "request_id": request_id,
-            "answer": answer,
-            "source_used": source_used,
-            "trace": trace,
-            "citations": citations,
-            "rewritten_query": result.get("current_query", question),
-        }
+        return response
 
     except Exception as exc:
         logger.exception(
@@ -135,6 +140,59 @@ def chat(payload: ChatRequest):
                 "request_id": request_id,
             },
         ) from exc
+
+
+def require_streaming_enabled() -> None:
+    """Raise 404 while the streaming endpoint is disabled."""
+    if not settings.stream_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+class StreamingFlagRoute(APIRoute):
+    """Checks the streaming flag before FastAPI reads or parses the body.
+
+    A disabled endpoint answers 404 for any request body, including invalid
+    JSON. When enabled, the request goes to FastAPI's normal handler, so
+    body parsing and validation errors are unchanged.
+    """
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def route_handler(request):
+            require_streaming_enabled()
+            return await handler(request)
+
+        return route_handler
+
+
+async def chat_stream(payload: ChatRequest):
+    """Answer a question as Server-Sent Events (controlled prototype, off by default)."""
+    request_id = str(uuid4())
+    question = payload.question
+
+    run = streaming.get_stream_service().start_run(
+        question, request_id, asyncio.get_running_loop()
+    )
+    if run is None:
+        return streaming.busy_response(settings.stream_retry_after_seconds)
+
+    return streaming.SSEResponse(
+        run,
+        build_done=lambda final: _chat_response(final, request_id, question),
+        heartbeat_seconds=settings.stream_heartbeat_seconds,
+        retry_after_seconds=settings.stream_retry_after_seconds,
+    )
+
+
+# Registered with add_api_route: the route-class override is not available
+# on the @router.post decorator.
+router.add_api_route(
+    "/chat/stream",
+    chat_stream,
+    methods=["POST"],
+    route_class_override=StreamingFlagRoute,
+)
 
 
 @router.post("/ingest")
