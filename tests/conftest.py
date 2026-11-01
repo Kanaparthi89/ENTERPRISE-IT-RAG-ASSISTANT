@@ -70,6 +70,7 @@ TEST_SETTINGS = IsolatedSettings(
     app_env="testing",
     max_retries=2,
     audit_db_path=UNCONFIGURED_STORAGE / "audit.db",
+    session_db_path=UNCONFIGURED_STORAGE / "sessions.db",
     upload_dir=UNCONFIGURED_STORAGE / "uploads",
     **{name: f"test-{name}" for name in SECRET_FIELDS},
 )
@@ -202,6 +203,7 @@ from app.api import routes  # noqa: E402
 from app.rag import vectorstore, workflow  # noqa: E402
 from app.services import audit  # noqa: E402
 from app.api import streaming  # noqa: E402
+from app.services import sessions as session_service  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from langchain_core.documents import Document  # noqa: E402
 from langchain_core.messages import AIMessage  # noqa: E402
@@ -301,6 +303,7 @@ def session_storage(tmp_path_factory):
     root = tmp_path_factory.mktemp("session-storage")
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(TEST_SETTINGS, "audit_db_path", root / "audit.db")
+        patch.setattr(TEST_SETTINGS, "session_db_path", root / "sessions.db")
         patch.setattr(TEST_SETTINGS, "upload_dir", root / "uploads")
         yield root
 
@@ -397,15 +400,17 @@ def stream_app(monkeypatch, settings):
         )
         service.audit = service.audit_writer
         service.started = []
-        real_start = service.start_run
+        real_start = service.start
 
-        def start_run(*args, **kwargs):
+        # start_run() goes through start(), and so do session runs (A2-6), so
+        # wrapping start() records every run either way.
+        def start(*args, **kwargs):
             run = real_start(*args, **kwargs)
             if run is not None:
                 service.started.append(run)
             return run
 
-        service.start_run = start_run
+        service.start = start
         monkeypatch.setattr(streaming, "get_stream_service", lambda: service)
         created.append(service)
         return service
@@ -430,9 +435,29 @@ def stream_app(monkeypatch, settings):
 
 
 @pytest.fixture(autouse=True)
+def session_runtime_singleton():
+    """Each test starts without a session runtime; one created is shut down after.
+
+    Fails the test if a lease keeper thread outlives the shutdown.
+    """
+    session_service.clear_session_runtime()
+    yield
+    runtime = session_service.peek_session_runtime()
+    if runtime is not None:
+        runtime.manager.shutdown()
+        session_service.clear_session_runtime(runtime)
+    deadline = time.monotonic() + 5.0
+    while any(t.name.startswith("session-keeper") and t.is_alive() for t in threading.enumerate()):
+        if time.monotonic() > deadline:
+            pytest.fail("A session keeper thread leaked from the session runtime.")
+        time.sleep(0.01)
+
+
+@pytest.fixture(autouse=True)
 def isolate(monkeypatch, tmp_path):
     """Give each test its own storage and forbid real external clients."""
     monkeypatch.setattr(TEST_SETTINGS, "audit_db_path", tmp_path / "audit.db")
+    monkeypatch.setattr(TEST_SETTINGS, "session_db_path", tmp_path / "sessions.db")
     monkeypatch.setattr(TEST_SETTINGS, "upload_dir", tmp_path / "uploads")
 
     for module, names in EXTERNAL_CLIENTS.items():

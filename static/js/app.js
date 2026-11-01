@@ -453,6 +453,8 @@
   async function submitQuestion(forcedQuestion) {
     if (isChatting) return;
 
+    hideSessionAlert();
+
     const question = getText(
       typeof forcedQuestion === "string"
         ? forcedQuestion
@@ -537,10 +539,175 @@
     el.trace.appendChild(item);
   }
 
+  // -------------------------------------------------------------------
+  // Conversation session (A2-7): status line and "not sent" alerts.
+  // Created only when sessions are in use; stateless pages never show them.
+  // -------------------------------------------------------------------
+
+  // Status line (polite): save state of the latest answer.
+  const SESSION_TEXT = {
+    on: "Conversation context on: follow-up questions can use earlier answers in this chat.",
+    notSaved:
+      "This answer wasn't saved to the conversation. Follow-up questions won't include it.",
+    unknown: "Couldn't confirm this answer was saved to the conversation.",
+    clearFailed:
+      "Earlier conversation memory couldn't be cleared right now. It will be cleared automatically after a period of inactivity.",
+  };
+
+  // Alerts: the question was not sent. ``action`` is the recovery offered:
+  // "retry" only where trying again can help; "reload" / "new_chat" / none
+  // otherwise. Nothing ever falls back to a stateless question.
+  const SESSION_ALERTS = {
+    session_expired: {
+      text: "This conversation has expired. Start a new chat to continue.",
+      action: "new_chat",
+    },
+    session_busy: {
+      text: "Another question in this conversation is still being answered. Your question wasn't sent. Wait a moment, then select Retry.",
+      action: "retry",
+    },
+    session_unavailable: {
+      text: "Conversation memory is temporarily unavailable. Your question wasn't sent. Select Retry to try again.",
+      action: "retry",
+    },
+    network: {
+      text: "Couldn't reach the server to start a conversation. Your question wasn't sent. Select Retry to try again.",
+      action: "retry",
+    },
+    timeout: {
+      text: "The server took too long to start a conversation. Your question wasn't sent. Select Retry to try again.",
+      action: "retry",
+    },
+    origin_not_allowed: {
+      text: "Conversations can't be started from this address. Your question wasn't sent. Open BluePeak AI Desk from its usual address to continue.",
+      action: null,
+    },
+    unsupported_media_type: {
+      text: "This page is out of date, so a conversation couldn't be started. Your question wasn't sent. Reload the page to continue.",
+      action: "reload",
+    },
+  };
+
+  // Any other 4xx won't succeed on a retry from this page.
+  const SESSION_ALERT_CLIENT_ERROR = {
+    text: "A conversation couldn't be started from this page. Your question wasn't sent. Reload the page to continue.",
+    action: "reload",
+  };
+
+  const SESSION_ALERT_DEFAULT = {
+    text: "Couldn't start a conversation. Your question wasn't sent. Select Retry to try again.",
+    action: "retry",
+  };
+
+  function sessionAlertFor(code) {
+    if (Object.hasOwn(SESSION_ALERTS, code)) return SESSION_ALERTS[code];
+    if (/^http_4\d\d$/.test(code)) return SESSION_ALERT_CLIENT_ERROR;
+    return SESSION_ALERT_DEFAULT;
+  }
+
+  let sessionNotice = null;
+  let sessionAlert = null;
+
+  function composerArea() {
+    return el.chatForm?.parentElement || null;
+  }
+
+  function showSessionNotice(text) {
+    const area = composerArea();
+    if (!area) return;
+
+    if (!sessionNotice) {
+      sessionNotice = document.createElement("p");
+      sessionNotice.className = "session-notice";
+      sessionNotice.setAttribute("role", "status");
+      sessionNotice.setAttribute("aria-live", "polite");
+      el.chatForm.after(sessionNotice);
+    }
+
+    sessionNotice.textContent = text;
+    sessionNotice.hidden = false;
+  }
+
+  function hideSessionNotice() {
+    if (!sessionNotice) return;
+    sessionNotice.textContent = "";
+    sessionNotice.hidden = true;
+  }
+
+  function hideSessionAlert() {
+    sessionAlert?.remove();
+    sessionAlert = null;
+  }
+
+  function showSessionAlert(code) {
+    hideSessionAlert();
+
+    const area = composerArea();
+    if (!area) return;
+
+    const alert = document.createElement("div");
+    alert.className = "session-alert";
+    alert.setAttribute("role", "alert");
+
+    const { text: message, action } = sessionAlertFor(code);
+
+    const text = document.createElement("p");
+    text.textContent = message;
+    alert.appendChild(text);
+
+    const actions = {
+      retry: ["Retry", () => submitQuestion()],
+      // Keep the unsent question for the new conversation.
+      new_chat: ["Start new chat", () => resetConversation({ keepQuestion: true })],
+      reload: ["Reload page", () => window.location.reload()],
+    };
+
+    if (action && actions[action]) {
+      const [label, onClick] = actions[action];
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "session-alert-action";
+      button.textContent = label;
+      button.addEventListener("click", onClick);
+      alert.appendChild(button);
+    }
+
+    area.insertBefore(alert, el.chatForm);
+    sessionAlert = alert;
+  }
+
   const chatView = {
+    blocked({ reason, question }) {
+      // Nothing was sent and nothing was added.
+      if (reason === "aborted") return; // the page is being left
+
+      // Keep the question in the box so Retry / Start new chat can use it
+      // (a suggestion card's question isn't there yet). Never overwrite
+      // text the user has typed.
+      if (question && !el.question.value.trim()) {
+        el.question.value = question;
+        updateCharacterCount();
+      }
+
+      showSessionAlert(reason);
+      // Expired is announced once, by the alert; drop any stale status line.
+      if (reason === "session_expired") hideSessionNotice();
+
+      // A Retry that is blocked again removed the focused button with its
+      // alert: move focus to the question rather than leave it on the page.
+      const active = document.activeElement;
+      if (!active || active === document.body || !active.isConnected) {
+        el.question.focus();
+      }
+    },
+
+    sessionStarted() {
+      showSessionNotice(SESSION_TEXT.on);
+    },
+
     begin(question) {
       clearWelcomeState();
-      addMessage("user", question);
+      const userMessage = addMessage("user", question);
 
       const loadingMessage = addMessage("assistant", "", {
         loading: true,
@@ -648,6 +815,32 @@
             setRunState("Request failed", 100, traceSteps);
           }
         },
+
+        // A session error before anything ran: the question wasn't sent, so
+        // undo begin() and give the question back.
+        reject({ code }) {
+          finish();
+          userMessage.message.remove();
+
+          el.question.value = question;
+          updateCharacterCount();
+
+          setRunState("Question not sent", 0, 0);
+          updateSource(
+            "Awaiting response",
+            "Evidence details will be shown after your question is processed."
+          );
+
+          showSessionAlert(code);
+          // Expired is announced once, by the alert; drop any stale status line.
+          if (code === "session_expired") hideSessionNotice();
+        },
+
+        sessionStatus({ turnSaved }) {
+          if (turnSaved === true) showSessionNotice(SESSION_TEXT.on);
+          else if (turnSaved === false) showSessionNotice(SESSION_TEXT.notSaved);
+          else showSessionNotice(SESSION_TEXT.unknown);
+        },
       };
     },
 
@@ -678,6 +871,16 @@
     typeof window.Response === "function" &&
     "body" in window.Response.prototype;
 
+  // The session token lives only inside this object (memory, never storage).
+  const sessionClient =
+    window.BluePeakChat && typeof window.fetch === "function"
+      ? new window.BluePeakChat.SessionClient({
+          fetchImpl: (url, init) => window.fetch(url, init),
+          // Abandon session creation when the page is being left.
+          signal: () => pageAbort.signal,
+        })
+      : null;
+
   const chatController = window.BluePeakChat
     ? window.BluePeakChat.createChatController({
         view: chatView,
@@ -686,11 +889,28 @@
           supported: streamingSupported,
         }),
         signal: () => pageAbort.signal,
+        sessions: sessionClient,
       })
     : null;
 
-  function resetConversation() {
+  function clearSession() {
+    hideSessionAlert();
+    hideSessionNotice();
+    if (!sessionClient) return;
+
+    // The token is dropped at once; the DELETE is not awaited.
+    sessionClient.clear().then((result) => {
+      if (result.hadSession && !result.cleared && !sessionClient.active) {
+        showSessionNotice(SESSION_TEXT.clearFailed);
+      }
+    });
+  }
+
+  function resetConversation(options = {}) {
     if (isChatting) return;
+
+    const keptQuestion = options.keepQuestion ? el.question.value : "";
+    clearSession();
 
     el.chat.replaceChildren();
 
@@ -764,7 +984,7 @@
       "Evidence details will be shown after your question is processed."
     );
 
-    el.question.value = "";
+    el.question.value = keptQuestion;
     updateCharacterCount();
     el.question.focus();
   }

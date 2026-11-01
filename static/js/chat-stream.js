@@ -34,6 +34,10 @@
 
   const STREAM_URL = "/api/chat/stream";
   const CHAT_URL = "/api/chat";
+  const SESSIONS_URL = "/api/sessions";
+  const SESSION_HEADER = "X-Session-ID";
+  const SESSION_CREATE_RETRY_MS = 1_000; // one automatic retry after a network error
+  const SESSION_CREATE_TIMEOUT_MS = 15_000; // per POST /api/sessions attempt
 
   const IDLE_TIMEOUT_MS = 45_000; // 3x the server's 15 s heartbeat
   const TOTAL_TIMEOUT_MS = 180_000; // above the server's 120 s deadline plus graces
@@ -195,13 +199,60 @@
     return value !== null && typeof value === "object" && !Array.isArray(value);
   }
 
+  /** turn_saved from a ``session`` event: true / false, or null if unusable. */
+  function parseSessionEvent(data, requestId) {
+    try {
+      const payload = JSON.parse(data);
+      if (isObject(payload) && payload.request_id === requestId && typeof payload.turn_saved === "boolean") {
+        return payload.turn_saved;
+      }
+    } catch {
+      // malformed: treated as unknown
+    }
+    return null;
+  }
+
+  /**
+   * Pre-SSE session errors (session requests only):
+   *   409 → session_busy (with Retry-After), 410 → session_expired,
+   *   503 with code session_unavailable → session_unavailable.
+   * A 503 with code stream_busy, or one whose body can't be read, is not a
+   * session error: it stays the existing capacity fallback.
+   */
+  async function readSessionError(response, now) {
+    if (response.status === 409) {
+      return {
+        code: "session_busy",
+        retryAfterMs: parseRetryAfter(response.headers.get("Retry-After"), now()),
+      };
+    }
+    if (response.status === 410) return { code: "session_expired" };
+    if (response.status === 503) {
+      let code = null;
+      try {
+        code = (await response.clone().json())?.detail?.code ?? null;
+      } catch {
+        code = null;
+      }
+      if (code === "session_unavailable") return { code };
+    }
+    return null;
+  }
+
   /**
    * Run one streaming request. Resolves (never rejects) to one of:
    *   { type: "done", data }            done payload (same shape as /api/chat)
    *   { type: "error", code }           the server's terminal error event
    *   { type: "fallback", reason, retryAfterMs? }
    *   { type: "failed", reason, status? }
-   * handlers: onStart(requestId), onTrace(step, index), onDelta(text)
+   *   { type: "session_error", code, retryAfterMs? }   session requests only (A2-7)
+   * handlers: onStart(requestId), onTrace(step, index), onDelta(text),
+   *           onDone(data)  (session requests only: render on "done")
+   *
+   * With ``sessionToken`` the request carries ``X-Session-ID``; a ``done``
+   * outcome then also has ``turnSaved`` (true / false / null) from the
+   * ``session`` event that follows ``done``. Without it the request and
+   * every outcome are exactly as before.
    */
   async function streamChat({
     question,
@@ -212,6 +263,7 @@
     now = Date.now,
     idleMs = IDLE_TIMEOUT_MS,
     totalMs = TOTAL_TIMEOUT_MS,
+    sessionToken = null,
   }) {
     const controller = new AbortController();
     let abortReason = null;
@@ -248,12 +300,14 @@
     try {
       let response;
       try {
+        const headers = {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        };
+        if (sessionToken) headers[SESSION_HEADER] = sessionToken;
         response = await fetchImpl(STREAM_URL, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "text/event-stream",
-          },
+          headers,
           body: JSON.stringify({ question }),
           cache: "no-store",
           signal: controller.signal,
@@ -274,6 +328,14 @@
         }
       };
 
+      if (sessionToken) {
+        // Session errors come before any SSE bytes; they never fall back.
+        const sessionError = await readSessionError(response, now);
+        if (sessionError) {
+          discardBody();
+          return { type: "session_error", ...sessionError };
+        }
+      }
       if (response.status === 404) {
         discardBody();
         return { type: "fallback", reason: "not_found" };
@@ -302,18 +364,27 @@
         return { type: "failed", reason: abortReason };
       }
       activeReader = response.body.getReader();
-      return await readStream(activeReader, handlers, resetIdle, abort, () => abortReason);
+      return await readStream(
+        activeReader, handlers, resetIdle, abort, () => abortReason, Boolean(sessionToken),
+      );
     } finally {
       cleanup();
     }
   }
 
-  async function readStream(reader, handlers, resetIdle, abort, abortReasonOf) {
+  async function readStream(reader, handlers, resetIdle, abort, abortReasonOf, sessionMode = false) {
     const decoder = new TextDecoder("utf-8");
     const parser = new SSEParser();
     let requestId = null;
     let text = "";
     let terminal = null;
+    let sessionSeen = false;
+    let turnSaved = null;
+
+    // A session "done" outcome carries turnSaved; null unless a valid
+    // ``session`` event arrived (missing, malformed or cut off → null).
+    const outcome = () =>
+      sessionMode && terminal && terminal.type === "done" ? { ...terminal, turnSaved } : terminal;
 
     const fail = (reason) => {
       abort(reason);
@@ -322,7 +393,15 @@
     };
 
     const handle = ({ event, data }) => {
-      if (terminal) return; // anything after done/error is ignored
+      if (terminal) {
+        // Session streams: one non-terminal ``session`` event may follow
+        // ``done``. A malformed one never fails the answer (it means null).
+        if (sessionMode && terminal.type === "done" && event === "session" && !sessionSeen) {
+          sessionSeen = true;
+          turnSaved = parseSessionEvent(data, requestId);
+        }
+        return; // anything else after done/error is ignored
+      }
       if (event === "start") {
         if (requestId !== null) throw new SSEProtocolError("duplicate start");
         const payload = parseJson(data);
@@ -354,6 +433,7 @@
           pyStrip(text) === payload.answer
             ? { type: "done", data: payload }
             : { type: "failed", reason: "mismatch" };
+        if (terminal.type === "done") handlers.onDone?.(payload);
       } else {
         terminal = {
           type: "error",
@@ -369,12 +449,12 @@
           chunk = await reader.read();
         } catch {
           // After a terminal event the answer is already complete.
-          if (terminal) return terminal;
+          if (terminal) return outcome();
           return { type: "failed", reason: abortReasonOf() ?? "interrupted" };
         }
 
         if (chunk.done) {
-          if (terminal) return terminal;
+          if (terminal) return outcome();
           const reason = abortReasonOf();
           if (reason !== null) return { type: "failed", reason }; // cancelled by us
           parser.push(decoder.decode());
@@ -406,17 +486,28 @@
     return typeof value === "string" && value.trim() ? value.trim() : fallback;
   }
 
-  /** Resolves to { ok: true, data } or { ok: false, message }. */
-  async function requestChat(question, fetchImpl) {
+  /**
+   * Resolves to { ok: true, data } or { ok: false, message }, or for a session
+   * request { ok: false, sessionError: { code, retryAfterMs? } }. Without a
+   * session token the request and results are exactly as before.
+   */
+  async function requestChat(question, fetchImpl, sessionToken = null, now = Date.now) {
     try {
+      const headers = {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      };
+      if (sessionToken) headers[SESSION_HEADER] = sessionToken;
       const response = await fetchImpl(CHAT_URL, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
+        headers,
         body: JSON.stringify({ question }),
       });
+
+      if (sessionToken) {
+        const sessionError = await readSessionError(response, now);
+        if (sessionError) return { ok: false, sessionError };
+      }
 
       const data = await response.json().catch(() => ({}));
 
@@ -432,6 +523,174 @@
         ok: false,
         message: error instanceof Error ? error.message : "Please try again.",
       };
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // Conversation session (A2-7): the token lives only in this object
+  // -----------------------------------------------------------------
+
+  /**
+   * Holds the session token in memory only (never storage, cookies or URLs).
+   *
+   * ensure() resolves to one of:
+   *   { mode: "session", token, created }   use this token
+   *   { mode: "stateless" }                 sessions are disabled (404): for the page session
+   *   { mode: "blocked", reason }           do not send the question
+   * Only a 404 allows stateless use; any other failure blocks. After a 410
+   * (expire()) it stays blocked with reason "session_expired" until clear():
+   * an expired conversation is never continued in a new session silently.
+   *
+   * Each create request is limited to ``timeoutMs`` (reason "timeout", not
+   * retried automatically) and is abandoned when the page lifecycle
+   * ``signal`` aborts (reason "aborted", never retried). An ordinary network
+   * failure is retried once. Abandoning a request does not undo a session
+   * the server may already have created: that session is never used and
+   * expires on the server after its idle timeout.
+   */
+  class SessionClient {
+    constructor({
+      fetchImpl,
+      timers = realTimers,
+      retryDelayMs = SESSION_CREATE_RETRY_MS,
+      timeoutMs = SESSION_CREATE_TIMEOUT_MS,
+      signal = null, // an AbortSignal, or a function returning the current one
+    }) {
+      this.fetchImpl = fetchImpl;
+      this.timers = timers;
+      this.retryDelayMs = retryDelayMs;
+      this.timeoutMs = timeoutMs;
+      this.signal = signal;
+      this.token = null;
+      this.disabled = false;
+      this.expired = false;
+    }
+
+    get active() {
+      return this.token !== null;
+    }
+
+    async ensure() {
+      if (this.disabled) return { mode: "stateless" };
+      if (this.expired) return { mode: "blocked", reason: "session_expired" };
+      if (this.token) return { mode: "session", token: this.token, created: false };
+
+      const pageSignal = typeof this.signal === "function" ? this.signal() : this.signal;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (pageSignal?.aborted) return { mode: "blocked", reason: "aborted" };
+        const result = await this.createOnce(pageSignal);
+        if (result.reason !== "network" || attempt === 1) return result;
+        // One automatic retry after an ordinary network failure: a retry is
+        // not a downgrade. Leaving the page cancels the wait.
+        if (!(await this.wait(this.retryDelayMs, pageSignal))) {
+          return { mode: "blocked", reason: "aborted" };
+        }
+      }
+      return { mode: "blocked", reason: "network" };
+    }
+
+    /** One POST /api/sessions, bounded by the timeout and the page signal. */
+    async createOnce(pageSignal) {
+      const controller = new AbortController();
+      let abortReason = null;
+      let rejectOnAbort;
+      const aborted = new Promise((_, reject) => (rejectOnAbort = reject));
+      aborted.catch(() => {});
+      const abort = (reason) => {
+        if (abortReason !== null) return;
+        abortReason = reason;
+        controller.abort();
+        rejectOnAbort(new Error(reason)); // even if fetchImpl ignores the signal
+      };
+      const timer = this.timers.setTimeout(() => abort("timeout"), this.timeoutMs);
+      const onPageAbort = () => abort("aborted");
+      pageSignal?.addEventListener("abort", onPageAbort, { once: true });
+      const blocked = (reason) => ({ mode: "blocked", reason });
+
+      try {
+        let response;
+        try {
+          response = await Promise.race([
+            this.fetchImpl(SESSIONS_URL, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Accept: "application/json" },
+              body: "{}",
+              cache: "no-store",
+              signal: controller.signal,
+            }),
+            aborted,
+          ]);
+        } catch {
+          return blocked(abortReason ?? "network");
+        }
+
+        if (response.status === 404) {
+          this.disabled = true; // the feature is off: stateless for this page session
+          return { mode: "stateless" };
+        }
+
+        let body = null;
+        try {
+          body = await Promise.race([response.json(), aborted]);
+        } catch {
+          body = null;
+        }
+        if (abortReason !== null) return blocked(abortReason);
+
+        if (response.status === 201 && typeof body?.session_id === "string" && body.session_id) {
+          this.token = body.session_id;
+          return { mode: "session", token: this.token, created: true };
+        }
+        const code = body?.detail?.code;
+        return blocked(typeof code === "string" && code ? code : `http_${response.status}`);
+      } finally {
+        this.timers.clearTimeout(timer);
+        pageSignal?.removeEventListener("abort", onPageAbort);
+      }
+    }
+
+    /** Resolves true after ``ms``, or false at once if the page signal aborts. */
+    wait(ms, pageSignal) {
+      return new Promise((resolve) => {
+        let timer = null;
+        const onAbort = () => {
+          this.timers.clearTimeout(timer);
+          resolve(false);
+        };
+        timer = this.timers.setTimeout(() => {
+          pageSignal?.removeEventListener("abort", onAbort);
+          resolve(true);
+        }, ms);
+        pageSignal?.addEventListener("abort", onAbort, { once: true });
+      });
+    }
+
+    /** After a 410: forget the token; "New chat" (clear) is needed to go on. */
+    expire() {
+      this.token = null;
+      this.expired = true;
+    }
+
+    /**
+     * "New chat": forget the token immediately, then ask the server to clear
+     * the memory. Resolves to { cleared: true } only on 204; a failure is not
+     * retried (the token is gone) and the memory expires on its own.
+     */
+    async clear() {
+      const token = this.token;
+      this.token = null;
+      this.expired = false;
+      if (!token) return { cleared: true, hadSession: false };
+      try {
+        const response = await this.fetchImpl(SESSIONS_URL, {
+          method: "DELETE",
+          headers: { [SESSION_HEADER]: token },
+          cache: "no-store",
+        });
+        return { cleared: response.status === 204, hadSession: true };
+      } catch {
+        return { cleared: false, hadSession: true };
+      }
     }
   }
 
@@ -456,8 +715,15 @@
 
   /**
    * view.begin(question) returns an attempt with:
-   *   trace(step, index), delta(text), complete(data), fail(message)
-   * The controller calls complete or fail exactly once per question.
+   *   trace(step, index), delta(text), complete(data), fail(message),
+   *   reject({ code, retryAfterMs })        session errors: the question was not sent
+   *   sessionStatus({ turnSaved, historyTurnsUsed })   after a session answer
+   * The controller calls exactly one of complete / fail / reject per question.
+   * view.blocked({ reason, question }) is called instead of begin() when a session is
+   * needed but can't be created (503 / 403 / 415 / network): nothing is sent.
+   *
+   * ``sessions`` (a SessionClient) is optional: without it, or once sessions
+   * turn out to be disabled (404), every question is stateless exactly as before.
    */
   function createChatController({
     view,
@@ -468,12 +734,34 @@
     signal,
     idleMs = IDLE_TIMEOUT_MS,
     totalMs = TOTAL_TIMEOUT_MS,
+    sessions = null,
   }) {
     let busy = false;
 
     async function submit(question) {
       if (busy) return false;
       busy = true;
+
+      // A session comes first. Only "disabled" (404) allows a stateless
+      // question; any other failure blocks, and nothing is sent.
+      let sessionToken = null;
+      if (sessions) {
+        let session;
+        try {
+          session = await sessions.ensure();
+        } catch {
+          session = { mode: "blocked", reason: "error" };
+        }
+        if (session.mode === "blocked") {
+          busy = false;
+          view.blocked?.({ reason: session.reason, question });
+          return false;
+        }
+        if (session.mode === "session") {
+          sessionToken = session.token;
+          if (session.created) view.sessionStarted?.();
+        }
+      }
 
       let attempt;
       try {
@@ -494,11 +782,33 @@
       let fallbackUsed = false;
       let partialShown = false;
 
+      const reportSession = (turnSaved, data) => {
+        if (!sessionToken) return;
+        const turns = data?.session?.history_turns_used;
+        attempt.sessionStatus?.({
+          turnSaved: typeof turnSaved === "boolean" ? turnSaved : null,
+          historyTurnsUsed: Number.isInteger(turns) ? turns : null,
+        });
+      };
+
+      const sessionError = ({ code, retryAfterMs }) => {
+        if (code === "session_expired") sessions.expire(); // never re-sent with this token
+        settle(() => attempt.reject({ code, retryAfterMs }));
+      };
+
       const fallback = async () => {
         if (fallbackUsed) return; // never more than one /api/chat request
         fallbackUsed = true;
-        const result = await requestChat(question, fetchImpl);
-        settle(() => (result.ok ? attempt.complete(result.data) : attempt.fail(result.message)));
+        // Same token as the stream: never a silent stateless retry.
+        const result = await requestChat(question, fetchImpl, sessionToken, now);
+        if (result.sessionError) {
+          sessionError(result.sessionError);
+        } else if (result.ok) {
+          settle(() => attempt.complete(result.data));
+          reportSession(result.data?.session?.turn_saved, result.data);
+        } else {
+          settle(() => attempt.fail(result.message));
+        }
       };
 
       try {
@@ -517,17 +827,24 @@
           now,
           idleMs,
           totalMs,
+          sessionToken,
           handlers: {
             onTrace: (step, index) => attempt.trace(step, index),
             onDelta: (text) => {
               partialShown = true;
               attempt.delta(text);
             },
+            // Session streams: show the answer as soon as "done" arrives; the
+            // question stays busy until the stream ends (after "session").
+            onDone: sessionToken ? (data) => settle(() => attempt.complete(data)) : undefined,
           },
         });
 
         if (outcome.type === "done") {
           settle(() => attempt.complete(outcome.data));
+          reportSession(outcome.turnSaved, outcome.data);
+        } else if (outcome.type === "session_error") {
+          sessionError(outcome);
         } else if (outcome.type === "error") {
           settle(() => attempt.fail(errorMessage(outcome.code)));
         } else if (outcome.type === "fallback" && !partialShown) {
@@ -557,6 +874,11 @@
   return {
     STREAM_URL,
     CHAT_URL,
+    SESSIONS_URL,
+    SESSION_HEADER,
+    SESSION_CREATE_RETRY_MS,
+    SESSION_CREATE_TIMEOUT_MS,
+    SessionClient,
     IDLE_TIMEOUT_MS,
     TOTAL_TIMEOUT_MS,
     ERROR_MESSAGES,

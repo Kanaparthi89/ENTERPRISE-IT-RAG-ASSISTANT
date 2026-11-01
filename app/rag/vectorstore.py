@@ -101,12 +101,37 @@ def ensure_index():
     return pc.Index(settings.pinecone_index_name)
 
 
+class _TimeoutIndex:
+    """A Pinecone index whose queries and upserts have a finite timeout (H1).
+
+    The SDK sets no timeout by default, so a stalled connection blocks its
+    thread indefinitely. ``_request_timeout`` applies to each HTTP attempt;
+    the SDK's own retries still apply. A timeout passed by the caller is kept.
+    Everything else (for example ``config``) is the wrapped index's.
+    """
+
+    def __init__(self, index, timeout_seconds: float):
+        self._index = index
+        self._timeout_seconds = timeout_seconds
+
+    def query(self, *args, **kwargs):
+        kwargs.setdefault("_request_timeout", self._timeout_seconds)
+        return self._index.query(*args, **kwargs)
+
+    def upsert(self, *args, **kwargs):
+        kwargs.setdefault("_request_timeout", self._timeout_seconds)
+        return self._index.upsert(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._index, name)
+
+
 def get_vectorstore():
     global _vectorstore
 
     if _vectorstore is None:
         _vectorstore = PineconeVectorStore(
-            index=ensure_index(),
+            index=_TimeoutIndex(ensure_index(), settings.pinecone_timeout_seconds),
             embedding=get_embeddings(),
             namespace=settings.pinecone_namespace,
         )

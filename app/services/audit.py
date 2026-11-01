@@ -4,6 +4,7 @@
 import json
 import logging
 import sqlite3
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -83,6 +84,9 @@ def init_db() -> None:
             "citation_json": "TEXT NOT NULL DEFAULT '[]'",
             "status": "TEXT NOT NULL DEFAULT 'success'",
             "error_type": "TEXT",
+            # A2: the internal session UUID (never the bearer token); NULL for
+            # stateless requests. Deleting a session never touches audit rows.
+            "session_id": "TEXT",
         }
 
         for column, definition in migrations.items():
@@ -105,6 +109,29 @@ def init_db() -> None:
             """
         )
 
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_query_audit_session_id
+            ON query_audit(session_id)
+            """
+        )
+
+
+def _check_session_id(session_id: str | None) -> None:
+    """Accept only an internal session ID: a canonical lowercase UUID.
+
+    This keeps a raw bearer token from ever being stored by mistake. The
+    error message never includes the rejected value.
+    """
+    if session_id is None:
+        return
+    try:
+        canonical = str(uuid.UUID(session_id)) if isinstance(session_id, str) else None
+    except ValueError:
+        canonical = None
+    if canonical is None or canonical != session_id:
+        raise ValueError("Audit session_id must be an internal session ID.")
+
 
 def write_audit(
     question: str,
@@ -115,12 +142,19 @@ def write_audit(
     citations: list[dict[str, Any]] | None = None,
     status: str = "success",
     error_type: str | None = None,
+    session_id: str | None = None,
 ) -> int:
     """Persist an audit event and return its database row ID.
 
     Avoid passing secrets, authentication tokens, or sensitive personal
     information in questions, traces, citations, or error messages.
+
+    ``session_id`` is the internal session UUID for session requests (never
+    the bearer token); omit it for stateless requests, which are written
+    exactly as before.
     """
+    _check_session_id(session_id)
+
     if not isinstance(question, str) or not question.strip():
         raise ValueError("Audit question must not be empty.")
 
@@ -143,6 +177,29 @@ def write_audit(
     except (TypeError, ValueError) as exc:
         raise ValueError("Trace and citations must be JSON serializable.") from exc
 
+    if session_id is not None:
+        with _transaction() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO query_audit (
+                    request_id, created_at, question, source_used, trace_json,
+                    citation_json, status, error_type, session_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id, created_at, question.strip(), source_used.strip(),
+                    trace_json, citation_json, status, error_type, session_id,
+                ),
+            )
+            audit_id = cursor.lastrowid
+        logger.info(
+            "Audit event recorded: id=%s source=%s status=%s session=%s",
+            audit_id, source_used, status, session_id,
+        )
+        return audit_id
+
+    # Stateless requests: the original statement, unchanged.
     with _transaction() as connection:
         cursor = connection.execute(
             """
@@ -190,7 +247,7 @@ def get_recent_audits(limit: int = 20) -> list[dict[str, Any]]:
         rows = connection.execute(
             """
             SELECT id, request_id, created_at, question, source_used,
-                   trace_json, citation_json, status, error_type
+                   trace_json, citation_json, status, error_type, session_id
             FROM query_audit
             ORDER BY id DESC
             LIMIT ?

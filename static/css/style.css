@@ -1152,6 +1152,53 @@ textarea:focus-visible,
   height: 15px;
 }
 
+/* Conversation session (A2-7): status line and "not sent" alert */
+.session-notice {
+  margin: 6px 2px 0;
+  color: var(--muted-dark);
+  font-size: 10px;
+}
+
+.session-notice[hidden] {
+  display: none;
+}
+
+.session-alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  padding: 9px 12px;
+  border: 1px solid #f1c9c9;
+  border-radius: 11px;
+  color: #8a2c2c;
+  background: #fdf3f3;
+  font-size: 10px;
+}
+
+.session-alert p {
+  margin: 0;
+}
+
+.session-alert-action {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 0 12px;
+  border: 1px solid currentColor;
+  border-radius: 8px;
+  color: inherit;
+  background: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.session-alert-action:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
 .disclaimer {
   margin: 10px 0 0;
   color: #a0a7b5;

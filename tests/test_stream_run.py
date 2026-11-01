@@ -877,6 +877,141 @@ async def test_shutdown_with_wait_completes_queued_work(make_service):
     assert [row["status"] for row in service.audit.rows] == ["success"]
 
 
+# -------------------------------------------------------------------
+# H2: close() at application shutdown
+# -------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_close_drains_a_worker_that_finishes_within_the_bound(make_service):
+    gate = Gate()
+    service = make_service(ScriptedWorkflow([("gate", gate), ("chunk", "A"), ("final", final_state())]))
+    run = start(service)
+    consumer = asyncio.ensure_future(consume(run))
+    await wait_event(gate.reached)
+
+    closing = asyncio.ensure_future(asyncio.to_thread(service.close, 2.0))  # off the event loop
+    await asyncio.sleep(0.05)
+    gate.release.set()  # the consumer keeps running on the loop meanwhile
+    received, end = await consumer
+    summary = await closing
+
+    assert summary == {"still_running": 0, "cancelled": 0}
+    assert end == "final" and deltas(received) == ["A"]
+    assert run.outcome.decision.status == "completed"
+    assert [row["status"] for row in service.audit.rows] == ["success"]
+
+
+@pytest.mark.anyio
+async def test_close_is_bounded_and_cancels_undecided_runs(make_service):
+    gate = Gate()
+    service = make_service(ScriptedWorkflow([("gate", gate), ("final", final_state())]))
+    run = start(service)
+    consumer = asyncio.ensure_future(consume(run))
+    await wait_event(gate.reached)
+
+    began = time.monotonic()
+    summary = await asyncio.to_thread(service.close, 0.2)
+    assert time.monotonic() - began < 0.2 + 0.5  # bounded by the drain, not by the worker
+
+    assert summary == {"still_running": 1, "cancelled": 1}
+    decision = run.outcome.decision
+    assert (decision.status, decision.error_type) == ("cancelled", "ServerShutdown")
+    assert run.stop_requested
+    _, end = await consumer
+    assert end is ABORTED  # the consumer is told to stop
+
+    gate.release.set()  # the worker finishes its step, then sees the stop
+    await wait_event(run.hooks["worker_exited"])
+    [row] = service.audit.rows
+    assert (row["status"], row["error_type"]) == ("cancelled", "ServerShutdown")
+
+
+@pytest.mark.anyio
+async def test_close_never_changes_a_completed_outcome(make_service):
+    audit_gate = Gate()
+
+    class BlockingAudit(AuditLog):
+        def __call__(self, **row):
+            audit_gate.reached.set()
+            audit_gate.release.wait(GUARD)
+            super().__call__(**row)
+
+    service = make_service(ScriptedWorkflow([("final", final_state())]), audit=BlockingAudit())
+    run = start(service)
+    _, end = await consume(run)  # claims "completed" after the final event
+    assert end == "final"
+    await wait_event(audit_gate.reached)  # the worker is still finishing
+
+    summary = await asyncio.to_thread(service.close, 0.2)
+
+    assert summary == {"still_running": 1, "cancelled": 0}
+    assert run.outcome.decision.status == "completed"  # not overwritten
+    assert not run.stop_requested
+    audit_gate.release.set()
+    await wait_event(run.hooks["worker_exited"])
+    assert [row["status"] for row in service.audit.rows] == ["success"]
+
+
+@pytest.mark.anyio
+async def test_close_stops_new_runs(make_service):
+    service = make_service(ScriptedWorkflow([("final", final_state())]))
+
+    assert await asyncio.to_thread(service.close, 0.1) == {"still_running": 0, "cancelled": 0}
+
+    run = service.start_run("q?", "req-after-close", asyncio.get_running_loop())
+    assert run is None  # the pool is shut down; the reserved slot is given back
+    assert service.capacity.in_use == 0
+
+
+@pytest.mark.anyio
+async def test_close_releases_a_run_whose_response_never_attached(make_service):
+    """U6: no consumer will ever mark itself done, so close() abandons it."""
+    gate = Gate()
+    service = make_service(ScriptedWorkflow([("gate", gate), ("final", final_state())]))
+    run = start(service)  # no consumer attaches
+    await wait_event(gate.reached)
+    assert service.capacity.in_use == 1
+
+    summary = await asyncio.to_thread(service.close, 0.1)
+
+    assert summary == {"still_running": 1, "cancelled": 1}
+    assert run.lease.attach_state == "abandoned"
+    assert run.attach() is False  # a late response can no longer attach
+    assert not run.lease.released  # the worker is still running
+
+    gate.release.set()
+    await wait_event(run.hooks["worker_exited"])
+    await wait_until(lambda: run.lease.released)
+    assert service.capacity.in_use == 0
+    assert service.active_runs() == []
+    [row] = service.audit.rows
+    assert (row["status"], row["error_type"]) == ("cancelled", "ServerShutdown")
+
+
+@pytest.mark.anyio
+async def test_close_leaves_an_attached_consumer_to_finish_itself(make_service):
+    """U6 keeps attached responses as they were: the lease waits for the consumer."""
+    gate = Gate()
+    service = make_service(ScriptedWorkflow([("gate", gate), ("final", final_state())]))
+    run = start(service)
+    assert run.attach()  # a response is attached but has not finished yet
+    run.mark_response_started()
+    await wait_event(gate.reached)
+
+    summary = await asyncio.to_thread(service.close, 0.1)
+
+    assert summary == {"still_running": 1, "cancelled": 1}
+    assert run.lease.attach_state == "attached"  # not abandoned
+    gate.release.set()
+    await wait_event(run.hooks["worker_exited"])
+    assert not run.lease.released  # still waiting for the attached consumer
+    assert service.capacity.in_use == 1
+
+    run.consumer_finished(None)  # the response ends
+    assert run.lease.released
+    assert service.capacity.in_use == 0
+
+
 @pytest.mark.anyio
 async def test_worker_cancelled_before_start_releases_lease_without_audit(make_service):
     service = make_service(ScriptedWorkflow([("final", final_state())]), max_concurrent=1)

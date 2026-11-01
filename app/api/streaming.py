@@ -34,8 +34,8 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Any
 
 import anyio
@@ -56,6 +56,11 @@ ATTACH_GRACE = 2.0
 FINALIZE_GRACE = 5.0  # TIMEOUT_ERROR_GRACE + END_OF_BODY_GRACE + 1 s margin
 
 WORKER_THREAD_PREFIX = "bp-stream"
+
+# Session streams (A2-6): after ``done`` the response waits at most this long,
+# outside the deadline scope, for the worker's save result before sending the
+# ``session`` event (design revision 8 §11.2).
+SESSION_SAVE_REPORT_WAIT = 2.0
 
 
 class _Sentinel:
@@ -412,6 +417,28 @@ CONSUMER_EXITS = {
 }
 
 
+@dataclass
+class StreamSession:
+    """The conversation-session side of a run (A2-6).
+
+    ``manager`` and ``lease`` come from ``app.services.sessions``; the lease
+    was taken before the run started. ``result`` receives ``turn_saved``
+    from the worker; the response waits for it (bounded) after ``done``.
+    """
+
+    manager: Any
+    lease: Any
+    history: list[dict[str, str]]
+    history_turns_used: int
+    result: Future = field(default_factory=Future)
+
+    def report(self, turn_saved: bool) -> None:
+        try:
+            self.result.set_result(turn_saved)
+        except InvalidStateError:
+            pass  # already reported
+
+
 class StreamRun:
     """A single streamed chat request.
 
@@ -434,10 +461,12 @@ class StreamRun:
         poll_seconds: float,
         workflow_stream: Callable[..., Iterator[tuple[str, Any]]],
         audit_writer: Callable[..., Any],
+        session: StreamSession | None = None,
     ):
         self.question = question
         self.request_id = request_id
         self.lease = lease
+        self.session = session
         self._loop = loop
         self._clock = clock
         self._poll_seconds = poll_seconds
@@ -529,7 +558,12 @@ class StreamRun:
         final = None
         error = None
         try:
-            stream = self._workflow_stream(self.question, self._forward_chunk)
+            if self.session is None:
+                stream = self._workflow_stream(self.question, self._forward_chunk)
+            else:
+                stream = self._workflow_stream(
+                    self.question, self._forward_chunk, history=self.session.history
+                )
             try:
                 for kind, payload in stream:
                     if self.stop_reason() is not None:
@@ -608,11 +642,37 @@ class StreamRun:
                 self.defensive_claim_fired = True
                 logger.error("Stream worker exited undecided for request_id=%s", self.request_id)
                 self.outcome.claim("cancelled", "WorkerExit", "worker exited undecided")
+            self._finish_session()
             self._write_audit()
         finally:
             self.stage = "done"
             self.lease.mark_worker_done()
             self.hooks["worker_exited"].set()
+
+    def _finish_session(self) -> None:
+        """Save the turn (completed only, ownership checked) or release; report turn_saved.
+
+        Runs on the worker thread after the outcome is decided and before the
+        audit row. The lease is always released and removed from the keeper.
+        """
+        session = self.session
+        if session is None:
+            return
+        saved = False
+        try:
+            final = self.final_state or {}
+            if self.outcome.decision.status == "completed" and final.get("answer"):
+                saved = bool(session.manager.finish(
+                    session.lease,
+                    (self.question.strip(), final.get("answer", ""), final.get("source_used")),
+                ))
+            else:
+                session.manager.finish(session.lease)
+        except Exception:  # noqa: BLE001 - reported as not saved
+            logger.exception("Session turn finish failed for request_id=%s", self.request_id)
+            saved = False
+        finally:
+            session.report(saved)
 
     def _write_audit(self) -> None:
         decision = self.outcome.decision
@@ -635,6 +695,9 @@ class StreamRun:
                 status="cancelled" if decision.status == "cancelled" else "failed",
                 error_type=decision.error_type,
             )
+
+        if self.session is not None:
+            fields["session_id"] = self.session.lease.session_id  # internal UUID, never the token
 
         self.audit_writes += 1
         try:
@@ -666,6 +729,14 @@ class StreamRun:
         if self.lease.abandon():  # no consumer attached; a late one is refused
             self.lease.mark_consumer_done()
         self.request_stop("worker_not_started")  # an attached consumer sees ABORTED
+        if self.session is not None:
+            session = self.session
+            session.report(False)
+            # May run on any thread, including the event loop: release off it.
+            threading.Thread(
+                target=session.manager.finish, args=(session.lease,),
+                name="session-release", daemon=True,
+            ).start()
         self.lease.mark_worker_done()
         self.hooks["worker_exited"].set()
 
@@ -722,6 +793,15 @@ class StreamRun:
 # Service: worker pool, admission, registry
 # -------------------------------------------------------------------
 
+@dataclass
+class Reservation:
+    """A capacity slot taken by ``StreamService.reserve()`` and not yet used."""
+
+    lease: StreamLease
+    run_key: list[int]
+    used: bool = False
+
+
 class StreamService:
     """Owns the dedicated worker pool, capacity, and active-run registry."""
 
@@ -751,17 +831,55 @@ class StreamService:
         self, question: str, request_id: str, loop: asyncio.AbstractEventLoop
     ) -> StreamRun | None:
         """Admit and start a run, or return None when no capacity is available."""
+        reservation = self.reserve()
+        if reservation is None:
+            return None
+        return self.start(reservation, question, request_id, loop)
+
+    def reserve(self) -> "Reservation | None":
+        """Take a capacity slot without starting a worker (A2-6: capacity first).
+
+        Returns None when capacity is full. A reservation must be passed to
+        ``start()`` or ``cancel()`` exactly once.
+        """
         run_key: list[int] = []
 
         def on_release():
             with self._registry_lock:
-                self._active.pop(run_key[0], None)
+                if run_key:
+                    self._active.pop(run_key[0], None)
 
         lease = self.capacity.try_acquire(on_release)
         if lease is None:
             self._log_saturation()
             return None
+        return Reservation(lease=lease, run_key=run_key)
 
+    def cancel(self, reservation: "Reservation") -> None:
+        """Give an unused reservation's slot back (exactly once; no worker, no audit)."""
+        if reservation.used:
+            return
+        reservation.used = True
+        reservation.lease.mark_worker_done()
+        reservation.lease.mark_consumer_done()
+
+    def start(
+        self,
+        reservation: "Reservation",
+        question: str,
+        request_id: str,
+        loop: asyncio.AbstractEventLoop,
+        session: StreamSession | None = None,
+    ) -> StreamRun | None:
+        """Start a run on a reserved slot; None if the worker can't be submitted.
+
+        On failure the slot is released here; a session lease is the caller's
+        to release.
+        """
+        if reservation.used:
+            raise RuntimeError("This reservation has already been used.")
+        reservation.used = True
+        lease = reservation.lease
         run = StreamRun(
             question=question,
             request_id=request_id,
@@ -772,8 +890,9 @@ class StreamService:
             poll_seconds=self.poll_seconds,
             workflow_stream=self.workflow_stream,
             audit_writer=self.audit_writer,
+            session=session,
         )
-        run_key.append(id(run))
+        reservation.run_key.append(id(run))
         with self._registry_lock:
             self._active[id(run)] = run
 
@@ -818,6 +937,39 @@ class StreamService:
         """
         self._executor.shutdown(wait=wait, cancel_futures=False)
 
+    def close(self, drain_seconds: float) -> dict[str, int]:
+        """Application shutdown (H2). Blocks; call it off the event loop.
+
+        Stops accepting runs, then waits at most ``drain_seconds`` for running
+        workers to finish, so their turns are saved and their audit rows are
+        written. A run that is still undecided afterwards is claimed
+        ``cancelled`` and asked to stop; a decided outcome, ``completed``
+        included, is never changed. Workers are never killed: one blocked in
+        an external call finishes when that call returns.
+        """
+        self.shutdown(wait=False)
+        deadline = time.monotonic() + max(0.0, drain_seconds)
+        for run in self.active_runs():
+            run.hooks["worker_exited"].wait(max(0.0, deadline - time.monotonic()))
+
+        running = [run for run in self.active_runs() if not run.hooks["worker_exited"].is_set()]
+        cancelled = 0
+        for run in running:
+            if run.outcome.claim("cancelled", "ServerShutdown", "server shutdown"):
+                run.request_stop("server_shutdown")
+                # A response that never attached will never mark the consumer
+                # done; abandon it so the lease (and its capacity slot) is
+                # released when the worker exits. An attached one is unaffected.
+                if run.lease.abandon():
+                    run.lease.mark_consumer_done()
+                cancelled += 1
+        if running:
+            logger.warning(
+                "Stream shutdown: %d worker(s) still running after %.1fs; %d undecided run(s) cancelled.",
+                len(running), drain_seconds, cancelled,
+            )
+        return {"still_running": len(running), "cancelled": cancelled}
+
 
 # -------------------------------------------------------------------
 # Service singleton
@@ -838,6 +990,20 @@ def get_stream_service() -> StreamService:
                 timeout_seconds=settings.stream_timeout_seconds,
             )
         return _service
+
+
+def peek_stream_service() -> StreamService | None:
+    """The service if one was created; never creates one."""
+    with _service_lock:
+        return _service
+
+
+def clear_stream_service(service: StreamService | None = None) -> None:
+    """Forget the service (after shutdown), so a restarted app gets a fresh one."""
+    global _service
+    with _service_lock:
+        if service is None or _service is service:
+            _service = None
 
 
 # -------------------------------------------------------------------
@@ -865,10 +1031,18 @@ def format_sse(event: str, data: Any) -> bytes:
     return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
 
 
-def busy_response(retry_after_seconds: int) -> JSONResponse:
+def busy_response(retry_after_seconds: int, code: str | None = None) -> JSONResponse:
+    """503 when stream capacity is full.
+
+    ``code`` (``"stream_busy"``) is added only for session requests, so the
+    stateless response body stays exactly as before.
+    """
+    detail = {"message": BUSY_MESSAGE}
+    if code is not None:
+        detail = {"code": code, **detail}
     return JSONResponse(
         status_code=503,
-        content={"detail": {"message": BUSY_MESSAGE}},
+        content={"detail": detail},
         headers={"Retry-After": str(retry_after_seconds)},
     )
 
@@ -915,6 +1089,7 @@ class SSEResponse(StreamingResponse):
         self._send_failed = False
         self._consumer_error: Exception | None = None
         self._terminal_sent = False  # "done" or "error" delivered
+        self._report_session = False  # completed with a session: send the ``session`` event
 
     async def __call__(self, scope, receive, send) -> None:
         run = self.run
@@ -1009,9 +1184,10 @@ class SSEResponse(StreamingResponse):
             await self._check_deadline(scope)
             await send({"type": "http.response.start", "status": 200, "headers": self.raw_headers})
             run.mark_response_started()
-            await self._send_body(
-                send, format_sse("start", {"request_id": run.request_id, "version": STREAM_VERSION})
-            )
+            start = {"request_id": run.request_id, "version": STREAM_VERSION}
+            if run.session is not None:
+                start["session"] = {"history_turns_used": run.session.history_turns_used}
+            await self._send_body(send, format_sse("start", start))
 
             while True:
                 await self._check_deadline(scope)
@@ -1029,7 +1205,8 @@ class SSEResponse(StreamingResponse):
                     self._terminal_sent = True
                     await anyio.lowlevel.checkpoint()  # process an already-delivered disconnect
                     if not self._disconnect_received:
-                        run.claim_completed()
+                        completed = run.claim_completed()
+                        self._report_session = completed and run.session is not None
                     break
                 if kind == "error":
                     await self._send_body(send, self._error_frame(payload.get("code", "internal_error")))
@@ -1048,6 +1225,34 @@ class SSEResponse(StreamingResponse):
                     await self._end_body(send)
             return  # headers never sent, or the grace expired: leave it to the server
 
+        if self._report_session:
+            await self._send_session_event(send)
+
         # Transport cleanup only: a failure here never changes a claimed outcome.
         with anyio.move_on_after(END_OF_BODY_GRACE):
             await self._end_body(send)
+
+    async def _send_session_event(self, send) -> None:
+        """After ``done``: wait (bounded) for the worker's save, then send ``session``.
+
+        Outside the deadline scope; ``completed`` is already claimed, so
+        nothing here can change the outcome. ``turn_saved`` is None when the
+        save result didn't arrive in time (the client treats that as not saved).
+        """
+        session = self.run.session
+        turn_saved = None
+        with anyio.move_on_after(SESSION_SAVE_REPORT_WAIT):
+            # shield: giving up on the wait must not cancel the worker's result.
+            turn_saved = await asyncio.shield(asyncio.wrap_future(session.result))
+        with anyio.move_on_after(END_OF_BODY_GRACE):
+            await self._send_body(
+                send,
+                format_sse(
+                    "session",
+                    {
+                        "request_id": self.run.request_id,
+                        "turn_saved": turn_saved,
+                        "history_turns_used": session.history_turns_used,
+                    },
+                ),
+            )

@@ -3,12 +3,15 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 # Project root: repository root, based on this file's location.
 BASE_DIR = Path(__file__).resolve().parents[2]
+
+# FINALIZE_GRACE (5 s) in app/api/streaming.py plus a 10 s margin (design §6).
+_STREAM_FINALIZE_MARGIN_SECONDS = 15.0
 
 
 class Settings(BaseSettings):
@@ -39,14 +42,45 @@ class Settings(BaseSettings):
     top_k: int = Field(default=4, ge=1, le=50)
     max_retries: int = Field(default=2, ge=0, le=10)
 
+    # Finite timeouts for Pinecone and Tavily calls (H1), separate from the
+    # OpenAI limits above. Pinecone: per HTTP attempt of a query or upsert;
+    # the SDK retries a failed attempt up to 5 times. Tavily: Requests
+    # connect and read timeouts for one search request (no retries).
+    pinecone_timeout_seconds: float = Field(default=10.0, gt=0, le=15)
+    tavily_timeout_seconds: float = Field(default=15.0, gt=0, le=30)
+
     # Streaming chat (POST /api/chat/stream). Disabled by default: a
-    # controlled prototype until Pinecone and Tavily calls have finite
-    # timeouts. The values below are proposals, not production-validated.
+    # controlled prototype, not production-ready. Pinecone queries and
+    # upserts and Tavily searches now have timeouts (above), but Pinecone
+    # setup calls in ensure_index() have none, and other production blockers
+    # remain open. The values below are proposals, not production-validated.
     stream_enabled: bool = False
     stream_heartbeat_seconds: float = Field(default=15.0, gt=0, le=300)
     stream_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
     max_concurrent_streams: int = Field(default=8, ge=1, le=64)
     stream_retry_after_seconds: int = Field(default=5, ge=1, le=300)
+
+    # Conversation sessions (A2). Disabled by default. Session memory lives
+    # in its own SQLite file, separate from the audit database.
+    sessions_enabled: bool = False
+    session_db_path: Path = BASE_DIR / "data" / "sessions.db"
+    session_idle_timeout_seconds: float = Field(default=1800.0, ge=60, le=86400)
+    session_absolute_timeout_seconds: float = Field(default=28800.0, ge=60, le=604800)
+    max_active_sessions: int = Field(default=5000, ge=1, le=100000)
+    session_db_busy_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    session_cleanup_batch: int = Field(default=500, ge=1, le=10000)
+    session_cleanup_interval_seconds: float = Field(default=300.0, ge=10, le=3600)
+    # Turn leases: one question at a time per session, renewed while running.
+    session_lease_ttl_seconds: float = Field(default=30.0, ge=3, le=300)
+    session_lease_margin_seconds: float = Field(default=2.0, ge=0, le=60)
+    session_turn_max_seconds: float = Field(default=180.0, ge=10, le=3600)
+    session_max_turns: int = Field(default=20, ge=1, le=200)
+    session_history_turns: int = Field(default=4, ge=0, le=50)
+    session_stored_answer_chars: int = Field(default=2000, ge=100, le=20000)
+    # Bounded shutdown (design §7.5): grace + keeper join + release budget.
+    session_shutdown_grace_seconds: float = Field(default=3.0, ge=0, le=30)
+    session_keeper_join_seconds: float = Field(default=2.0, ge=0, le=30)
+    session_release_budget_seconds: float = Field(default=2.0, gt=0, le=30)
 
     # Application authentication
     admin_api_key: SecretStr = SecretStr("")
@@ -80,6 +114,27 @@ class Settings(BaseSettings):
         if not value:
             raise ValueError("This setting cannot be empty.")
         return value
+
+    @model_validator(mode="after")
+    def validate_session_timeouts(self) -> "Settings":
+        if self.session_absolute_timeout_seconds < self.session_idle_timeout_seconds:
+            raise ValueError(
+                "session_absolute_timeout_seconds must be at least session_idle_timeout_seconds."
+            )
+        # A streamed turn must never lose its lease before the stream's own
+        # deadline plus its finalize grace (5 s) plus a 10 s margin.
+        minimum_turn = self.stream_timeout_seconds + _STREAM_FINALIZE_MARGIN_SECONDS
+        if self.session_turn_max_seconds < minimum_turn:
+            raise ValueError(
+                f"session_turn_max_seconds must be at least stream_timeout_seconds + "
+                f"{_STREAM_FINALIZE_MARGIN_SECONDS:g} ({minimum_turn:g})."
+            )
+        if self.session_lease_margin_seconds >= self.session_lease_ttl_seconds / 3:
+            raise ValueError(
+                "session_lease_margin_seconds must be smaller than one renewal interval "
+                "(session_lease_ttl_seconds / 3)."
+            )
+        return self
 
     def ensure_directories(self) -> None:
         """Create required local directories when needed."""

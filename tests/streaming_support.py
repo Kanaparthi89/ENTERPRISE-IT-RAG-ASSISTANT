@@ -168,6 +168,8 @@ class ScriptedChatModel(BaseChatModel):
 
 STREAM_EVENTS = ("start", "trace", "delta", "done", "error")
 TERMINAL_EVENTS = ("done", "error")
+# A2-6: session streams may add one non-terminal ``session`` event after ``done``.
+SESSION_STREAM_EVENTS = STREAM_EVENTS + ("session",)
 
 
 class SSEProtocolError(AssertionError):
@@ -239,13 +241,23 @@ def parse_sse(raw: bytes, *, allowed=STREAM_EVENTS) -> ParsedStream:
     return parsed
 
 
-def assert_stream_grammar(parsed: ParsedStream, *, connected: bool) -> None:
+def assert_stream_grammar(parsed: ParsedStream, *, connected: bool, session: bool = False) -> None:
     """Check the approved order.
 
     connected:     start ( trace | delta )* ( done | error )
     disconnected:  start? ( trace | delta )*        (no terminal event)
+
+    With ``session=True`` (A2-6) a connected stream that ended with ``done``
+    may be followed by exactly one ``session`` event, which is then last.
+    Without it, any ``session`` event is a violation.
     """
-    names = parsed.names
+    names = list(parsed.names)
+    if "session" in names:
+        if not session:
+            raise SSEProtocolError(f"'session' event in a stateless stream: {names}")
+        if names.count("session") != 1 or names[-1] != "session" or len(names) < 2 or names[-2] != "done":
+            raise SSEProtocolError(f"'session' must appear once, right after 'done', last: {names}")
+        names = names[:-1]
     terminals = [name for name in names if name in TERMINAL_EVENTS]
 
     if names.count("start") > 1 or ("start" in names and names[0] != "start"):

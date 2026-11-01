@@ -63,3 +63,38 @@ def test_fixture_answer_follows_the_delta_rule():
 
 def test_streaming_stays_disabled_by_default(settings):
     assert type(settings).model_fields["stream_enabled"].default is False
+
+
+# ---------------------------------------------------------------------------
+# A2-7: frontend session integration
+# ---------------------------------------------------------------------------
+
+SESSION_FIXTURE = Path(__file__).parent / "js" / "fixtures" / "session-event.sse"
+STATIC_JS = Path(__file__).parent.parent / "static" / "js"
+
+
+def test_js_session_fixture_matches_the_backend_sse_encoding():
+    expected = format_sse(
+        "session", {"request_id": "req-1", "turn_saved": True, "history_turns_used": 1}
+    )
+
+    assert SESSION_FIXTURE.read_bytes() == expected
+
+
+def test_page_wires_the_session_client_into_the_controller():
+    app_js = (STATIC_JS / "app.js").read_text(encoding="utf-8")
+
+    assert "new window.BluePeakChat.SessionClient(" in app_js
+    assert "sessions: sessionClient" in app_js
+
+
+def test_session_token_is_never_persisted_by_the_frontend():
+    """The token lives in JavaScript memory only: no storage, cookies or URLs."""
+    for name in ("app.js", "chat-stream.js"):
+        source = (STATIC_JS / name).read_text(encoding="utf-8")
+        for forbidden in ("localStorage", "sessionStorage", "document.cookie", "indexedDB"):
+            assert forbidden not in source, f"{forbidden} in {name}"
+
+
+def test_sessions_stay_disabled_by_default(settings):
+    assert type(settings).model_fields["sessions_enabled"].default is False

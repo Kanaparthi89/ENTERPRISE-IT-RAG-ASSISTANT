@@ -367,33 +367,51 @@ Technology selection should reflect customer requirements for privacy, data resi
 
 ## 7. Repository Structure
 
-The project is organized around a modular application architecture. The tree below illustrates the principal components; verify optional scripts and filenames against the final repository before using them.
+The project is organized around a modular application architecture. The tree below shows the principal files.
 
 ```text
 ENTERPRISE-IT-RAG-ASSISTANT/
 ├── app/
-│   ├── main.py                 # FastAPI application entry point
+│   ├── main.py                  # FastAPI application entry point
 │   ├── api/
-│   │   └── routes.py           # API routes
+│   │   ├── main.py              # Alternative application entry point
+│   │   ├── routes.py            # API routes: chat, streaming, sessions, ingestion
+│   │   └── streaming.py         # Streaming chat (SSE) service
+│   ├── core/
+│   │   ├── config.py            # Settings (Pydantic Settings)
+│   │   └── logging.py           # Logging configuration
 │   ├── rag/
-│   │   ├── workflow.py         # Agentic RAG workflow
-│   │   └── state.py            # Workflow state and schemas
-│   ├── services/
-│   │   └── audit.py            # Audit persistence
-│   ├── ingestion/              # Document ingestion components
-│   ├── vectorstore/             # Pinecone integration
-│   ├── templates/
-│   │   └── index.html          # Frontend template, if enabled
-│   └── static/                  # Static frontend assets
+│   │   ├── workflow.py          # Agentic RAG workflow
+│   │   ├── state.py             # Workflow state and schemas
+│   │   └── vectorstore.py       # Embeddings and Pinecone integration
+│   └── services/
+│       ├── audit.py             # Audit persistence (SQLite)
+│       ├── ingestion.py         # Document ingestion pipeline
+│       └── sessions.py          # Conversation session storage and leases (SQLite)
+├── templates/
+│   └── index.html               # Web interface template
+├── static/
+│   ├── css/style.css            # Web interface styles
+│   └── js/
+│       ├── app.js               # Web interface behavior
+│       └── chat-stream.js       # Chat client: streaming, fallback, sessions
 ├── data/
 │   └── sample_kb/               # Sample knowledge-base documents
-├── tests/                       # Automated tests, if present
+├── tests/                       # Python tests (pytest)
+│   └── js/                      # JavaScript tests (Node.js test runner)
+├── Dockerfile
+├── compose.yaml
 ├── .env.example                 # Example configuration
 ├── .gitignore
+├── package.json                 # JavaScript test script
 ├── requirements.txt
+├── requirements-dev.txt         # Test dependencies
+├── ingest_sample_kb.py          # Sample knowledge-base ingestion script
 ├── run.py                       # Optional application entry point
 └── README.md
 ```
+
+At runtime the application creates its SQLite databases in `data/`: `audit.db` for audit records and, once conversation sessions are used, `sessions.db`. Neither is tracked in Git.
 
 The workflow module coordinates routing, retrieval, evidence grading, external search, query rewriting, and response generation. The API layer exposes application functionality, while configuration and service modules keep infrastructure details separate from the main workflow.
 
@@ -444,7 +462,7 @@ Typical configuration categories include:
 ```dotenv
 OPENAI_API_KEY=your_openai_api_key
 OPENAI_MODEL=gpt-4o-mini
-OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_MODEL=text-embedding-3-small
 
 PINECONE_API_KEY=your_pinecone_api_key
 PINECONE_INDEX_NAME=fde-it-support-rag
@@ -547,6 +565,8 @@ These examples confirm that the application can retrieve public security informa
 | `STREAM_RETRY_AFTER_SECONDS` | `5` | 1–300 | `Retry-After` value sent with `503` when capacity is full. |
 | `OPENAI_TIMEOUT_SECONDS` | `60` | > 0, ≤ 600 | OpenAI timeout per HTTP operation (not per request). Also applies to `/api/chat` and ingestion. |
 | `OPENAI_MAX_RETRIES` | `2` | 0–10 | OpenAI retries. Also applies to `/api/chat` and ingestion. |
+| `PINECONE_TIMEOUT_SECONDS` | `10` | > 0, ≤ 15 | Timeout for each HTTP attempt of a Pinecone query or upsert. The Pinecone SDK retries a failed attempt up to 5 times, so one call can take about 6 × this value plus retry backoff (about 8 seconds, measured locally). Also applies to `/api/chat` and ingestion. Pinecone setup calls are not covered (see blocker H1). |
+| `TAVILY_TIMEOUT_SECONDS` | `15` | > 0, ≤ 30 | Connect and read timeout for one Tavily search request, which is not retried. The read timeout applies to each read, not the whole response. A timed-out search is treated as a failed web search. Also applies to `/api/chat`. |
 
 Settings are read once at startup, so a change requires a server restart. An environment variable takes precedence over `.env`, so streaming can be enabled for a single local run without editing any file:
 
@@ -578,6 +598,11 @@ curl -N -X POST http://127.0.0.1:8000/api/chat/stream \
 | `503` | No streaming capacity. The body is `{"detail": {"message": "The server is busy. Please retry shortly."}}` with a `Retry-After` header. |
 | `500` (plain text) | The deadline passed before the response headers could be sent. This is sent by the server (Uvicorn), not by the application. |
 
+With an `X-Session-ID` header (see [Conversation sessions](#conversation-sessions-controlled-prototype-disabled-by-default)), the request is admitted in this order, and every error below is returned before any SSE bytes:
+
+1. Streaming capacity: if it is full, `503` with `{"detail": {"message": "...", "code": "stream_busy"}}` and `Retry-After`. The `code` field is present only for session requests; the session is not touched.
+2. The session: `410` `session_expired`, `409` `session_busy` (with `Retry-After`), or `503` `session_unavailable`, with the same bodies as [the session errors](#session-errors).
+
 #### SSE event contract (version 1)
 
 Every event has one `event:` line and one single-line JSON `data:` line.
@@ -587,18 +612,20 @@ Every event has one `event:` line and one single-line JSON `data:` line.
 | `start` | `{"request_id": "...", "version": 1}` | First event of every stream. |
 | `trace` | `{"index": 0, "step": "Router → KB"}` | Each workflow step, in order. |
 | `delta` | `{"text": "..."}` | A piece of the answer text, in order. |
-| `done` | The complete `/api/chat` response object (`request_id`, `answer`, `source_used`, `trace`, `citations`, `rewritten_query`) | The answer is complete. |
+| `done` | The complete `/api/chat` response object (`request_id`, `answer`, `source_used`, `trace`, `citations`, `rewritten_query`). Session requests also include `session: {"history_turns_used": n}`. | The answer is complete. |
 | `error` | `{"request_id": "...", "code": "internal_error" \| "timeout", "message": "..."}` | The request failed. Messages are always generic; exception details are never sent. |
+| `session` | `{"request_id": "...", "turn_saved": true \| false \| null, "history_turns_used": n}` | Session requests only: once, after a completed `done`. |
 
 Contract rules:
 
 - A stream that stays connected ends with **exactly one** `done` or **exactly one** `error`, never both.
 - The `delta` texts, joined and stripped of surrounding whitespace, equal `done.answer`. Routing, grading, and query-rewriting model calls never produce `delta` events.
-- `done` is identical to the `/api/chat` response for the same result, apart from `request_id`.
+- `done` is identical to the `/api/chat` response for the same result, apart from `request_id` and, for session requests, the `session` object: `turn_saved` is reported by the `session` event instead, because the turn is saved after `done` is sent.
+- For session requests, one `session` event follows a completed `done` before the stream ends. `turn_saved` is `null` when the save could not be confirmed within 2 seconds. No `session` event follows an `error` event.
 - `: keepalive` comment lines are sent when no event has been sent for `STREAM_HEARTBEAT_SECONDS`.
 - If the client disconnects, the stream ends without a terminal event and the workflow is stopped at the next opportunity.
 
-Each streamed request writes exactly one audit row: `success` or `insufficient_evidence` only when `done` was sent successfully; `failed` with an error type (for example `TimeoutError`) on errors and timeouts; and `cancelled` (for example `ClientDisconnected`) when the client went away.
+Each streamed request writes exactly one audit row (session requests also record the internal session ID): `success` or `insufficient_evidence` only when `done` was sent successfully; `failed` with an error type (for example `TimeoutError`) on errors and timeouts; and `cancelled` (for example `ClientDisconnected`) when the client went away.
 
 #### Frontend behavior and fallback
 
@@ -616,6 +643,8 @@ The web interface tries the streaming endpoint first and renders the answer prog
 | No bytes received for 45 seconds (keepalive comments count) | Treated as interrupted. |
 | Stream still running after 180 seconds | Treated as interrupted. |
 | The user leaves the page (`pagehide`) | The stream is cancelled. Switching tabs or minimizing does not cancel it. |
+| In a conversation session: `503` with code `stream_busy`, `404`, a network failure before headers, or a non-event-stream `200` | Uses `/api/chat` once, **with the same session token**. A session request is never retried without its session. |
+| In a conversation session: `409`, `410`, or `503` `session_unavailable` | No fallback and no automatic retry. The question is not sent; see [Frontend behavior in a session](#frontend-behavior-in-a-session). |
 
 Each question produces exactly one assistant message and at most one `/api/chat` request. Browsers without streaming `fetch` support use `/api/chat` directly.
 
@@ -642,8 +671,8 @@ Streaming must remain disabled in production until these are resolved:
 
 | ID | Blocker | Impact |
 | -- | ------- | ------ |
-| H1 | Pinecone and Tavily calls have no finite timeout. | A stalled call holds a streaming slot and a worker thread until the process restarts. The client receives a timeout error, but capacity is not recovered. `/api/chat` has the same exposure. |
-| H2 | The streaming service is not shut down with the application, and the container start command sets no graceful-shutdown timeout. | During deploys or restarts, in-flight streams can be terminated before their audit rows are written, and a stalled worker can delay process exit. |
+| H1 | External calls are only partly time-limited. Pinecone queries and upserts (`PINECONE_TIMEOUT_SECONDS`) and Tavily searches (`TAVILY_TIMEOUT_SECONDS`) have timeouts, but the Pinecone setup calls in `ensure_index()` (listing, describing, and creating the index) have none. | A stalled setup call holds its worker thread, and for a stream its streaming slot, until the process restarts. Setup runs on the first retrieval or ingestion of each process, and again after a failed attempt. Time-limited calls still hold a slot until they finish: a Pinecone call with its retries can take about a minute, and OpenAI calls (`OPENAI_TIMEOUT_SECONDS`, `OPENAI_MAX_RETRIES`) can outlast the stream deadline. `/api/chat` has the same exposure. |
+| H2 | Shutdown is bounded but not complete. The application now drains stream workers before shutting sessions down, and the container runs Uvicorn with `--timeout-graceful-shutdown 8`, within a 20-second budget (see [Shutdown and deployment](#shutdown-and-deployment)). Running work is never forcibly interrupted, and Python's wait for worker threads at process exit has no limit. | Streams still open 8 seconds after a stop signal are interrupted. A worker that is still running when Docker sends `SIGKILL` (20 seconds after the stop signal), for example one blocked in a call without a timeout (H1), loses its turn and its audit record. |
 | H3 | Disconnect, timeout, and flow-control behavior is tested with the `asyncio` event loop and `h11`, while production Uvicorn uses `uvloop` and `httptools`. | Local use with the default runtime has shown correct successful streaming, but disconnect and timeout behavior under the production runtime is not yet verified. |
 
 Related operational risks:
@@ -654,6 +683,139 @@ Related operational risks:
 - **Per-process capacity:** `MAX_CONCURRENT_STREAMS` applies to each server process separately.
 - **Audit writes are attempted exactly once:** a failed SQLite write (for example, a lock held for more than 10 seconds) is logged but not retried.
 - **Limited observability:** streaming failures are logged by error type only, and there is no per-request outcome log or capacity metric yet.
+
+### Conversation sessions (controlled prototype, disabled by default)
+
+**Status: Controlled prototype — disabled by default; not production-ready until the relevant production blockers and operational risks are resolved or explicitly accepted.** See [Session limitations and shutdown behavior](#session-limitations-and-shutdown-behavior) and [Session and database deployment requirements](#session-and-database-deployment-requirements).
+
+A conversation session lets follow-up questions use earlier questions and answers. Without a session, every question is answered independently, exactly as before. Session memory is stored in its own SQLite database (`data/sessions.db` by default), separate from the audit database.
+
+#### Enabling sessions
+
+Set `SESSIONS_ENABLED=true` (for example `SESSIONS_ENABLED=true python run.py`) and restart the server. Settings are read once at startup. Reload the browser page afterwards: the web interface remembers a `404` from `POST /api/sessions` for the rest of the page session. Sessions work with or without streaming.
+
+| Setting | Default | Enforced range | Purpose |
+| ------- | ------- | -------------- | ------- |
+| `SESSIONS_ENABLED` | `false` | boolean | Enables session creation and session-aware chat. |
+| `SESSION_DB_PATH` | `data/sessions.db` | No range configured | Session database file. |
+| `SESSION_IDLE_TIMEOUT_SECONDS` | `1800` (30 min) | 60–86400 | Idle expiry (see [Session lifecycle](#session-lifecycle-expiry-capacity-and-cleanup)). |
+| `SESSION_ABSOLUTE_TIMEOUT_SECONDS` | `28800` (8 h) | 60–604800 | Absolute expiry, counted from creation. |
+| `MAX_ACTIVE_SESSIONS` | `5000` | 1–100000 | Maximum unexpired sessions; creation fails with `503` at the cap. |
+| `SESSION_DB_BUSY_TIMEOUT_SECONDS` | `2` | > 0, ≤ 30 | How long a session database operation waits for a lock. |
+| `SESSION_CLEANUP_BATCH` | `500` | 1–10000 | Expired sessions deleted per cleanup pass. |
+| `SESSION_CLEANUP_INTERVAL_SECONDS` | `300` | 10–3600 | Interval of the periodic cleanup. |
+| `SESSION_LEASE_TTL_SECONDS` | `30` | 3–300 | Lifetime of a question's lease; renewed every TTL/3 while the question runs. |
+| `SESSION_LEASE_MARGIN_SECONDS` | `2` | 0–60 | A lease that is not renewed at least this long before it expires is treated as lost, and the turn is not saved. |
+| `SESSION_TURN_MAX_SECONDS` | `180` | 10–3600 | Longest time one question can hold its session's lease. |
+| `SESSION_MAX_TURNS` | `20` | 1–200 | Turns kept per session; older turns are deleted. |
+| `SESSION_HISTORY_TURNS` | `4` | 0–50 | Stored turns read for each question. `0` disables history. The prompt uses at most 4 turns regardless (see [Session history](#session-history)). |
+| `SESSION_STORED_ANSWER_CHARS` | `2000` | 100–20000 | Stored answers are cut to this length. |
+| `SESSION_SHUTDOWN_GRACE_SECONDS` | `3` | 0–30 | Shutdown: time allowed for in-flight questions to finish. |
+| `SESSION_KEEPER_JOIN_SECONDS` | `2` | 0–30 | Shutdown: time allowed for the lease keeper thread to stop. |
+| `SESSION_RELEASE_BUDGET_SECONDS` | `2` | > 0, ≤ 30 | Shutdown: time allowed for releasing remaining leases. |
+
+Startup validation also requires:
+
+- `SESSION_ABSOLUTE_TIMEOUT_SECONDS` ≥ `SESSION_IDLE_TIMEOUT_SECONDS`.
+- `SESSION_TURN_MAX_SECONDS` ≥ `STREAM_TIMEOUT_SECONDS` + 15, so a streamed question never loses its lease before the stream's own deadline.
+- `SESSION_LEASE_MARGIN_SECONDS` < `SESSION_LEASE_TTL_SECONDS` / 3.
+
+These settings are not listed in `.env.example`.
+
+#### Session API
+
+Session tokens are **bearer credentials**: anyone who has a token can use and delete that conversation. Send the token only in the `X-Session-ID` header, never in a URL.
+
+**`POST /api/sessions`** creates a session.
+
+- The request must have `Content-Type: application/json` and an empty body or `{}` (at most 1 KiB); otherwise `415`.
+- A request from another site is refused with `403`: a `Sec-Fetch-Site` header other than `same-origin` or `none`, or an `Origin` header whose host and port differ from the request's `Host`. These checks run before any database access. They protect against cross-site requests; they are **not** authentication, and session creation is otherwise unauthenticated.
+- `201` returns the following, with `Cache-Control: no-store`:
+
+  ```json
+  {"session_id": "<token>", "idle_timeout_seconds": 1800, "expires_at": "2026-01-01T08:00:00Z"}
+  ```
+
+  **Despite its name, `session_id` in this response is the bearer token.** It is returned only here and never again. The server stores only its SHA-256 hash. A separate internal session ID (a UUID) is used in logs and audit records; the token is never written to either.
+- `404` while sessions are disabled. `503` `session_unavailable` if the session database cannot be used or `MAX_ACTIVE_SESSIONS` is reached.
+
+**`DELETE /api/sessions`** (token in `X-Session-ID`) deletes the conversation memory.
+
+- `204` when the session was deleted, and also when it was unknown, expired, or already deleted. It also answers `204` while sessions are disabled, and still deletes a stored session in that case.
+- `400` `invalid_session_id` when the header is missing, empty, or longer than 128 characters. `503` `session_unavailable` when deletion cannot be confirmed.
+- Audit records are **not** deleted (see [Conversation session data](#conversation-session-data)).
+
+**`POST /api/chat` and `POST /api/chat/stream` with `X-Session-ID`** answer the question with the conversation's history:
+
+- Without the header, both endpoints behave exactly as before (stateless).
+- With the header, the session must exist and be unexpired. A header sent while sessions are disabled, or an empty header, is answered with `410` (`/api/chat/stream` first answers `404` while streaming is disabled). It is never ignored, and the question is never answered without its session.
+- `/api/chat` adds `"session": {"history_turns_used": n, "turn_saved": true | false}` to its response. `turn_saved` is `true` only if the turn was actually stored.
+- `/api/chat/stream` reports the same information through `done` and the `session` event (see [SSE event contract](#sse-event-contract-version-1)).
+- If answering fails (`500`), nothing is saved.
+
+#### Session errors
+
+Session errors have the body `{"detail": {"code": "...", "message": "..."}}`. Messages are generic and never include the token or exception details.
+
+| Status | `code` | Meaning |
+| ------ | ------ | ------- |
+| `400` | `invalid_session_id` | `DELETE` without a usable `X-Session-ID` header. |
+| `403` | `origin_not_allowed` | Session creation from another site. |
+| `409` | `session_busy` | Another question in this conversation is still running. `Retry-After` gives the remaining lease time in whole seconds (at least 1). Nothing was run. |
+| `410` | `session_expired` | The session is unknown, deleted, or expired, or sessions are disabled. Start a new session. |
+| `415` | `unsupported_media_type` | Session creation without `Content-Type: application/json` or with a body other than empty or `{}`. |
+| `503` | `session_unavailable` | The session database cannot be used, or the session cap is reached. |
+
+#### Session lifecycle: expiry, capacity, and cleanup
+
+- **One question at a time.** Each question takes its session's lease, which lasts `SESSION_LEASE_TTL_SECONDS` (30 s). A background keeper thread renews it every TTL/3 (10 s) while the question runs, up to `SESSION_TURN_MAX_SECONDS` (180 s) from when the question started. A second question during that time receives `409`.
+- **Idle expiry** (`SESSION_IDLE_TIMEOUT_SECONDS`, 30 min) is counted from creation. It is extended when a turn is saved and when a running question's lease is renewed. A question that cannot be saved does not extend it beyond these renewals.
+- **Absolute expiry** (`SESSION_ABSOLUTE_TIMEOUT_SECONDS`, 8 h) is counted from creation and never extended.
+- **Capacity.** Only unexpired sessions count toward `MAX_ACTIVE_SESSIONS`. At the cap, creation returns `503` and a warning is logged.
+- **Cleanup** deletes expired sessions that have no running question, in batches of `SESSION_CLEANUP_BATCH`, together with their turns. When it deletes anything, it then checkpoints the write-ahead log. It runs:
+  - once at startup, only if the session database already exists (even while sessions are disabled), waiting at most 2 seconds;
+  - before every session creation;
+  - every `SESSION_CLEANUP_INTERVAL_SECONDS` (300 s) on the keeper thread, which starts with the first question of the process.
+
+  Expired sessions are therefore removed only when the server has activity. After the startup cleanup pass, expired sessions remain on disk until the next session creation or a subsequent periodic cleanup pass triggered by session activity.
+
+#### Session history
+
+- Each saved turn stores the user's question, the answer (cut to `SESSION_STORED_ANSWER_CHARS`), and the answer source. The last `SESSION_MAX_TURNS` turns are kept.
+- For each question, the prompt includes at most 4 earlier turns and 6,000 characters, with each answer cut to 2,000 characters. These limits are fixed in the workflow.
+- When the session has saved turns, the new question is first rewritten into a standalone question by an extra internal model call, which is never streamed. Retrieval, web search, and routing use the standalone question. If the rewrite fails or is invalid, the original question is used.
+- Earlier turns are marked in the prompts as untrusted conversation data, not instructions.
+
+#### Frontend behavior in a session
+
+- **Token handling.** The token is kept only in the page's JavaScript memory: not in cookies, browser storage, or URLs. Reloading or closing the page ends the conversation for that page; the old session is no longer used and expires on the server.
+- **Session creation.** Before the first question, the page creates a session.
+  - The request times out after 15 seconds. It is retried once, after 1 second, only after an ordinary network failure.
+  - A timeout, or leaving the page, is not retried.
+  - Leaving the page abandons the request without showing an error.
+  - When sessions are disabled, the frontend may still send `POST /api/sessions` on the first question. The endpoint returns `404`, after which the chat continues statelessly. This adds an unnecessary request but does not prevent normal stateless chat.
+  - **A `404` switches the page to stateless questions** for the rest of the page session. This is how a disabled feature is detected. A proxy that answers `404` for `/api/sessions` by mistake (for example, a misrouted path) therefore also makes the page stateless.
+  - Any other failure blocks the question: nothing is sent, and the question is never sent without a session.
+- **What the user sees after an answer.** A status line below the input box reports whether the answer was saved to the conversation:
+  - saved: follow-ups can use it;
+  - not saved: follow-ups won't include it;
+  - unknown: the save could not be confirmed.
+- **Recovery when a question is not sent.** An alert explains what happened, and the question stays in the input box:
+  - **Retry** is offered when trying again can help: the conversation is busy (`409`), session storage is unavailable (`503`), a network failure or timeout, or another server error.
+  - **Reload page** is offered for `415` and other client errors.
+  - **No button** is shown for `403`; the page must be opened from its usual address.
+  - **Start new chat** is offered when the conversation has expired (`410`). The page does not continue an expired conversation in a new session on its own: every later question is blocked until the user starts a new chat, which keeps the unsent question in the input box.
+  - None of these is retried automatically, and none falls back to a question without the session.
+- **Suggestion cards.** A suggested question that is blocked is placed in the input box only if the box is empty or contains only whitespace. Text the user has typed is never overwritten; in that case Retry sends the typed text.
+- **New chat** forgets the token immediately and sends one `DELETE /api/sessions` without waiting for it. If the deletion fails, and no new session has started in the meantime, the status line says that the earlier memory will be cleared automatically after a period of inactivity. The deletion is not retried.
+- **Streaming fallback** keeps the session token (see [Frontend behavior and fallback](#frontend-behavior-and-fallback)).
+
+#### Operating sessions
+
+- **SQLite 3.35.0 or newer** is required. With an older version the session store disables itself: an error is logged and session creation returns `503`.
+- **Abandoned (orphan) sessions.** A server-side session can exist that no browser holds a token for. This happens when session creation timed out or the page was left after the server created the session, when its response was lost, or after a page reload. Abandoning the browser request does not undo the server-side creation. Such sessions are never used, count toward `MAX_ACTIVE_SESSIONS` until their idle expiry, and are then removed by cleanup.
+- **Request load.** A question asked in a session that already has saved turns makes one more model call (the standalone rewrite) than the same question without a session.
+- **Rate limits.** `POST /api/sessions` has no rate limit or authentication. Apply limits at the proxy.
 
 ---
 
@@ -685,7 +847,7 @@ A successful syntax compilation confirms that Python can compile the module. It 
 
 ### Recommended automated test suite
 
-The next stage is to build repeatable tests covering:
+The repository includes automated Python and JavaScript test suites (see [Running the automated tests](#running-the-automated-tests)). Areas where repeatable tests are recommended include:
 
 - Routing for greetings, internal IT questions, and official-source requests.
 - Retrieval relevance and expected document selection.
@@ -698,13 +860,23 @@ The next stage is to build repeatable tests covering:
 - Authorized and unauthorized document ingestion.
 - Audit-record completeness and protection of sensitive data.
 
-Run the automated tests when the suite is present:
+### Running the automated tests
+
+Python tests (install `requirements-dev.txt` first):
 
 ```bash
 pytest -q
 ```
 
-This command is a recommended validation step; do not interpret it as evidence that all tests have already passed.
+JavaScript tests for the web interface's chat client, run with the Node.js built-in test runner (tested with Node.js 25; no npm packages are needed):
+
+```bash
+npm run test:js
+```
+
+Tests marked `live` call real external services and are skipped unless `RUN_LIVE_TESTS=1` is set. A passing run shows that the tested behavior works as specified; it does not establish answer quality, security, or production readiness.
+
+**Test provenance note.** `tests/test_session_api.py` and `tests/test_session_leases.py` are not yet tracked in Git. For one round of H2 edits, their earlier contents were reconstructed from the edits rather than taken from saved copies, so the byte-level history of those edits is incomplete. The current files are what the suite runs.
 
 ---
 
@@ -767,6 +939,33 @@ The workflow is designed to associate numbered inline references with retrieved 
 Audit records can support debugging and operational investigation. They should capture only the information necessary for the stated purpose.
 
 Avoid unnecessarily storing API keys, authentication tokens, sensitive document contents, or personal information in logs. Define access controls, retention periods, and deletion procedures before production use.
+
+**Current behavior:** each audit record in `data/audit.db` stores the question text, the answer source, the workflow trace, citations, and the outcome. The application has no audit retention or deletion mechanism, so audit records are kept indefinitely until an operator removes them. This is a known limitation, separate from session expiry and deletion.
+
+### Conversation session data
+
+Implemented behavior (see [Conversation sessions](#conversation-sessions-controlled-prototype-disabled-by-default)):
+
+- **Bearer tokens.** A session token is a random bearer credential (`secrets.token_urlsafe(32)`). It is not tied to a user or identity: anyone holding it can continue or delete the conversation. It is returned once, at creation, and must only be sent in the `X-Session-ID` header.
+- **Hashed storage.** The server stores only the SHA-256 hash of the token, never the token itself, and never logs it. Logs and audit records use a separate internal session ID (a UUID).
+- **Stored content.** `data/sessions.db` holds each saved turn's question, answer (cut to `SESSION_STORED_ANSWER_CHARS`), and answer source, for at most `SESSION_MAX_TURNS` turns per session.
+- **SQLite settings.**
+  - The session database uses write-ahead logging (`journal_mode=WAL`), so `data/sessions.db-wal` and `data/sessions.db-shm` files exist next to it and can also contain conversation text.
+  - Each connection enables `foreign_keys`, so deleting a session also deletes its turns.
+  - Each connection enables `secure_delete`, so deleted content is overwritten in the database file.
+- **Deletion and expiry do not affect audit records.** `DELETE /api/sessions`, expiry, and cleanup remove only session data. Each audit record of a session request keeps its question text and the internal session ID.
+- **Data sent to external services.** Earlier turns are included in later prompts sent to OpenAI. The rewritten standalone question is used for knowledge-base retrieval (embedded with OpenAI) and as the Tavily web-search query, so a web search can contain details taken from earlier turns.
+- **Version control and images.** `.gitignore` excludes `*.db`, `*.db-wal`, `*.db-shm`, and `*.db-journal` files at any directory depth. `.dockerignore` excludes root-level `*.db` files and, at any depth, `**/*.db`, `**/*.db-wal`, `**/*.db-shm`, and `**/*.db-journal`. These rules keep the database files and their WAL, SHM, and rollback-journal files out of Git and out of Docker build contexts.
+
+Known limitations:
+
+- **Deletion is not forensic erasure.**
+  - `secure_delete` applies to the database file, but copies of deleted content can remain in the write-ahead log until it is checkpointed. Cleanup checkpoints the log after deleting expired sessions; `DELETE /api/sessions` does not.
+  - Copies can also remain in filesystem or storage-device remnants and in backups.
+- **No encryption at rest.** Neither `sessions.db` nor `audit.db` is encrypted by the application. Disk or volume encryption is a deployment responsibility.
+- **No identity binding.** Session protection relies on keeping the token secret; it is not a substitute for authentication.
+
+Recommended production hardening: an identity-bound session model, encrypted storage, an audit retention policy, and backups that respect deletion requirements.
 
 ### Dependency and deployment security
 
@@ -853,8 +1052,68 @@ The current implementation and observed tests identify several areas that need f
 7. **Evaluation coverage:** A few successful manual requests do not establish overall retrieval or answer accuracy.
 8. **Operational readiness:** Deployment, monitoring, scaling, retention, and incident-management procedures need to be verified separately.
 9. **Streaming prototype:** Streaming chat is disabled by default and is not production-ready. See [Production-readiness blockers](#production-readiness-blockers).
+10. **Conversation sessions:** Controlled prototype — disabled by default; not production-ready until the relevant production blockers and operational risks are resolved or explicitly accepted. See [Session limitations and shutdown behavior](#session-limitations-and-shutdown-behavior).
 
 Documenting these limitations makes the project more useful to engineers and reviewers by distinguishing working behavior from remaining engineering work.
+
+### Session limitations and shutdown behavior
+
+These are known limitations of the current implementation. They are separate issues: resolving one does not resolve the others.
+
+| Issue | Current state |
+| ----- | ------------- |
+| Production blockers H1–H3 | Open (see [Production-readiness blockers](#production-readiness-blockers)). H1 is only partly addressed: Pinecone queries and upserts and Tavily searches have timeouts, but Pinecone setup calls do not. H2 is only partly addressed: shutdown is bounded, but running work is not forcibly interrupted (see [Shutdown and deployment](#shutdown-and-deployment)). H3 is open. They also affect session requests, as described below. |
+| Persistent storage | Not configured. `compose.yaml` defines no volume, so `data/sessions.db` and `data/audit.db` are lost when the container is recreated. |
+| Encryption at rest | Not provided by the application (see [Conversation session data](#conversation-session-data)). |
+| Audit retention | No retention or deletion mechanism; audit records are kept indefinitely (see [Audit logging and privacy](#audit-logging-and-privacy)). |
+
+**Lease recovery.** A lease left behind by a stopped or crashed process remains valid for at most `SESSION_LEASE_TTL_SECONDS` (30 s) after its last renewal. Until then the conversation answers `409` with `Retry-After`; after that, the next question proceeds normally.
+
+**Effect of slow external calls (blocker H1).** A slow external call keeps its question's lease, even after a stream has reported a timeout, and other questions in the same conversation receive `409` meanwhile. Pinecone queries and upserts and Tavily searches are time-limited (see [Enabling streaming](#enabling-streaming)), so a stalled one ends at its timeout: a Pinecone timeout fails the question, which releases the lease, and a Tavily timeout counts as a failed web search while the question continues. A stalled Pinecone setup call, or slow OpenAI calls, can keep the lease for up to `SESSION_TURN_MAX_SECONDS` (180 s); after that, the stalled question's turn is not saved.
+
+**Abandoned sessions.** Timed-out or abandoned session-creation requests, lost responses, and page reloads can leave server-side sessions that no browser uses. They count toward `MAX_ACTIVE_SESSIONS` until their idle expiry and are then removed by cleanup (see [Operating sessions](#operating-sessions)).
+
+**Deployment topology.** The session store is designed for one host with local storage. Sharing the session database between replicas or hosts, and placing it on a network file system, are not supported or tested. Running several server processes against the same session database has not been tested either.
+
+**One question at a time.** A conversation runs one question at a time. A second question sent while the first is running receives `409` and is not run.
+
+### Shutdown and deployment
+
+Streaming and conversation sessions both remain disabled by default (`STREAM_ENABLED=false`, `SESSIONS_ENABLED=false`). The Dockerfile's `--timeout-graceful-shutdown 8` limit applies to every deployment, including when both features are disabled. It also affects non-streaming `/api/chat` requests. The stream-drain and session-shutdown behavior described below applies only when streaming or sessions are enabled. It is bounded, but it is not a production-readiness claim: blockers H1 and H3 remain open, and H2 is only partly addressed.
+
+**Shutdown sequence (implemented).** When the container is stopped, Docker sends `SIGTERM`:
+
+1. Uvicorn stops accepting connections and waits for open responses. After `--timeout-graceful-shutdown 8` (set in the `Dockerfile`), it cancels the responses that are still open.
+2. The application stops the stream service and waits up to 3 seconds (`STREAM_SHUTDOWN_DRAIN_SECONDS`, fixed in code) for stream workers to finish, so that their turns can be saved and their audit records written. A run that is still undecided after that is recorded as `cancelled` (`ServerShutdown`) and asked to stop; a run whose outcome is already decided is left as it is.
+3. If sessions were used, the session shutdown then stops accepting new session questions, waits up to `SESSION_SHUTDOWN_GRACE_SECONDS` (3 s) for running questions, refuses new turn saves, and releases the leases that remain. It returns within `SESSION_SHUTDOWN_GRACE_SECONDS` + `SESSION_KEEPER_JOIN_SECONDS` + `SESSION_RELEASE_BUDGET_SECONDS` (7 s with the defaults).
+
+**Timeout budget.** 8 s (Uvicorn graceful timeout) + 3 s (stream drain) + 7 s (session shutdown) + 2 s margin = 20 s, the `stop_grace_period` in `compose.yaml`, after which Docker sends `SIGKILL`. A test checks the `Dockerfile` command and the `compose.yaml` value against this budget. If any of these values changes, keep the total within the stop grace period.
+
+**What users see when a deploy interrupts a stream.** A stream that is still open 8 seconds after the stop signal is cancelled. The connection ends with no `done` or `error` event, so the web interface shows its existing message, "The response was interrupted. Please try again.", and does not fall back to `/api/chat` automatically. The turn is not saved, the audit record is `cancelled`, and the user has to ask again.
+
+**Outcomes for a session question that is running at shutdown:**
+
+- **Saved:** the question finishes, and its save is admitted before new saves are refused. This includes a slow save that finishes after its response has already reported `turn_saved: null` (the response waits 2 seconds for the save result), as long as it finishes within the stream drain. Tests cover this with a real Uvicorn server.
+- **Not saved:** a save that starts after new saves are refused is refused (`reason=manager_closed`), whatever the database shows.
+- **Depends on SQLite lock order:** a save admitted before new saves are refused is not cancelled. It commits only if it gets SQLite's write lock and still owns the lease. If the bulk lease release commits first, the save fails its lease check and saves nothing. Admission before shutdown is therefore not a guarantee that the turn is saved. Tests cover both orders.
+- **Not saved and not audited:** the process is stopped by `SIGKILL`, or crashes, before the worker finishes. Neither the turn nor its audit record is written. The lease is left to expire (see **Lease recovery** in [Session limitations and shutdown behavior](#session-limitations-and-shutdown-behavior)). This has not been reproduced in a container test.
+- A streamed response that the server cancels is recorded as `cancelled`, and its turn is not saved.
+
+**Limits of the shutdown guarantees (known limitations):**
+
+- **Running work is not interrupted.** Neither an external call in progress nor a SQLite transaction that has already started is cancelled. A stream worker stops at its next check, after its current step returns. A worker blocked in a call without a timeout (blocker H1) can keep running beyond the budget.
+- **Ingestion blocks shutdown (existing issue, not fixed by H2).** The `/api/ingest` route is asynchronous, but it loads the file and ingests the document synchronously, which blocks the event loop while ingestion runs. During a deployment, an ingestion in progress can delay Uvicorn's graceful-shutdown timer and the application's shutdown, so shutdown can exceed the 20-second Docker stop budget and end in `SIGKILL`. Until this is fixed separately, do not run ingestion during a deployment.
+- **Process exit can wait for workers.** Python waits without a time limit for stream worker threads when the process exits, so a stuck worker can keep the process alive until Docker's `SIGKILL`, with the losses described above.
+- **Non-streaming `/api/chat` requests have the same 8-second limit, even with both features disabled.** Uvicorn cancels a `/api/chat` request that is still running when the graceful-shutdown timeout expires.
+  - **Client response (not verified for this application).** A probe with a minimal FastAPI app on the same Uvicorn and library versions returned `500` with a plain-text `Internal Server Error` body. That result was observed only in the minimal-app probe; it has **not** been tested against this application's `/api/chat` route.
+  - **The handler keeps running for now.** The synchronous handler runs in an AnyIO worker thread, and cancelling the request task does not interrupt that thread.
+  - **But the process does not wait for it.** That worker thread does not keep the process alive. If the handler has not finished when the process exits, its remaining work stops, so its audit record and its session-turn save may be lost.
+  - **If it finishes before the process exits,** its audit record can still be written, but its turn is saved only if its save is admitted before new saves are refused.
+- **Connection teardown overlaps the drain.** When the graceful timeout expires, Uvicorn cancels open responses and starts the application shutdown at once, so the stream drain can begin while a cancelled connection is still closing. The session shutdown runs after the drain; in the real-Uvicorn tests the connection is closed by then.
+- **Cancelling the shutdown itself.** If the application's shutdown is cancelled while it waits for stream workers (a normal Uvicorn shutdown does not do this), the stream service is still cleared, but the session-manager shutdown is skipped. Leases then expire within `SESSION_LEASE_TTL_SECONDS` (30 s), with `409` meanwhile.
+- **Turn saves are admitted one at a time, with a bounded wait.** Each save waits at most `SESSION_DB_BUSY_TIMEOUT_SECONDS` (2 s) to be admitted. If another save is stalled, for example on storage, a waiting save is not saved (`turn_saved: false`, `reason=save_gate_timeout`) and its lease is released, instead of waiting indefinitely. Finishing a question can therefore take up to about twice the busy timeout before it gives up.
+- **Lease-expiry fallback.** If the stalled save also holds SQLite's write lock, the timed-out question's lease cannot be released either; it expires within `SESSION_LEASE_TTL_SECONDS` (30 s), and that conversation answers `409` until then.
+- **Test coverage.** The admission timeout is tested at the session-manager level, not through a stream. Shutdown is tested with a real Uvicorn server on the `asyncio` event loop and `h11`, not with `uvloop` and `httptools` (blocker H3). A `SIGKILL` during shutdown is not tested.
 
 ---
 
@@ -896,6 +1155,30 @@ Before publishing or deploying the project, verify the following:
 - [ ] Production deployment and monitoring have been tested.
 - [ ] Streaming remains disabled (`STREAM_ENABLED=false`) unless blockers H1–H3 are resolved.
 - [ ] If streaming is enabled, heartbeat and timeout settings stay within the frontend limits, and capacity is planned for `/api/chat` and streaming together.
+- [ ] Conversation sessions remain disabled (`SESSIONS_ENABLED=false`) unless the issues in [Session limitations and shutdown behavior](#session-limitations-and-shutdown-behavior) are resolved or explicitly accepted.
+- [ ] If sessions are enabled, the requirements below are met.
+
+### Session and database deployment requirements
+
+Requirements of the current implementation:
+
+- **SQLite 3.35.0 or newer.** Older versions disable the session store (creation returns `503`). The Dockerfile uses the `python:3.11-slim` tag, which is not pinned to a digest, so check the version in every new image:
+
+  ```bash
+  python -c "import sqlite3; print(sqlite3.sqlite_version)"
+  ```
+
+- **Local, persistent storage for `data/`.** Both `sessions.db` (with its `-wal` and `-shm` files) and `audit.db` live there by default. The provided `compose.yaml` does not define a volume yet, so data is lost when the container is recreated. Use storage local to the host, not a network file system, and restrict access to it.
+- **One host.** Do not share the session database between replicas or hosts (see [Session limitations and shutdown behavior](#session-limitations-and-shutdown-behavior)).
+- **Shutdown timeout budget.** The `Dockerfile` runs Uvicorn with `--timeout-graceful-shutdown 8`, and `compose.yaml` sets `stop_grace_period: 20s`. Uvicorn's timeout (8 s), the stream drain (3 s), and the session shutdown (7 s with the defaults) must stay at least 2 seconds within the stop grace period (see [Shutdown and deployment](#shutdown-and-deployment)).
+
+Recommended production hardening (not implemented by the application):
+
+- Encrypt the storage volume; the application does not encrypt either database.
+- Define backups for `audit.db` and `sessions.db`. Backups keep copies of conversation and audit data, so align them with retention and deletion requirements.
+- Define an audit retention period and a deletion procedure.
+- Apply rate limits to `POST /api/sessions` at the proxy.
+- Plan deploys around the shutdown behavior described in [Shutdown and deployment](#shutdown-and-deployment): streams in progress are interrupted, and work that outlives the 20-second stop grace period is lost.
 
 ---
 
