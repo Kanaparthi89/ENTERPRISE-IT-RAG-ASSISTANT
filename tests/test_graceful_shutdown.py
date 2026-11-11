@@ -1,7 +1,8 @@
 """H2: graceful shutdown through a real Uvicorn server, and the Docker budget.
 
 The loopback tests run ``app.main.app`` with ``lifespan="on"`` on a real
-Uvicorn server (``LoopbackServer``: asyncio loop, h11). Shutdown is started
+Uvicorn server (``LoopbackServer``), on runtime A (asyncio + h11) and runtime
+P (uvloop + httptools, what production selects; H3). Shutdown is started
 the way a signal starts it, by setting ``should_exit``, so Uvicorn's own order
 applies: stop accepting, wait for open connections (cancelling them after
 ``timeout_graceful_shutdown``), then run the lifespan shutdown (stream drain,
@@ -27,6 +28,7 @@ from app.services import sessions as session_service
 from tests.streaming_support import (
     SESSION_STREAM_EVENTS,
     LoopbackServer,
+    assert_run_cleaned_up,
     parse_sse,
     read_sse_until,
 )
@@ -110,13 +112,13 @@ def wait_for(event, timeout=GUARD):
     assert event.wait(timeout), "event not set in time"
 
 
-def test_shutdown_cancels_an_open_session_stream_then_shuts_sessions_down(shutdown_app, settings):
+def test_shutdown_cancels_an_open_session_stream_then_shuts_sessions_down(shutdown_app, settings, loopback_runtime):
     gate = Gate()
     service = shutdown_app(HistoryWorkflow(answer_steps(gate=gate)))
     buffer = bytearray()
 
-    with LoopbackServer(app.main.app, lifespan="on", graceful_shutdown_timeout=0.5) as server, \
-            client(server) as http:
+    with LoopbackServer(app.main.app, runtime=loopback_runtime, lifespan="on",
+                        graceful_shutdown_timeout=0.5) as server, client(server) as http:
         recorder = ShutdownRecorder(server, service)
         token = new_session(http)
         recorder.watch_session_shutdown()
@@ -162,9 +164,12 @@ def test_shutdown_cancels_an_open_session_stream_then_shuts_sessions_down(shutdo
     assert recorder.summary == {"still_running": 0, "cancelled": 0}  # already decided
     assert streaming.peek_stream_service() is None
     assert session_service.peek_session_runtime() is None
+    assert_run_cleaned_up(service, run, server)
 
 
-def test_a_slow_save_finishes_within_the_drain_after_the_response_ended(shutdown_app, settings, monkeypatch):
+def test_a_slow_save_finishes_within_the_drain_after_the_response_ended(
+    shutdown_app, settings, monkeypatch, loopback_runtime
+):
     service = shutdown_app(HistoryWorkflow(answer_steps()))
     save_entered, save_release = threading.Event(), threading.Event()
     save_times = {}
@@ -181,8 +186,8 @@ def test_a_slow_save_finishes_within_the_drain_after_the_response_ended(shutdown
 
     monkeypatch.setattr(session_service.SessionStore, "save_turn", slow_save)
 
-    with LoopbackServer(app.main.app, lifespan="on", graceful_shutdown_timeout=0.5) as server, \
-            client(server) as http:
+    with LoopbackServer(app.main.app, runtime=loopback_runtime, lifespan="on",
+                        graceful_shutdown_timeout=0.5) as server, client(server) as http:
         recorder = ShutdownRecorder(server, service)
         token = new_session(http)
         recorder.watch_session_shutdown()
@@ -218,6 +223,74 @@ def test_a_slow_save_finishes_within_the_drain_after_the_response_ended(shutdown
         ("stream.closed", 0),
         ("session.shutdown", 0),
     ]
+    assert_run_cleaned_up(service, run, server)
+
+
+def test_shutdown_never_interrupts_the_call_in_flight_and_starts_no_later_call(
+    stream_app, fake_rag, monkeypatch, loopback_runtime, record_property
+):
+    """S3 (H1-3a under H3): a provider call in flight when the server stops.
+
+    The real workflow runs with fake providers; the embedding call is held
+    open across the whole shutdown. It is not interrupted: it returns only
+    when the test releases it, after the server has stopped. The run then
+    starts no further external call (no Pinecone query, no grading), and its
+    slot and lease are held until its worker exits.
+    """
+    from tests.test_cancellation import GatedRetriever, gated_rag, provider_calls
+
+    finished = threading.Event()
+
+    class InFlightRetriever(GatedRetriever):
+        def invoke(self, query):
+            self.gate.reached.set()
+            assert self.gate.release.wait(GUARD), "the in-flight call was never released"
+            finished.set()  # the call in flight completed normally
+            self.timed.query(vector=[0.1], top_k=4)  # the next external call (checked)
+            return []
+
+    gate, llm, _ = gated_rag(fake_rag)
+    retriever = InFlightRetriever(gate)
+    fake_rag(llm=llm, retriever=retriever)
+    service = stream_app(streaming.stream_ask)
+    monkeypatch.setattr(streaming, "_service", service)  # the lifespan closes the singleton
+    monkeypatch.setattr(routes, "STREAM_SHUTDOWN_DRAIN_SECONDS", 0.2)
+
+    with LoopbackServer(app.main.app, runtime=loopback_runtime, lifespan="on",
+                        graceful_shutdown_timeout=0.5) as server, client(server) as http:
+        with http.stream("POST", "/api/chat/stream", json={"question": QUESTION}) as response:
+            assert response.status_code == 200
+            chunks = response.iter_raw()
+            read_sse_until(chunks, bytearray(), b"event: trace")  # routing done
+            wait_for(gate.reached)  # the embedding call is in flight
+            [run] = service.started
+            server.server.should_exit = True  # what SIGTERM does
+            try:
+                for _ in chunks:  # Uvicorn waits 0.5 s, then cancels the response
+                    pass
+            except httpx.HTTPError:
+                pass
+        server.thread.join(GUARD)
+        assert not server.thread.is_alive()  # the server stopped with the call still in flight
+
+    # Shutdown completed (drain, shutdown signal, sessions) without the worker.
+    from app.rag import cancellation
+
+    assert cancellation.shutdown_signalled()  # set by the real lifespan after the drain
+    assert not finished.is_set() and not run.hooks["worker_exited"].is_set()
+    assert not run.lease.released and service.capacity.in_use == 1  # held while the call runs
+    decision = run.outcome.decision
+    assert decision.status == "cancelled"
+    record_property("observed_error_type", decision.error_type)
+
+    gate.release.set()  # the in-flight call returns on its own
+    wait_for(finished)
+    wait_for(run.hooks["worker_exited"])
+
+    assert provider_calls(llm, retriever) == ["RouteDecision"]  # no query, no grading after it
+    [row] = service.audit.rows
+    assert row["status"] == "cancelled"
+    assert_run_cleaned_up(service, run, server)
 
 
 # ---------------------------------------------------------------------------

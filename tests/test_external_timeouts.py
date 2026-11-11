@@ -1,10 +1,12 @@
 """H1: finite timeouts for Pinecone and Tavily calls (no external network).
 
 Pinecone wrapper tests live in tests/test_vectorstore.py. Here: the settings,
-and the Tavily wrapper, its injection, and failed-search handling.
+and the Tavily wrapper, its injection, and failed-search handling; and (H1-2)
+the retry behavior the README documents for OpenAI, Tavily and Pinecone.
 """
 
 import logging
+import selectors
 import socket
 import threading
 import time
@@ -14,7 +16,7 @@ import requests
 from pydantic import ValidationError
 
 from app.core import config
-from app.rag import workflow
+from app.rag import vectorstore, workflow
 from tests.conftest import FakeWebSearch, IsolatedSettings
 
 Wrapper = workflow._TimeoutTavilySearchAPIWrapper
@@ -234,3 +236,226 @@ def test_a_normal_result_is_not_treated_as_an_error(fake_rag, settings, monkeypa
     assert "Web fallback → Tavily search" in result["trace"]
     assert "Web search failed" not in result["trace"]
     assert not [r for r in caplog.records if r.getMessage().startswith("External web search failed")]
+
+
+# ---------------------------------------------------------------------------
+# H1-2: retry behavior (documented in the README's timeout and retry budget)
+# ---------------------------------------------------------------------------
+
+class StalledHttpServer:
+    """A loopback HTTP server that reads each request's headers and never answers.
+
+    One selector thread accepts connections and counts complete request
+    headers, so every attempt a client makes is counted, on whichever
+    connection it arrives. Leaving the ``with`` block stops the thread
+    (bounded join) and closes every socket, which also ends any client
+    still waiting on a response.
+    """
+
+    def __init__(self):
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self._listener.setblocking(False)
+        self.port = self._listener.getsockname()[1]
+        self.headers = []  # lowercased header lines of each request, in order
+        self._buffers = {}
+        self._changed = threading.Condition()
+        self._stop = threading.Event()
+        self._selector = selectors.DefaultSelector()
+        self._selector.register(self._listener, selectors.EVENT_READ)
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info):
+        self._stop.set()
+        self._thread.join(5.0)
+        for conn in list(self._buffers):
+            conn.close()
+        self._selector.close()
+        self._listener.close()
+        assert not self._thread.is_alive(), "the server thread did not stop"
+
+    @property
+    def base_url(self):
+        return f"http://127.0.0.1:{self.port}"
+
+    def _serve(self):
+        while not self._stop.is_set():
+            for key, _ in self._selector.select(timeout=0.05):
+                if key.fileobj is self._listener:
+                    conn, _ = self._listener.accept()
+                    conn.setblocking(False)
+                    self._buffers[conn] = b""
+                    self._selector.register(conn, selectors.EVENT_READ)
+                    continue
+                conn = key.fileobj
+                try:
+                    data = conn.recv(65536)
+                except OSError:
+                    data = b""
+                if not data:
+                    self._selector.unregister(conn)
+                    self._buffers.pop(conn, None)
+                    conn.close()
+                    continue
+                buffer = self._buffers[conn] + data
+                if b"\r\n\r\n" in buffer:  # complete headers: one request
+                    head = buffer.split(b"\r\n\r\n", 1)[0]
+                    with self._changed:
+                        self.headers.append(head.decode("latin-1").lower().split("\r\n"))
+                        self._changed.notify_all()
+                    buffer = b""  # the body is ignored, and no response is sent
+                self._buffers[conn] = buffer
+
+    def wait_for_requests(self, count, timeout=5.0):
+        with self._changed:
+            self._changed.wait_for(lambda: len(self.headers) >= count, timeout)
+            return len(self.headers)
+
+
+def run_bounded(call, timeout=15.0):
+    """Run ``call`` in a daemon thread; a missing timeout fails the test instead of hanging it."""
+    outcome = {}
+
+    def target():
+        try:
+            outcome["result"] = call()
+        except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
+            outcome["error"] = exc
+
+    started = time.monotonic()
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), f"the call was still running after {timeout} seconds"
+    outcome["elapsed"] = time.monotonic() - started
+    return outcome
+
+
+@pytest.fixture
+def no_proxy(monkeypatch):
+    """Loopback requests must not be sent through a proxy from the environment."""
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+
+
+class RecordingClient:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+def test_chat_models_get_the_configured_openai_timeout_and_retries(settings, monkeypatch):
+    # Non-default values, so a hard-coded 60 s / 2 retries would fail.
+    monkeypatch.setattr(settings, "openai_timeout_seconds", 7.5)
+    monkeypatch.setattr(settings, "openai_max_retries", 4)
+    monkeypatch.setattr(workflow, "ChatOpenAI", RecordingClient)
+
+    for client in (workflow.llm(), workflow.internal_llm()):
+        assert client.kwargs["timeout"] == 7.5
+        assert client.kwargs["max_retries"] == 4
+
+
+def test_embeddings_get_the_configured_openai_timeout_and_retries(settings, monkeypatch):
+    monkeypatch.setattr(settings, "openai_timeout_seconds", 7.5)
+    monkeypatch.setattr(settings, "openai_max_retries", 4)
+    monkeypatch.setattr(vectorstore, "OpenAIEmbeddings", RecordingClient)
+
+    embeddings = vectorstore.get_embeddings()
+
+    assert embeddings.kwargs["timeout"] == 7.5
+    assert embeddings.kwargs["max_retries"] == 4
+
+
+def test_openai_makes_three_attempts_against_a_stalled_server(settings, monkeypatch, no_proxy):
+    # The application's chat model, built by _chat_model() from the settings,
+    # against a loopback server: 1 attempt + OPENAI_MAX_RETRIES (2) retries.
+    import openai
+    from langchain_openai import ChatOpenAI as RealChatOpenAI
+
+    monkeypatch.setattr(workflow, "ChatOpenAI", RealChatOpenAI)  # the conftest blocks it
+    monkeypatch.setattr(settings, "openai_timeout_seconds", 0.2)
+    monkeypatch.setattr(settings, "openai_max_retries", 2)
+
+    with StalledHttpServer() as server:
+        model = workflow._chat_model(base_url=f"{server.base_url}/v1")
+        outcome = run_bounded(lambda: model.invoke("ping"))
+        received = server.wait_for_requests(3)
+        headers = list(server.headers)
+
+    assert isinstance(outcome.get("error"), openai.APITimeoutError)
+    assert received == 3
+    assert len(headers) == 3  # the client had finished, so no request can follow
+    assert [_header(h, "x-stainless-retry-count") for h in headers] == ["0", "1", "2"]
+    assert all(h[0].startswith("post /v1/chat/completions") for h in headers)
+    # 3 × 0.2 s per attempt plus about 1.1–1.5 s of backoff.
+    assert outcome["elapsed"] < 10.0
+
+
+def _header(lines, name):
+    for line in lines[1:]:
+        key, _, value = line.partition(":")
+        if key.strip() == name:
+            return value.strip()
+    return None
+
+
+def test_tavily_makes_exactly_one_request_against_a_stalled_server(no_proxy):
+    with StalledHttpServer() as server:
+        wrapper = Wrapper(tavily_api_key="test-key", timeout_seconds=0.2, api_base_url=server.base_url)
+        outcome = run_bounded(lambda: wrapper.raw_results(query="q"))
+        received = server.wait_for_requests(1)
+        headers = list(server.headers)
+
+    assert isinstance(outcome.get("error"), requests.exceptions.ReadTimeout)
+    assert received == 1
+    assert len(headers) == 1  # no HTTP retry: the client had finished
+    assert headers[0][0].startswith("post /search")
+    assert outcome["elapsed"] < 5.0
+
+
+# The README's Pinecone retry figures come from the SDK's default policy.
+# Reading it uses private SDK attributes (the same generated control-plane
+# API as ensure_index(), via vectorstore._index_api, and the client the data
+# plane builds); if an SDK upgrade changes them, this test fails and the
+# README's retry budget must be re-checked. No request is sent.
+def test_installed_pinecone_default_retry_policy_matches_the_readme():
+    from pinecone import Pinecone as RealPinecone
+    from urllib3.util.retry import Retry
+
+    pc = RealPinecone(api_key="test-key")
+    control = vectorstore._index_api(pc).api_client.rest_client
+    data = pc.Index(host="test-index.example.invalid")._vector_api.api_client.rest_client
+
+    for rest_client in (control, data):
+        retry = rest_client.pool_manager.connection_pool_kw["retries"]
+        assert isinstance(retry, Retry)
+        assert retry.total == 5  # 6 attempts
+        assert (retry.connect, retry.read, retry.status) == (None, None, None)  # only total limits
+        assert retry.backoff_factor == 0.25
+        assert retry.backoff_max == 120
+        assert tuple(retry.status_forcelist) == (500, 502, 503, 504)
+        assert retry.allowed_methods is None  # every method, POST included
+        assert retry.respect_retry_after_header is True
+        assert retry.retry_after_max == 21600  # Retry-After honored up to 6 hours per retry
+        assert set(Retry.RETRY_AFTER_STATUS_CODES) == {413, 429, 503}
+        # 0 s before the first retry, then 0.5, 1, 2, 4 s, each plus up to
+        # 0.25 s of jitter (Pinecone's JitterRetry).
+        backoffs = []
+        for _ in range(5):
+            retry = retry.increment(method="POST", url="/", error=None, response=_FakeResponse(503))
+            backoffs.append(retry.get_backoff_time())
+        assert all(0 <= b - base <= 0.25 for b, base in zip(backoffs, [0, 0.5, 1, 2, 4], strict=True))
+
+
+class _FakeResponse:
+    """Just enough of a urllib3 response for Retry.increment()."""
+
+    def __init__(self, status):
+        self.status = status
+
+    def get_redirect_location(self):
+        return False

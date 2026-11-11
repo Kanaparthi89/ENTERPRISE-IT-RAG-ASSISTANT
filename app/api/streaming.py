@@ -43,6 +43,13 @@ from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse, StreamingResponse
 
 from app.core.config import get_settings
+from app.rag.cancellation import (
+    SERVER_SHUTDOWN,
+    SESSION_LEASE_LOST,
+    SESSION_TURN_EXPIRED,
+    WorkflowStopped,
+    stop_checks,
+)
 from app.rag.workflow import stream_ask
 from app.services.audit import write_audit
 
@@ -77,6 +84,24 @@ ABORTED = _Sentinel("ABORTED")
 
 class StreamStopped(Exception):
     """Raised on a producer thread when the stream can no longer accept output."""
+
+
+# H1-3a: outcomes for a cooperative stop (WorkflowStopped) that nobody else
+# has claimed, by stop reason. A stop requested by the consumer, a backstop,
+# or the stream shutdown is normally claimed by the requester first and is
+# never reclaimed here. The deadline reasons cover a race: the check saw a
+# due backstop, but it no longer applied when the worker tried it (for
+# example, the response attached in between). The outcome then matches the
+# deadline instead of a generic one.
+WORKFLOW_STOP_OUTCOMES = {
+    SERVER_SHUTDOWN: ("cancelled", "ServerShutdown", "server shutdown"),
+    SESSION_TURN_EXPIRED: ("timeout", "SessionTurnExpired", "session turn limit reached"),
+    SESSION_LEASE_LOST: ("failed", "SessionLeaseLost", "session lease lost"),
+    "timeout": ("timeout", "TimeoutError", "deadline"),
+    "abandon_due": ("timeout", "TimeoutError", "deadline before the response attached"),
+    "consumer_unresponsive": ("timeout", "TimeoutError", "consumer unresponsive at deadline"),
+    "loop_closed": ("cancelled", "LoopClosed", "event loop closed"),
+}
 
 
 # -------------------------------------------------------------------
@@ -552,33 +577,50 @@ class StreamRun:
         if not self.channel.publish(("delta", {"text": text})):
             raise StreamStopped()
 
+    def external_call_stop_reason(self) -> str | None:
+        """Checked immediately before each external call (H1-3a).
+
+        Any stop reason of the run (a requested stop such as ``timeout``,
+        ``disconnected`` or ``server_shutdown``, or a due backstop), or for a
+        session the turn limit or a lost lease (in-memory state; no database
+        access). Never claims anything: the worker does that when the stop
+        reaches ``_complete``.
+        """
+        reason = self.stop_reason()
+        if reason is None and self.session is not None:
+            return self.session.manager.turn_stop_reason(self.session.lease)
+        return reason
+
     def _run_worker(self) -> None:
         self.worker_started = True
         self.stage = "running"
         final = None
         error = None
         try:
-            if self.session is None:
-                stream = self._workflow_stream(self.question, self._forward_chunk)
-            else:
-                stream = self._workflow_stream(
-                    self.question, self._forward_chunk, history=self.session.history
-                )
-            try:
-                for kind, payload in stream:
-                    if self.stop_reason() is not None:
-                        self._apply_backstops()
-                        break
-                    if kind == "trace":
-                        self.trace.append(payload)
-                        event = ("trace", {"index": len(self.trace) - 1, "step": payload})
-                        if not self.channel.publish(event):
+            # Nodes see this check through the context, also in LangGraph's
+            # threads; a stop raises WorkflowStopped before the next call.
+            with stop_checks(self.external_call_stop_reason):
+                if self.session is None:
+                    stream = self._workflow_stream(self.question, self._forward_chunk)
+                else:
+                    stream = self._workflow_stream(
+                        self.question, self._forward_chunk, history=self.session.history
+                    )
+                try:
+                    for kind, payload in stream:
+                        if self.stop_reason() is not None:
+                            self._apply_backstops()
                             break
-                        self.hooks["trace_published"].set()
-                    elif kind == "final":
-                        final = payload
-            finally:
-                stream.close()  # waits only for the in-flight node
+                        if kind == "trace":
+                            self.trace.append(payload)
+                            event = ("trace", {"index": len(self.trace) - 1, "step": payload})
+                            if not self.channel.publish(event):
+                                break
+                            self.hooks["trace_published"].set()
+                        elif kind == "final":
+                            final = payload
+                finally:
+                    stream.close()  # waits only for the in-flight node
         except StreamStopped:
             pass
         except Exception as exc:  # noqa: BLE001 - recorded as the outcome
@@ -594,6 +636,21 @@ class StreamRun:
             self._apply_backstops()
         if self.stop_requested:
             return  # the requester has already claimed the outcome
+
+        if isinstance(error, WorkflowStopped):
+            # Stopped before an external call for a reason nobody claimed (the
+            # shutdown signal, a session limit, or a backstop that lost a
+            # race). The most specific outcome for the reason; never a success.
+            status, error_type, marker = WORKFLOW_STOP_OUTCOMES.get(
+                error.reason,
+                CONSUMER_EXITS.get(error.reason, ("cancelled", "WorkflowStopped", "workflow stopped")),
+            )
+            logger.warning(
+                "Stream workflow stopped for request_id=%s (%s)", self.request_id, error.reason
+            )
+            if self.outcome.claim(status, error_type, marker):
+                self._publish_error("timeout" if status == "timeout" else "internal_error")
+            return
 
         if error is not None:
             logger.error(
@@ -619,8 +676,8 @@ class StreamRun:
                 return
         self._apply_backstops()  # e.g. the loop closed while handing over
 
-    def _publish_error(self) -> None:
-        if self.channel.set_terminal(("error", {"code": "internal_error"})):
+    def _publish_error(self, code: str = "internal_error") -> None:
+        if self.channel.set_terminal(("error", {"code": code})):
             self.hooks["terminal_set"].set()
             if self.channel.finish():
                 self.hooks["finished"].set()

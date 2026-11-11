@@ -5,6 +5,7 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
 
 from app.core.config import get_settings
+from app.rag.cancellation import raise_if_stopped
 
 settings = get_settings()
 
@@ -50,6 +51,37 @@ def get_embeddings():
     return _embeddings
 
 
+INDEX_READY_POLLS = 60
+INDEX_READY_POLL_SECONDS = 2
+INDEX_READY_DEADLINE_SECONDS = 120
+
+
+def _index_api(pc):
+    """The SDK's generated control-plane API (private in pinecone 7.x; H1-1).
+
+    The public ``list_indexes()`` and ``describe_index()`` accept no HTTP
+    timeout. The generated methods underneath them accept
+    ``_request_timeout``, which applies to each HTTP attempt; the SDK's
+    retries still apply. Both calls go through this one private access.
+    """
+    return pc.db.index._index_api
+
+
+def _list_index_names(pc) -> list[str]:
+    raise_if_stopped("Pinecone list indexes")
+    response = _index_api(pc).list_indexes(
+        _request_timeout=settings.pinecone_timeout_seconds
+    )
+    return [index.name for index in response.get("indexes", [])]
+
+
+def _describe_index(pc, name: str):
+    raise_if_stopped("Pinecone describe index")
+    return _index_api(pc).describe_index(
+        name, _request_timeout=settings.pinecone_timeout_seconds
+    )
+
+
 def ensure_index():
     if not settings.pinecone_api_key:
         raise RuntimeError("PINECONE_API_KEY is missing.")
@@ -63,10 +95,10 @@ def ensure_index():
         api_key=settings.pinecone_api_key.get_secret_value()
     )
 
-    index_names = [item["name"] for item in pc.list_indexes()]
+    index_names = _list_index_names(pc)
 
     if settings.pinecone_index_name in index_names:
-        index_info = pc.describe_index(settings.pinecone_index_name)
+        index_info = _describe_index(pc, settings.pinecone_index_name)
 
         if index_info.dimension != dimension:
             raise RuntimeError(
@@ -75,30 +107,46 @@ def ensure_index():
                 "Use a matching index or model. The index was not deleted."
             )
 
-        if not index_info.status["ready"]:
+        if not index_info.status.ready:
             raise RuntimeError("The Pinecone index is not ready.")
 
     else:
+        # The create request itself has no HTTP timeout (public SDK method).
+        # timeout=-1 skips the SDK's own readiness polling, which has no
+        # limit when no timeout is given; the loop below waits instead.
+        raise_if_stopped("Pinecone create index")
         pc.create_index(
             name=settings.pinecone_index_name,
             dimension=dimension,
             metric="cosine",
             spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+            timeout=-1,
         )
 
-        for _ in range(60):
-            index_info = pc.describe_index(settings.pinecone_index_name)
+        # The deadline is checked between polls, so one describe call in
+        # progress (with its retries) can run past it.
+        deadline = time.monotonic() + INDEX_READY_DEADLINE_SECONDS
 
-            if index_info.status["ready"]:
+        for _ in range(INDEX_READY_POLLS):
+            index_info = _describe_index(pc, settings.pinecone_index_name)
+
+            if index_info.status.ready:
                 break
 
-            time.sleep(2)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Pinecone index did not become ready within 120 seconds."
+                )
+
+            time.sleep(min(INDEX_READY_POLL_SECONDS, remaining))
         else:
             raise TimeoutError(
                 "Pinecone index did not become ready within 120 seconds."
             )
 
-    return pc.Index(settings.pinecone_index_name)
+    # The known host avoids another, untimed describe call in the SDK.
+    return pc.Index(settings.pinecone_index_name, host=index_info.host)
 
 
 class _TimeoutIndex:
@@ -115,6 +163,7 @@ class _TimeoutIndex:
         self._timeout_seconds = timeout_seconds
 
     def query(self, *args, **kwargs):
+        raise_if_stopped("Pinecone query")  # H1-3a: no-op outside a stoppable run
         kwargs.setdefault("_request_timeout", self._timeout_seconds)
         return self._index.query(*args, **kwargs)
 

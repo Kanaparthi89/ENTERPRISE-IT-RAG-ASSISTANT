@@ -9,44 +9,79 @@ from langchain_pinecone import PineconeVectorStore as LangChainPineconeVectorSto
 from app.rag import vectorstore
 
 
+HOST = "test-index-abc123.svc.example.invalid"
+
+
+class FakeIndexApi:
+    """Stand-in for the SDK's generated control-plane API (``pc.db.index._index_api``)."""
+
+    def __init__(self, pinecone):
+        self.pinecone = pinecone
+        self.calls = []
+
+    def list_indexes(self, **kwargs):
+        self.calls.append(("list_indexes", (), kwargs))
+        return {"indexes": [SimpleNamespace(name=name) for name in self.pinecone.indexes]}
+
+    def describe_index(self, name, **kwargs):
+        self.calls.append(("describe_index", (name,), kwargs))
+        self.pinecone.on_describe()
+        info = self.pinecone.indexes[name]
+        if self.pinecone.polls_until_ready > 0:
+            self.pinecone.polls_until_ready -= 1
+            return index_info(dimension=info.dimension, ready=False, host=info.host)
+        return info
+
+
 class FakePinecone:
     """Minimal stand-in for the Pinecone client."""
 
-    def __init__(self, indexes=None):
+    def __init__(self, indexes=None, polls_until_ready=0):
         self.indexes = dict(indexes or {})
         self.created = []
+        self.opened = []
+        self.polls_until_ready = polls_until_ready
+        self.on_describe = lambda: None
+        self.db = SimpleNamespace(index=SimpleNamespace(_index_api=FakeIndexApi(self)))
 
     def __call__(self, api_key):
         return self
 
+    @property
+    def control_calls(self):
+        return self.db.index._index_api.calls
+
+    # The public list and describe calls take no HTTP timeout; ensure_index()
+    # must not use them.
     def list_indexes(self):
-        return [{"name": name} for name in self.indexes]
+        raise AssertionError("untimed list_indexes() was called")
 
     def describe_index(self, name):
-        return self.indexes[name]
+        raise AssertionError("untimed describe_index() was called")
 
-    def create_index(self, name, dimension, metric, spec):
-        self.created.append((name, dimension, metric))
-        self.indexes[name] = SimpleNamespace(
-            dimension=dimension, status={"ready": True}
-        )
+    def create_index(self, name, dimension, metric, spec, timeout=None):
+        self.created.append((name, dimension, metric, timeout))
+        self.indexes[name] = index_info(dimension=dimension)
 
-    def Index(self, name):
+    def Index(self, name="", host=""):
+        # Without a host, the SDK would describe the index again (untimed).
+        assert host, "Index() was called without the known host"
+        self.opened.append((name, host))
         return f"index:{name}"
 
 
 @pytest.fixture
 def pinecone(monkeypatch):
-    def install(indexes=None):
-        fake = FakePinecone(indexes)
+    def install(indexes=None, **kwargs):
+        fake = FakePinecone(indexes, **kwargs)
         monkeypatch.setattr(vectorstore, "Pinecone", fake)
         return fake
 
     return install
 
 
-def index_info(dimension=1536, ready=True):
-    return SimpleNamespace(dimension=dimension, status={"ready": ready})
+def index_info(dimension=1536, ready=True, host=HOST):
+    return SimpleNamespace(dimension=dimension, status=SimpleNamespace(ready=ready), host=host)
 
 
 def ensure_index():
@@ -101,7 +136,225 @@ def test_missing_index_is_created_with_cosine_metric(pinecone, settings):
 
     ensure_index()
 
-    assert fake.created == [(settings.pinecone_index_name, 1536, "cosine")]
+    assert [created[:3] for created in fake.created] == [(settings.pinecone_index_name, 1536, "cosine")]
+
+
+# ---------------------------------------------------------------------------
+# H1-1: timeouts for the Pinecone setup calls in ensure_index()
+# ---------------------------------------------------------------------------
+
+def test_existing_index_setup_calls_get_the_timeout_and_reuse_the_host(pinecone, settings):
+    name = settings.pinecone_index_name
+    fake = pinecone({name: index_info()})
+
+    ensure_index()
+
+    timeout = {"_request_timeout": settings.pinecone_timeout_seconds}
+    assert fake.control_calls == [("list_indexes", (), timeout), ("describe_index", (name,), timeout)]
+    assert fake.opened == [(name, HOST)]
+
+
+def test_missing_index_skips_sdk_polling_and_polls_with_the_timeout(pinecone, settings, clock):
+    name = settings.pinecone_index_name
+    fake = pinecone({}, polls_until_ready=2)
+
+    ensure_index()
+
+    [(_, _, _, sdk_timeout)] = fake.created
+    assert sdk_timeout == -1  # the SDK returns at once instead of polling without a limit
+    timeout = {"_request_timeout": settings.pinecone_timeout_seconds}
+    assert fake.control_calls == [("list_indexes", (), timeout)] + [("describe_index", (name,), timeout)] * 3
+    assert clock.sleeps == [2, 2]
+    assert fake.opened == [(name, HOST)]
+
+
+class FakeClock:
+    """A monotonic clock that only moves when the code sleeps or a describe call takes time."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = FakeClock()
+    monkeypatch.setattr(vectorstore, "time", fake)
+    return fake
+
+
+def test_readiness_wait_stops_at_the_deadline(pinecone, clock):
+    fake = pinecone({}, polls_until_ready=1000)
+
+    def slow_describe():  # each describe takes 25 s, like a slow call with retries
+        clock.now += 25
+
+    fake.on_describe = slow_describe
+
+    with pytest.raises(TimeoutError, match="within 120 seconds"):
+        ensure_index()
+
+    describes = [call for call in fake.control_calls if call[0] == "describe_index"]
+    assert len(describes) == 5  # well before the 60-poll limit
+    assert clock.now - 1000.0 == 5 * 25 + 4 * 2  # the deadline is checked between polls
+    assert fake.opened == []
+
+
+def test_last_sleep_is_cut_to_the_time_left(pinecone, clock):
+    fake = pinecone({}, polls_until_ready=1000)
+    fake.on_describe = lambda: setattr(clock, "now", clock.now + 58.5)
+
+    with pytest.raises(TimeoutError):
+        ensure_index()
+
+    # After two describes and one sleep (119 s) only 1 s is left before the deadline.
+    assert clock.sleeps == [2, 1]
+    assert clock.now - 1000.0 == 120 + 58.5  # one more describe ran past the deadline
+
+
+def test_readiness_wait_keeps_the_poll_limit(pinecone, clock):
+    fake = pinecone({}, polls_until_ready=1000)
+    clock.sleep = clock.sleeps.append  # time does not move
+
+    with pytest.raises(TimeoutError, match="within 120 seconds"):
+        ensure_index()
+
+    describes = [call for call in fake.control_calls if call[0] == "describe_index"]
+    assert len(describes) == vectorstore.INDEX_READY_POLLS == 60
+    assert fake.opened == []
+
+
+def test_index_that_becomes_ready_on_the_last_poll_is_used(pinecone, clock, settings):
+    fake = pinecone({}, polls_until_ready=59)
+
+    ensure_index()
+
+    assert fake.opened == [(settings.pinecone_index_name, HOST)]
+
+
+# Private SDK dependency (H1-1). ensure_index() reaches the generated
+# control-plane API through ``pc.db.index._index_api``, because the public
+# list_indexes() and describe_index() take no HTTP timeout. This checks the
+# shape it relies on in the installed SDK, without contacting Pinecone.
+def test_installed_pinecone_sdk_has_the_control_plane_methods_ensure_index_uses():
+    import inspect
+
+    from pinecone import Pinecone as RealPinecone
+    from pinecone.core.openapi.db_control.api.manage_indexes_api import ManageIndexesApi
+
+    pc = RealPinecone(api_key="test-key")
+    api = vectorstore._index_api(pc)
+
+    assert isinstance(api, ManageIndexesApi)
+    assert "_request_timeout" in api.list_indexes.params_map["all"]
+    assert "_request_timeout" in api.describe_index.params_map["all"]
+    assert api.describe_index.params_map["required"] == ["index_name"]
+    assert "timeout" in inspect.signature(RealPinecone.create_index).parameters
+    assert "host" in inspect.signature(RealPinecone.Index).parameters
+
+
+# ---------------------------------------------------------------------------
+# H1-1 against loopback servers, with the real Pinecone SDK
+# ---------------------------------------------------------------------------
+
+def index_json(name, ready=True):
+    return {
+        "name": name,
+        "metric": "cosine",
+        "dimension": 1536,
+        "host": HOST,
+        "spec": {"serverless": {"cloud": "aws", "region": "us-east-1"}},
+        "status": {"ready": ready, "state": "Ready" if ready else "Initializing"},
+        "deletion_protection": "disabled",
+        "vector_type": "dense",
+    }
+
+
+@pytest.fixture
+def loopback_pinecone(monkeypatch):
+    """Points the real Pinecone client's control plane at a loopback URL."""
+    from pinecone import Pinecone as RealPinecone
+
+    def install(base_url):
+        monkeypatch.setattr(
+            vectorstore, "Pinecone", lambda api_key: RealPinecone(api_key=api_key, host=base_url)
+        )
+
+    return install
+
+
+def test_real_sdk_reads_the_raw_control_plane_responses(loopback_pinecone, settings):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    name = settings.pinecone_index_name
+    paths = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            paths.append(self.path)
+            body = {"/indexes": {"indexes": [index_json(name)]}, f"/indexes/{name}": index_json(name)}
+            payload = json.dumps(body[self.path]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            loopback_pinecone(f"http://127.0.0.1:{server.server_address[1]}")
+            index = ensure_index()
+        finally:
+            server.shutdown()
+            thread.join(5)
+
+    assert paths == ["/indexes", f"/indexes/{name}"]  # no extra describe for the host
+    assert index.config.host == f"https://{HOST}"
+
+
+def test_a_stalled_setup_call_times_out_instead_of_blocking(loopback_pinecone, settings, monkeypatch):
+    # The server accepts connections (in the listen backlog) and never
+    # answers. Each attempt times out after 0.2 s; the SDK's retries and
+    # their backoff (about 8 s) still apply, so this test takes ~10 s.
+    import socket
+    import threading
+    import time
+
+    monkeypatch.setattr(settings, "pinecone_timeout_seconds", 0.2)
+    outcome = {}
+
+    with socket.create_server(("127.0.0.1", 0), backlog=32) as server:
+        loopback_pinecone(f"http://127.0.0.1:{server.getsockname()[1]}")
+
+        def setup():
+            try:
+                ensure_index()
+            except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
+                outcome["error"] = exc
+
+        started = time.monotonic()
+        thread = threading.Thread(target=setup, daemon=True)
+        thread.start()
+        thread.join(30.0)
+        elapsed = time.monotonic() - started
+
+    assert not thread.is_alive(), "the setup call was still blocked after 30 seconds"
+    assert type(outcome.get("error")).__name__ == "MaxRetryError"
+    assert elapsed < 20.0
 
 
 def test_add_documents_with_no_chunks_skips_pinecone():

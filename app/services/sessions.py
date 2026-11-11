@@ -1036,6 +1036,30 @@ class SessionLeaseManager:
                 self._entries[request_id] = entry
             return lease
 
+    def turn_expired(self, lease: Lease) -> bool:
+        """True once the lease's turn limit (``turn_max``) has passed (H1-3a).
+
+        Uses the store's clock, as the database does; no database access.
+        Only a stop hint: the fenced save in ``finish()`` still decides.
+        """
+        return self._clock() >= lease.started_at + self.turn_max
+
+    def lease_lost(self, lease: Lease) -> bool:
+        """True once the keeper has marked this request's lease lost (H1-3a).
+
+        Reads the manager's in-memory state under its lock; no database
+        access. ``finish()`` never saves a turn for a lost lease.
+        """
+        return self.state_of(lease.request_id) == LEASE_LOST
+
+    def turn_stop_reason(self, lease: Lease) -> str | None:
+        """Why a session question must start no further external call, or None."""
+        if self.turn_expired(lease):
+            return "session_turn_expired"
+        if self.lease_lost(lease):
+            return "session_lease_lost"
+        return None
+
     def finish(self, lease: Lease, turn: tuple[str, str, str | None] | None = None) -> bool | None:
         """End the request's use of its lease. Always call it, in ``finally``.
 

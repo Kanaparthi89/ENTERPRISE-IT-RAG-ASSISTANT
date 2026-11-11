@@ -19,6 +19,7 @@ from pydantic import BaseModel, BeforeValidator, StringConstraints
 
 from app.api import streaming
 from app.core.config import get_settings
+from app.rag import cancellation
 from app.rag.workflow import ask, history_window
 from app.rag.vectorstore import add_documents
 from app.services import sessions as session_service
@@ -57,7 +58,13 @@ async def _sessions_lifespan(app):
     ``STREAM_SHUTDOWN_DRAIN_SECONDS``), then runs the lease manager's bounded
     shutdown if sessions were used. Blocking work runs in worker threads,
     never on the event loop.
+
+    After the drain, a shutdown signal (H1-3a) stops streams and
+    ``/api/chat`` questions (with or without a session) that are still
+    running before their next external call; a call already in progress is
+    not interrupted.
     """
+    cancellation.reset_shutdown()
     store = session_service.SessionStore.from_settings(settings)
     await anyio.to_thread.run_sync(store.startup_cleanup, SESSION_STARTUP_CLEANUP_WAIT_SECONDS)
     try:
@@ -66,6 +73,7 @@ async def _sessions_lifespan(app):
         try:
             await _close_stream_service()
         finally:
+            cancellation.signal_shutdown()
             runtime = session_service.peek_session_runtime()
             if runtime is not None:
                 try:
@@ -277,6 +285,35 @@ def _acquire_session_lease(token: str, request_id: str):
         raise _session_error("session_unavailable") from exc
 
 
+# H1-3a: audit error types for an /api/chat question (stateless or session) stopped early.
+_STOP_ERROR_TYPES = {
+    cancellation.SESSION_TURN_EXPIRED: "SessionTurnExpired",
+    cancellation.SESSION_LEASE_LOST: "SessionLeaseLost",
+    cancellation.SERVER_SHUTDOWN: "ServerShutdown",
+}
+
+
+def _chat_error_type(exc: Exception) -> str:
+    if isinstance(exc, cancellation.WorkflowStopped):
+        return _STOP_ERROR_TYPES.get(exc.reason, type(exc).__name__)
+    return type(exc).__name__
+
+
+def _log_chat_failure(exc: Exception, request_id: str) -> None:
+    """A cooperative stop is expected: one warning, no traceback. Others: full traceback."""
+    if isinstance(exc, cancellation.WorkflowStopped):
+        logger.warning(
+            "Chat request stopped for request_id=%s (%s)", request_id, _chat_error_type(exc)
+        )
+    else:
+        logger.exception("Chat request failed for request_id=%s", request_id)
+
+
+def _no_deadline() -> str | None:
+    """Stateless /api/chat has no deadline; only the shutdown signal stops it."""
+    return None
+
+
 def _chat_with_session(question: str, request_id: str, token: str) -> dict:
     """Session-aware /api/chat (design §10).
 
@@ -291,8 +328,13 @@ def _chat_with_session(question: str, request_id: str, token: str) -> dict:
     turns_used = len(history_window(history))
     finished = False
 
+    def stop_reason() -> str | None:
+        """H1-3a: after the turn limit or a lost lease, start no further external calls."""
+        return runtime.manager.turn_stop_reason(lease)
+
     try:
-        result = ask(question, history=history)
+        with cancellation.stop_checks(stop_reason):
+            result = ask(question, history=history)
         response = _chat_response(result, request_id, question)
 
         if not response["answer"]:
@@ -321,7 +363,7 @@ def _chat_with_session(question: str, request_id: str, token: str) -> dict:
         return response
 
     except Exception as exc:
-        logger.exception("Chat request failed for request_id=%s", request_id)
+        _log_chat_failure(exc, request_id)
 
         try:
             write_audit(
@@ -330,7 +372,7 @@ def _chat_with_session(question: str, request_id: str, token: str) -> dict:
                 trace=[],
                 request_id=request_id,
                 status="failed",
-                error_type=type(exc).__name__,
+                error_type=_chat_error_type(exc),
                 session_id=lease.session_id,
             )
         except Exception:
@@ -362,7 +404,9 @@ def chat(payload: ChatRequest, session_token: str | None = Depends(_session_toke
         return _chat_with_session(question, request_id, session_token)
 
     try:
-        result = ask(question)
+        # No deadline (H1-3a); the shutdown signal still applies before each external call.
+        with cancellation.stop_checks(_no_deadline):
+            result = ask(question)
         response = _chat_response(result, request_id, question)
 
         if not response["answer"]:
@@ -388,10 +432,7 @@ def chat(payload: ChatRequest, session_token: str | None = Depends(_session_toke
         return response
 
     except Exception as exc:
-        logger.exception(
-            "Chat request failed for request_id=%s",
-            request_id,
-        )
+        _log_chat_failure(exc, request_id)
 
         try:
             write_audit(
@@ -400,7 +441,7 @@ def chat(payload: ChatRequest, session_token: str | None = Depends(_session_toke
                 trace=[],
                 request_id=request_id,
                 status="failed",
-                error_type=type(exc).__name__,
+                error_type=_chat_error_type(exc),
             )
         except Exception:
             logger.exception(

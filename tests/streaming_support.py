@@ -547,11 +547,36 @@ class ASGIHarness:
 # Loopback uvicorn server
 # -------------------------------------------------------------------
 
+# H3 runtimes: (event loop, HTTP protocol). "A" is the baseline the suite has
+# always used; "P" is what production uvicorn selects ("auto" with
+# uvicorn[standard] installed). D1/D2 isolate a difference between A and P.
+RUNTIMES = {
+    "A": ("asyncio", "h11"),
+    "P": ("uvloop", "httptools"),
+    "D1": ("asyncio", "httptools"),
+    "D2": ("uvloop", "h11"),
+}
+
+
+def _http_protocol_class(name: str) -> type:
+    if name == "h11":
+        from uvicorn.protocols.http.h11_impl import H11Protocol
+
+        return H11Protocol
+    from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
+
+    return HttpToolsProtocol
+
+
 class LoopbackServer:
     """Real uvicorn on 127.0.0.1 in a background thread.
 
-    Forced to ``loop="asyncio"`` and ``http="h11"`` so the network guard
-    (which only sees Python socket calls) remains effective. The listening
+    ``runtime`` selects the event loop and HTTP protocol (``RUNTIMES``);
+    the default is the baseline, asyncio + h11. The harness creates the
+    event loop itself (``serve()`` does not run uvicorn's loop setup): the
+    standard asyncio loop, or for uvloop ``guarded_uvloop_class()`` from the
+    conftest, so the network guard stays effective. Startup fails unless the
+    loop and protocol actually in use are the requested ones. The listening
     socket is bound before the server starts, so no host name is resolved.
     """
 
@@ -559,17 +584,27 @@ class LoopbackServer:
         self,
         app,
         *,
+        runtime: str = "A",
         lifespan: str = "off",
         startup_timeout: float = 10.0,
         graceful_shutdown_timeout: float | None = 5.0,
     ):
         self.app = app
+        self.runtime = runtime
+        self.loop_name, self.http_name = RUNTIMES[runtime]
         self.lifespan = lifespan
         self.startup_timeout = startup_timeout
         # Bounds shutdown if a test leaves a streaming connection open.
         self.graceful_shutdown_timeout = graceful_shutdown_timeout
-        self.loop_class: type | None = None
+        self.loop_class: type | None = None  # recorded inside the server task
         self._error: BaseException | None = None
+
+    def _loop_factory(self):
+        if self.loop_name == "uvloop":
+            from tests.conftest import guarded_uvloop_class
+
+            return guarded_uvloop_class()
+        return None  # asyncio's default loop, as asyncio.run() uses
 
     def __enter__(self) -> "LoopbackServer":
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -578,8 +613,8 @@ class LoopbackServer:
 
         config = uvicorn.Config(
             self.app,
-            loop="asyncio",
-            http="h11",
+            loop="none",  # the harness creates the loop (see _run)
+            http=self.http_name,
             ws="none",
             lifespan=self.lifespan,
             log_config=None,
@@ -597,15 +632,40 @@ class LoopbackServer:
             if time.monotonic() > deadline:
                 raise TimeoutError("Loopback server did not start in time.")
             time.sleep(0.01)
+        self._check_runtime()
         return self
+
+    def _check_runtime(self) -> None:
+        """Fail fast unless the requested loop and protocol are the ones in use."""
+        wanted_protocol = _http_protocol_class(self.http_name)
+        problems = []
+        if self.loop_name == "uvloop":
+            from tests.conftest import guarded_uvloop_class
+
+            if self.loop_class is not guarded_uvloop_class():
+                problems.append(f"loop {self.loop_class!r}, expected the guarded uvloop loop")
+        elif not issubclass(self.loop_class, asyncio.BaseEventLoop):  # uvloop.Loop is not one
+            problems.append(f"loop {self.loop_class!r}, expected the standard asyncio loop")
+        if self.server.config.http_protocol_class is not wanted_protocol:
+            problems.append(
+                f"protocol {self.server.config.http_protocol_class!r}, expected {wanted_protocol!r}"
+            )
+        if problems:
+            self.server.should_exit = True
+            self.thread.join(10)
+            self.sock.close()
+            raise RuntimeError(f"Loopback runtime {self.runtime} not in use: " + "; ".join(problems))
 
     def _run(self) -> None:
         async def main():
-            self.loop_class = type(asyncio.get_running_loop())
+            self.loop_class = type(asyncio.get_running_loop())  # inside the server task
             await self.server.serve(sockets=[self.sock])
 
         try:
-            asyncio.run(main())
+            # asyncio.Runner (Python 3.11+) is what asyncio.run() uses; it also
+            # accepts the guarded uvloop loop for the production runtime.
+            with asyncio.Runner(loop_factory=self._loop_factory()) as runner:
+                runner.run(main())
         except BaseException as exc:  # noqa: BLE001 - surfaced in __enter__
             self._error = exc
 
@@ -619,6 +679,20 @@ class LoopbackServer:
         self.sock.close()
         if self.thread.is_alive():
             raise RuntimeError("Loopback server did not stop.")
+
+
+def assert_run_cleaned_up(service, run, server: "LoopbackServer | None" = None) -> None:
+    """The run's own cleanup (H3): its worker exited, its lease and capacity
+    slot were released, it wrote exactly one audit row, and the loopback
+    server (if given) stopped. Waits are the callers' (bounded) waits."""
+    assert run.hooks["worker_exited"].is_set(), "the run's worker has not exited"
+    assert run.lease.released, "the run's lease was not released"
+    assert service.capacity.in_use == 0
+    assert service.capacity.acquired_total == service.capacity.released_total
+    assert run.audit_writes == 1
+    assert not run.defensive_claim_fired
+    if server is not None:
+        assert not server.thread.is_alive(), "the loopback server did not stop"
 
 
 def read_sse_until(chunks: Iterator[bytes], buffer: bytearray, fragment: bytes) -> None:

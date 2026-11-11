@@ -43,17 +43,20 @@ class Settings(BaseSettings):
     max_retries: int = Field(default=2, ge=0, le=10)
 
     # Finite timeouts for Pinecone and Tavily calls (H1), separate from the
-    # OpenAI limits above. Pinecone: per HTTP attempt of a query or upsert;
-    # the SDK retries a failed attempt up to 5 times. Tavily: Requests
-    # connect and read timeouts for one search request (no retries).
+    # OpenAI limits above. Pinecone: per HTTP attempt of a query or upsert,
+    # and of the index list and describe calls in ensure_index() (not the
+    # create request); the SDK retries a failed attempt up to 5 times.
+    # Tavily: Requests connect and read timeouts for one search request
+    # (no retries).
     pinecone_timeout_seconds: float = Field(default=10.0, gt=0, le=15)
     tavily_timeout_seconds: float = Field(default=15.0, gt=0, le=30)
 
     # Streaming chat (POST /api/chat/stream). Disabled by default: a
-    # controlled prototype, not production-ready. Pinecone queries and
-    # upserts and Tavily searches now have timeouts (above), but Pinecone
-    # setup calls in ensure_index() have none, and other production blockers
-    # remain open. The values below are proposals, not production-validated.
+    # controlled prototype, not production-ready. Pinecone and Tavily calls
+    # now have per-attempt timeouts (above), but the Pinecone index create
+    # request has none, no call has a total deadline, and other production
+    # blockers remain open. The values below are proposals, not
+    # production-validated.
     stream_enabled: bool = False
     stream_heartbeat_seconds: float = Field(default=15.0, gt=0, le=300)
     stream_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)

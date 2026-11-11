@@ -16,9 +16,11 @@ Isolation guarantees (enforced here, verified in tests/test_isolation.py):
 Event-loop limitation: the network guard wraps Python's ``socket`` module.
 uvloop (libuv) performs DNS resolution and connections in C and would bypass
 it. Async tests therefore run on the standard asyncio loop only
-(``anyio_backend`` below), ``tests/test_isolation.py`` asserts that uvloop is
-not active, and loopback servers are started with ``loop="asyncio"``.
-Production uvicorn may still choose uvloop; that path is not exercised here.
+(``anyio_backend`` below), and ``tests/test_isolation.py`` asserts that uvloop
+is not active. Loopback servers run the baseline runtime (asyncio + h11) by
+default; the production runtime (uvloop + httptools, H3) runs on
+``guarded_uvloop_class()`` below, which applies the same rules to uvloop's own
+network methods. Its limits are documented there.
 """
 
 import ipaddress
@@ -183,6 +185,77 @@ socket.socket.sendto = _guarded_sendto
 socket.getaddrinfo = _guarded_getaddrinfo
 
 
+_guarded_uvloop_class = None
+
+
+def guarded_uvloop_class():
+    """A ``uvloop.Loop`` with the network guard on its own network methods (H3).
+
+    uvloop resolves names and connects in C (libuv), so the socket-module
+    guard above cannot see those calls. This subclass applies the same rules
+    to the loop's Python-level entry points: ``getaddrinfo``,
+    ``getnameinfo``, ``create_connection``, ``sock_connect``,
+    ``sock_sendto`` and ``create_datagram_endpoint``. Blocked attempts are
+    recorded like any other, so the test fails even if the error is caught.
+    Inbound sockets, pipes and Unix-domain connections are allowed, as in the
+    socket guard.
+
+    Limitation: network work that libuv performs without going through
+    these methods is not intercepted. The application opens no connections
+    on its event loop (its provider clients are synchronous and use Python
+    sockets in worker threads); container runs with ``--network none``
+    cover the rest. Used only by loopback servers; async tests still run on
+    the standard asyncio loop.
+    """
+    global _guarded_uvloop_class
+    if _guarded_uvloop_class is not None:
+        return _guarded_uvloop_class
+
+    import uvloop
+
+    class GuardedUVLoop(uvloop.Loop):
+        async def getaddrinfo(self, host, port, *, family=0, type=0, proto=0, flags=0):
+            if not (
+                _is_loopback(host)
+                or _is_passive_wildcard_lookup(host, (port, family, type, proto, flags), {})
+            ):
+                _block(f"uvloop getaddrinfo {host!r}")
+            return await super().getaddrinfo(
+                host, port, family=family, type=type, proto=proto, flags=flags
+            )
+
+        async def getnameinfo(self, sockaddr, flags=0):
+            if not _is_loopback(sockaddr[0]):
+                _block(f"uvloop getnameinfo {sockaddr!r}")
+            return await super().getnameinfo(sockaddr, flags)
+
+        async def create_connection(self, protocol_factory, host=None, port=None, *args, **kwargs):
+            sock = kwargs.get("sock")
+            if sock is not None:
+                _check_socket_address(sock, sock.getpeername(), "uvloop create_connection")
+            elif not _is_loopback(host):
+                _block(f"uvloop create_connection {(host, port)!r}")
+            return await super().create_connection(protocol_factory, host, port, *args, **kwargs)
+
+        async def sock_connect(self, sock, address):
+            _check_socket_address(sock, address, "uvloop sock_connect")
+            return await super().sock_connect(sock, address)
+
+        async def sock_sendto(self, sock, data, address):
+            _check_socket_address(sock, address, "uvloop sock_sendto")
+            return await super().sock_sendto(sock, data, address)
+
+        async def create_datagram_endpoint(self, protocol_factory, local_addr=None, remote_addr=None, **kwargs):
+            if remote_addr is not None and not _is_loopback(remote_addr[0]):
+                _block(f"uvloop create_datagram_endpoint {remote_addr!r}")
+            return await super().create_datagram_endpoint(
+                protocol_factory, local_addr=local_addr, remote_addr=remote_addr, **kwargs
+            )
+
+    _guarded_uvloop_class = GuardedUVLoop
+    return GuardedUVLoop
+
+
 def check_network_attempts(attempts: list[str]) -> None:
     """Fail the current test if it attempted outbound network access."""
     if attempts:
@@ -200,7 +273,7 @@ import app.core.logging as app_logging  # noqa: E402
 import app.main  # noqa: E402
 import ingest_sample_kb  # noqa: E402
 from app.api import routes  # noqa: E402
-from app.rag import vectorstore, workflow  # noqa: E402
+from app.rag import cancellation, vectorstore, workflow  # noqa: E402
 from app.services import audit  # noqa: E402
 from app.api import streaming  # noqa: E402
 from app.services import sessions as session_service  # noqa: E402
@@ -435,6 +508,14 @@ def stream_app(monkeypatch, settings):
 
 
 @pytest.fixture(autouse=True)
+def shutdown_signal_cleared():
+    """The H1-3a shutdown signal is process-wide; an app lifespan's shutdown sets it."""
+    cancellation.reset_shutdown()
+    yield
+    cancellation.reset_shutdown()
+
+
+@pytest.fixture(autouse=True)
 def session_runtime_singleton():
     """Each test starts without a session runtime; one created is shut down after.
 
@@ -486,6 +567,13 @@ def client():
     """Test client with lifespan enabled so the audit DB is initialized."""
     with TestClient(app.main.app) as test_client:
         yield test_client
+
+
+@pytest.fixture(params=["A", "P"])
+def loopback_runtime(request):
+    """H3: run a real-server test on runtime A (asyncio + h11, the baseline)
+    and runtime P (uvloop + httptools, what production uvicorn selects)."""
+    return request.param
 
 
 @pytest.fixture

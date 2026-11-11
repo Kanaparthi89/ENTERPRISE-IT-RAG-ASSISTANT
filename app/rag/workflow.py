@@ -20,6 +20,7 @@ from langgraph.constants import TAG_NOSTREAM
 from langgraph.graph import StateGraph, START, END
 
 from app.core.config import get_settings
+from app.rag.cancellation import raise_if_stopped
 from app.rag.state import AgentState, RouteDecision, EvidenceGrade
 from app.rag.vectorstore import get_retriever
 
@@ -260,6 +261,7 @@ def contextualize_question(state: AgentState):
     window = history_window(state.get("history"))
     started = time.monotonic()
     standalone = None
+    raise_if_stopped("OpenAI chat (contextualize)")  # outside the try: a stop is not a failure
     try:
         response = internal_llm().invoke(
             f"""
@@ -410,6 +412,7 @@ def route_question(state: AgentState):
         method="json_mode",
     )
 
+    raise_if_stopped("OpenAI chat (route)")
     decision = router.invoke(
         f"""
 You route messages for an enterprise IT support assistant.
@@ -460,7 +463,11 @@ def route_after_router(
 def retrieve_kb(state: AgentState):
     """Retrieve relevant documents from the private knowledge base."""
     query = state.get("current_query") or state["question"]
-    docs = get_retriever().invoke(query)
+    retriever = get_retriever()  # first use sets up Pinecone (checked in vectorstore)
+    # The retriever embeds the query (OpenAI), then queries Pinecone; the
+    # Pinecone query is checked again in vectorstore._TimeoutIndex.
+    raise_if_stopped("OpenAI embeddings (retrieval)")
+    docs = retriever.invoke(query)
 
     logger.info("Retrieved %d private KB chunks", len(docs))
 
@@ -489,6 +496,7 @@ def grade_kb(state: AgentState):
         method="json_mode",
     )
 
+    raise_if_stopped("OpenAI chat (grade knowledge base)")
     grade = grader.invoke(
         f"""
 Evaluate the relevance and sufficiency of evidence for an enterprise
@@ -543,6 +551,7 @@ def search_web(state: AgentState):
     """Search external sources and keep unique, relevant-looking results."""
     query = state.get("current_query") or state["question"]
 
+    raise_if_stopped("Tavily search")  # outside the try: a stop is not a failed search
     try:
         official_domains = _official_domains_for_question(
             _effective_question(state)
@@ -647,6 +656,7 @@ def grade_web(state: AgentState):
         method="json_mode",
     )
 
+    raise_if_stopped("OpenAI chat (grade web)")
     grade = grader.invoke(
         f"""
 Evaluate the external evidence for the user's question.
@@ -695,6 +705,7 @@ def after_web(
 
 def rewrite_query(state: AgentState):
     """Rewrite the question before a bounded retrieval retry."""
+    raise_if_stopped("OpenAI chat (rewrite)")
     response = internal_llm().invoke(
         f"""
 Rewrite the following question as a clear, self-contained search query
@@ -741,6 +752,7 @@ def generate_from_kb(state: AgentState):
     docs = state.get("kb_docs", [])
     context = _kb_context(docs)
 
+    raise_if_stopped("OpenAI chat (answer from knowledge base)")
     response = llm().invoke(
         f"""
 You are the BluePeak enterprise IT support copilot.
@@ -791,6 +803,7 @@ def generate_from_web(state: AgentState):
             ),
         }
 
+    raise_if_stopped("OpenAI chat (answer from web)")
     response = llm().invoke(
         f"""
 You are the BluePeak enterprise IT support copilot.
@@ -845,6 +858,7 @@ Numbered external evidence:
 
 def direct_answer(state: AgentState):
     """Respond briefly without retrieving company information."""
+    raise_if_stopped("OpenAI chat (direct answer)")
     response = llm().invoke(
         f"""
 Respond briefly and naturally to the user's conversational message.

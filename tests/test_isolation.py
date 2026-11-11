@@ -236,6 +236,87 @@ async def test_async_tests_run_on_the_standard_asyncio_loop():
 
 
 # -------------------------------------------------------------------
+# Guarded uvloop (H3): loopback servers on the production runtime
+# -------------------------------------------------------------------
+
+REMOTE = "203.0.113.5"  # TEST-NET-3: never routed
+
+
+def run_on_guarded_uvloop(make_coro):
+    from tests.conftest import guarded_uvloop_class
+
+    with asyncio.Runner(loop_factory=guarded_uvloop_class()) as runner:
+        return runner.run(make_coro())
+
+
+def test_guarded_uvloop_is_a_uvloop_loop():
+    import uvloop
+
+    from tests.conftest import guarded_uvloop_class
+
+    assert issubclass(guarded_uvloop_class(), uvloop.Loop)
+    assert guarded_uvloop_class() is guarded_uvloop_class()  # one class, created once
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "getaddrinfo",
+        "getnameinfo",
+        "create_connection",
+        "open_connection",
+        "sock_connect",
+        "sock_sendto",
+        "create_datagram_endpoint",
+    ],
+)
+def test_guarded_uvloop_blocks_remote_network_access(blocked_network, operation):
+    async def attempt():
+        loop = asyncio.get_running_loop()
+        if operation == "getaddrinfo":
+            await loop.getaddrinfo("example.com", 443)
+        elif operation == "getnameinfo":
+            await loop.getnameinfo((REMOTE, 443))
+        elif operation == "create_connection":
+            await loop.create_connection(asyncio.Protocol, REMOTE, 443)
+        elif operation == "open_connection":
+            await asyncio.open_connection(REMOTE, 443)
+        elif operation == "sock_connect":
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.setblocking(False)
+                await loop.sock_connect(sock, (REMOTE, 443))
+        elif operation == "sock_sendto":
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.setblocking(False)
+                await loop.sock_sendto(sock, b"x", (REMOTE, 53))
+        else:
+            await loop.create_datagram_endpoint(asyncio.DatagramProtocol, remote_addr=(REMOTE, 53))
+
+    with pytest.raises(NetworkAccessBlocked):
+        run_on_guarded_uvloop(attempt)
+
+    [recorded] = blocked_network()  # recorded, so a caught error still fails a test
+    assert recorded.startswith("uvloop ") and (REMOTE in recorded or "example.com" in recorded)
+
+
+def test_guarded_uvloop_allows_loopback(blocked_network):
+    with socket.create_server(("127.0.0.1", 0)) as server:
+        port = server.getsockname()[1]
+
+        async def connect():
+            loop = asyncio.get_running_loop()
+            await loop.getaddrinfo("localhost", port)
+            transport, _ = await loop.create_connection(asyncio.Protocol, "127.0.0.1", port)
+            transport.close()
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.close()
+
+        run_on_guarded_uvloop(connect)
+
+    assert blocked_network() == []
+
+
+# -------------------------------------------------------------------
 # External clients
 # -------------------------------------------------------------------
 
