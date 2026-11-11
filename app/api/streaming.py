@@ -1248,6 +1248,14 @@ class SSEResponse(StreamingResponse):
 
             while True:
                 await self._check_deadline(scope)
+                # H3-A: yield once before taking the next batch. After a
+                # disconnect, uvicorn's send() returns without suspending and
+                # receive_batch() does too while events are queued, so without
+                # this the loop could drain whole batches into a closed
+                # connection (freeing the channel for the worker) before the
+                # disconnect listener ran. Here a pending disconnect cancels
+                # the stream before another batch is taken.
+                await anyio.lowlevel.checkpoint()
                 batch = await run.channel.receive_batch(self._heartbeat)
                 if batch is END or batch is ABORTED:
                     break  # stopped elsewhere: end without a terminal event

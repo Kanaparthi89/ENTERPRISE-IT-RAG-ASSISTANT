@@ -28,6 +28,7 @@ import socket
 import threading
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -588,6 +589,7 @@ class LoopbackServer:
         lifespan: str = "off",
         startup_timeout: float = 10.0,
         graceful_shutdown_timeout: float | None = 5.0,
+        sndbuf: int | None = None,
     ):
         self.app = app
         self.runtime = runtime
@@ -596,7 +598,14 @@ class LoopbackServer:
         self.startup_timeout = startup_timeout
         # Bounds shutdown if a test leaves a streaming connection open.
         self.graceful_shutdown_timeout = graceful_shutdown_timeout
+        # H3-A: optional SO_SNDBUF for the listening socket, inherited by the
+        # connections it accepts. Small values make a slow reader fill the
+        # kernel buffers after little data instead of the OS's auto-tuned
+        # maximum (several MB), so transport flow control engages promptly.
+        # None (the default) leaves the OS default untouched.
+        self.sndbuf = sndbuf
         self.loop_class: type | None = None  # recorded inside the server task
+        self.loop: asyncio.AbstractEventLoop | None = None  # the server's own loop
         self._error: BaseException | None = None
 
     def _loop_factory(self):
@@ -608,6 +617,8 @@ class LoopbackServer:
 
     def __enter__(self) -> "LoopbackServer":
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if self.sndbuf is not None:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.sndbuf)
         self.sock.bind(("127.0.0.1", 0))
         self.port = self.sock.getsockname()[1]
 
@@ -658,7 +669,8 @@ class LoopbackServer:
 
     def _run(self) -> None:
         async def main():
-            self.loop_class = type(asyncio.get_running_loop())  # inside the server task
+            self.loop = asyncio.get_running_loop()
+            self.loop_class = type(self.loop)  # inside the server task
             await self.server.serve(sockets=[self.sock])
 
         try:
@@ -668,6 +680,52 @@ class LoopbackServer:
                 runner.run(main())
         except BaseException as exc:  # noqa: BLE001 - surfaced in __enter__
             self._error = exc
+
+    def call_in_loop(self, fn: Callable[[], Any], timeout: float = 5.0) -> Any:
+        """Run ``fn`` on the server's event-loop thread and return its result.
+
+        For reading per-connection state that the loop owns (H3-A) without
+        racing it. Fails if the loop does not run ``fn`` within ``timeout``,
+        which also shows the loop is not blocked when it succeeds.
+        """
+        assert self.loop is not None, "the server loop is not running"
+        done: Future = Future()
+
+        def run():
+            try:
+                done.set_result(fn())
+            except BaseException as exc:  # noqa: BLE001 - re-raised by result()
+                done.set_exception(exc)
+
+        self.loop.call_soon_threadsafe(run)
+        return done.result(timeout)
+
+    def connection_flow(self) -> list[dict]:
+        """Flow-control state of each open connection, read on the server loop (H3-A).
+
+        ``write_paused`` is uvicorn's ``FlowControl`` flag, set when the
+        transport's write buffer passed its high-water mark and the transport
+        called ``protocol.pause_writing()``; ``sndbuf`` is the accepted
+        socket's actual SO_SNDBUF (``None`` if the transport does not expose
+        a socket).
+        """
+
+        def read():
+            states = []
+            for protocol in list(self.server.server_state.connections):
+                flow = getattr(protocol, "flow", None)
+                transport = getattr(protocol, "transport", None)
+                sock = transport.get_extra_info("socket") if transport is not None else None
+                states.append(
+                    {
+                        "write_paused": None if flow is None else flow.write_paused,
+                        "write_buffer": None if transport is None else transport.get_write_buffer_size(),
+                        "sndbuf": None if sock is None else sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF),
+                    }
+                )
+            return states
+
+        return self.call_in_loop(read)
 
     @property
     def base_url(self) -> str:
