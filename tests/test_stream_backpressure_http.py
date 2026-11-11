@@ -42,6 +42,7 @@ import httpx
 import pytest
 
 import app.main
+from app.api import routes, streaming
 from app.api.streaming import CHANNEL_MAX_EVENTS, FINALIZE_GRACE, TIMEOUT_ERROR_GRACE
 from tests.streaming_support import LoopbackServer, assert_run_cleaned_up, parse_sse
 from tests.test_stream_run import final_state
@@ -277,4 +278,60 @@ def test_slow_reader_disconnect_stops_the_blocked_run(stream_app, loopback_runti
     decision = run.outcome.decision
     assert (decision.status, decision.error_type) == ("cancelled", "ClientDisconnected")
     assert rows(service) == [("cancelled", "ClientDisconnected")]
+    assert_run_cleaned_up(service, run, server)
+
+
+# H2 × H3: server shutdown while the slow reader's connection is paused.
+GRACEFUL_SHUTDOWN = 0.5  # Uvicorn's timeout_graceful_shutdown for this test
+SHUTDOWN_MARGIN = 3.0
+# Uvicorn's graceful wait, then the lifespan's stream drain, plus a margin.
+SHUTDOWN_BOUND = GRACEFUL_SHUTDOWN + routes.STREAM_SHUTDOWN_DRAIN_SECONDS + SHUTDOWN_MARGIN
+
+
+def test_shutdown_while_a_slow_reader_is_paused_is_bounded(stream_app, loopback_runtime, monkeypatch, record_property):
+    """The client never reads, so the paused send cannot release itself; only
+    shutdown can end the stream. Shutdown starts as a signal starts it
+    (``should_exit``): Uvicorn stops accepting, waits ``GRACEFUL_SHUTDOWN``
+    for the open connection and then cancels the response, then the lifespan
+    drains stream workers. The server must stop within ``SHUTDOWN_BOUND``.
+
+    Hang guard: the server thread is a daemon; the wait below is bounded, and
+    ``LoopbackServer.__exit__`` joins for at most 10 s and then raises, so a
+    shutdown hang fails this test instead of hanging the suite.
+    """
+    workflow = VolumeWorkflow()
+    service = stream_app(workflow)
+    monkeypatch.setattr(streaming, "_service", service)  # the lifespan drains this service
+
+    with LoopbackServer(app.main.app, runtime=loopback_runtime, lifespan="on",
+                        graceful_shutdown_timeout=GRACEFUL_SHUTDOWN, sndbuf=SNDBUF) as server:
+        http = slow_client(server)
+        response = open_stream(http)
+        try:
+            [run] = service.started
+            wait_for_backpressure(server, run, workflow, record_property)
+            held_at = workflow.produced
+
+            started = time.monotonic()
+            server.server.should_exit = True  # what SIGTERM does; the client still never reads
+            server.thread.join(SHUTDOWN_BOUND)
+            shutdown_seconds = time.monotonic() - started
+            record_property("shutdown_seconds", round(shutdown_seconds, 2))
+            assert not server.thread.is_alive(), f"the server did not stop within {SHUTDOWN_BOUND} s"
+        finally:
+            response.close()  # SO_LINGER 0: reset; the server side is already gone
+            http.close()
+
+        wait_for(run.hooks["worker_exited"])
+        wait_until(lambda: run.lease.released, "the lease was not released")
+        assert workflow.produced <= held_at + 1  # the paused producer was not released by shutdown
+        assert workflow.produced < workflow.count
+
+    decision = run.outcome.decision
+    record_property("outcome_marker", decision.marker)
+    # Uvicorn cancels the paused response at its graceful timeout, as in
+    # tests/test_graceful_shutdown.py; never a success, and exactly one audit row.
+    assert (decision.status, decision.error_type) == ("cancelled", "Cancelled")
+    assert rows(service) == [("cancelled", "Cancelled")]
+    assert streaming.peek_stream_service() is None  # the lifespan drained and cleared it
     assert_run_cleaned_up(service, run, server)
