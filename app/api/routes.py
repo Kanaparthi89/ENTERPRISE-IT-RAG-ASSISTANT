@@ -629,6 +629,21 @@ def delete_session(session_token: str | None = Depends(_session_token)):
     return Response(status_code=204)
 
 
+@router.get("/voice/status")
+async def voice_status(response: Response):
+    """Whether spoken answers may be offered (Voice V1b).
+
+    404 (the same body as an unknown route) while ``VOICE_ENABLED`` is off,
+    the default. When on: ``{"tts": true}``, meaning the page may offer
+    browser speech synthesis with on-device voices. Reads one setting and
+    nothing else: no speech provider, credentials, storage or audit.
+    """
+    if not settings.voice_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+    response.headers["Cache-Control"] = "no-store"  # the flag can change on restart
+    return {"tts": True}
+
+
 @router.post("/ingest")
 async def ingest(
     file: UploadFile = File(...),

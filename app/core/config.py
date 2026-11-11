@@ -101,6 +101,12 @@ class Settings(BaseSettings):
     session_keeper_join_seconds: float = Field(default=2.0, ge=0, le=30)
     session_release_budget_seconds: float = Field(default=2.0, gt=0, le=30)
 
+    # Voice (V1). Disabled by default. Only reports, through
+    # GET /api/voice/status, that spoken answers may be offered; speech runs
+    # in the browser with on-device voices, so the server calls no speech
+    # provider. No page uses it yet. Strict: only true or false.
+    voice_enabled: bool = False
+
     # Application authentication
     admin_api_key: SecretStr = SecretStr("")
 
@@ -125,6 +131,22 @@ class Settings(BaseSettings):
         case_sensitive=False,
         validate_default=True,
     )
+
+    @field_validator("voice_enabled", mode="before")
+    @classmethod
+    def validate_strict_boolean(cls, value):
+        """Accept only a real boolean or the words true/false (any case).
+
+        Pydantic's default boolean parsing also accepts 1, yes, on, t and y.
+        A feature flag that controls what users are offered must not turn on
+        from an ambiguous value, so anything else is rejected at startup.
+        Pydantic's StrictBool cannot be used: environment values are strings.
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+            return value.strip().lower() == "true"
+        raise ValueError("This setting must be true or false.")
 
     @field_validator("pinecone_index_name", "pinecone_namespace")
     @classmethod

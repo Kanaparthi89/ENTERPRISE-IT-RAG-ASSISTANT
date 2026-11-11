@@ -864,6 +864,20 @@ Session errors have the body `{"detail": {"code": "...", "message": "..."}}`. Me
 - **Request load.** A question asked in a session that already has saved turns makes one more model call (the standalone rewrite) than the same question without a session.
 - **Rate limits.** `POST /api/sessions` has no rate limit or authentication. Apply limits at the proxy.
 
+### Voice status (in development, disabled by default)
+
+Voice is under development and is **not available in the user interface**: no page calls this endpoint yet, and enabling it changes nothing a user sees. It reports only whether spoken answers may be offered. The planned speech is the browser's own speech synthesis with on-device voices; the server calls no speech provider, and no audio is uploaded or stored.
+
+| Setting | Default | Allowed | Purpose |
+| ------- | ------- | ------- | ------- |
+| `VOICE_ENABLED` | `false` | `true` or `false` only (any case) | Enables `GET /api/voice/status`. Any other value, including `1`, `yes`, or an empty value, stops the application at startup. |
+
+| Request | Disabled (default) | Enabled |
+| ------- | ------------------ | ------- |
+| `GET /api/voice/status` | `404` with `{"detail": "Not Found"}`, the same as an unknown route | `200` with exactly `{"tts": true}` and `Cache-Control: no-store` |
+
+The endpoint reads only this setting: it returns no other configuration and makes no external call, audit record, or storage change. Other methods on the path return FastAPI's standard `405`, also while voice is disabled.
+
 ---
 
 ## 10. Validation and Testing
