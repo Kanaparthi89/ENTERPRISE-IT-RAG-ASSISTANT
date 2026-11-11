@@ -628,6 +628,98 @@ test("the voice is chosen once and reused", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// prime(): the synchronous user-gesture unlock (V1c)
+// ---------------------------------------------------------------------------
+
+test("prime speaks one empty, silent utterance synchronously", () => {
+  const { speaker, synth, states } = speakerWith();
+
+  assert.equal(speaker.prime(), true); // no await: it must run inside the click
+  assert.equal(synth.spoken.length, 1);
+  const [primer] = synth.spoken;
+  assert.equal(primer.text, ""); // no answer text reaches any voice
+  assert.equal(primer.volume, 0);
+  assert.equal(primer.voice, null);
+  assert.equal(primer.onend, null); // no handlers: it cannot change the speaker
+  assert.equal(primer.onerror, null);
+  assert.equal(speaker.state, STATES.IDLE);
+  assert.deepEqual(states, []);
+});
+
+test("prime cancels speech in progress and keeps stale callbacks ignored", async () => {
+  const { speaker, synth, states } = speakerWith();
+  const result = speaker.speak("One. Two. Three.".repeat(30));
+  await tick();
+  const first = synth.spoken[0];
+
+  speaker.prime();
+  assert.deepEqual(await result, { spoken: false, reason: "cancelled" });
+  first.onend({}); // late events from the cancelled answer
+  first.onerror({ error: "interrupted" });
+  assert.equal(speaker.state, STATES.IDLE);
+  assert.deepEqual(states, ["loading", "speaking", "idle"]);
+});
+
+test("speech after prime works, and the primer is dropped", async () => {
+  const { speaker, synth } = speakerWith();
+  speaker.prime();
+
+  const result = speaker.speak("Hello there.");
+  await tick();
+  assert.deepEqual(synth.queue.map((u) => u.text), ["Hello there."]); // primer cancelled by speak()
+  synth.finishAll();
+  assert.deepEqual(await result, { spoken: true });
+});
+
+test("prime is safe when unsupported or when the engine throws", () => {
+  assert.equal(createSpeaker({}).prime(), false);
+
+  const synth = new FakeSynth();
+  synth.speakError = new Error("not allowed");
+  const { speaker } = speakerWith({ synth });
+  assert.equal(speaker.prime(), false);
+  assert.equal(speaker.state, STATES.IDLE);
+});
+
+// ---------------------------------------------------------------------------
+// hasLocalVoice(): check before offering speech (V1c)
+// ---------------------------------------------------------------------------
+
+test("hasLocalVoice is true only for an on-device voice", async () => {
+  assert.equal(await speakerWith({ synth: new FakeSynth([LOCAL_EN]) }).speaker.hasLocalVoice(), true);
+  assert.equal(await speakerWith({ synth: new FakeSynth([NETWORK_EN]) }).speaker.hasLocalVoice(), false);
+  assert.equal(await speakerWith({ synth: new FakeSynth([LOCAL_FR]) }).speaker.hasLocalVoice(), false);
+  assert.equal(await createSpeaker({}).hasLocalVoice(), false);
+});
+
+test("hasLocalVoice waits for late voices and shares the wait with speak", async () => {
+  const synth = new FakeSynth([]);
+  const { speaker, timers } = speakerWith({ synth });
+
+  const check = speaker.hasLocalVoice();
+  const spoken = speaker.speak("Hi.");
+  await tick();
+  assert.equal(synth.listenerCount("voiceschanged"), 1); // one shared wait
+  assert.equal(timers.count(), 1);
+
+  synth.loadVoices([LOCAL_EN]);
+  assert.equal(await check, true);
+  await tick();
+  synth.finishAll();
+  assert.deepEqual(await spoken, { spoken: true });
+});
+
+test("hasLocalVoice resolves false when voices never load", async () => {
+  const { speaker, timers, synth } = speakerWith({ synth: new FakeSynth([]) });
+  const check = speaker.hasLocalVoice();
+  await tick();
+  timers.fire(VOICE_LOAD_TIMEOUT_MS);
+  assert.equal(await check, false);
+  assert.equal(synth.listenerCount("voiceschanged"), 0);
+  assert.equal(speaker.state, STATES.IDLE); // checking never changes the state
+});
+
+// ---------------------------------------------------------------------------
 // Module boundaries
 // ---------------------------------------------------------------------------
 
@@ -662,6 +754,10 @@ test("the browser global is BluePeakVoice and the API is complete", () => {
   assert.match(VOICE_SOURCE, /root\.BluePeakVoice = api;/);
   for (const name of ["toSpeechText", "splitIntoChunks", "pickLocalVoice", "createSpeaker"]) {
     assert.equal(typeof voice[name], "function", name);
+  }
+  const speaker = createSpeaker({});
+  for (const name of ["speak", "cancel", "prime", "hasLocalVoice"]) {
+    assert.equal(typeof speaker[name], "function", name);
   }
   assert.ok(Object.isFrozen(STATES));
 });

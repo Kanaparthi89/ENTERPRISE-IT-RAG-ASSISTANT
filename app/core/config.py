@@ -104,7 +104,8 @@ class Settings(BaseSettings):
     # Voice (V1). Disabled by default. Only reports, through
     # GET /api/voice/status, that spoken answers may be offered; speech runs
     # in the browser with on-device voices, so the server calls no speech
-    # provider. No page uses it yet. Strict: only true or false.
+    # provider. When on, the page offers an opt-in "Read answers aloud"
+    # toggle. Strict: only true or false.
     voice_enabled: bool = False
 
     # Application authentication

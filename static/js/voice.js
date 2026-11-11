@@ -329,7 +329,11 @@
    * ``speak(markdown)`` cancels anything playing, then resolves (never
    * rejects) with ``{ spoken: true }`` after the last chunk, or
    * ``{ spoken: false, reason }`` where reason is "unsupported", "empty",
-   * "no_local_voice", "cancelled" or "error".
+   * "no_local_voice", "cancelled" or "error" (with the engine's ``error``,
+   * for example "not-allowed" when the browser blocks speech).
+   *
+   * ``prime()`` is the synchronous user-gesture unlock; ``hasLocalVoice()``
+   * checks for an on-device voice before speech is offered.
    */
   function createSpeaker(options = {}) {
     const {
@@ -446,6 +450,37 @@
       if (state === STATES.SPEAKING || state === STATES.LOADING) setState(STATES.IDLE);
     }
 
+    /**
+     * Best-effort unlock for browsers that only allow speech a user started
+     * (Safari, iOS). Call it synchronously inside the click handler, before
+     * anything is awaited. It cancels anything playing (a new generation, so
+     * every stale-callback guarantee holds), then speaks an empty, silent
+     * utterance with no handlers: no text reaches any voice and the speaker's
+     * state is unchanged. Returns false if unsupported or the engine throws.
+     * True does not prove later speech is allowed; speak() reports that.
+     */
+    function prime() {
+      if (!supported) return false;
+      cancel();
+      try {
+        const utterance = new Utterance("");
+        utterance.volume = 0;
+        synth.speak(utterance);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * Whether an on-device voice exists for ``lang``. Waits (bounded, shared
+     * with speak()) for the voice list; resolves, never rejects.
+     */
+    async function hasLocalVoice() {
+      if (!supported) return false;
+      return Boolean(await resolveVoice());
+    }
+
     async function speak(markdown) {
       if (!supported) {
         setState(STATES.UNAVAILABLE, { reason: "unsupported" });
@@ -511,6 +546,8 @@
     return {
       speak,
       cancel,
+      prime,
+      hasLocalVoice,
       get state() {
         return state;
       },

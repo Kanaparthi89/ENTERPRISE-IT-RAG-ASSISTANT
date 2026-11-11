@@ -27,6 +27,9 @@
     fileName: $("#fileName"),
     uploadBtn: $("#uploadBtn"),
     uploadStatus: $("#uploadStatus"),
+    voiceToggle: $("#voiceToggle"),
+    voiceStop: $("#voiceStop"),
+    voiceStatus: $("#voiceStatus"),
   };
 
   const MAX_FILE_SIZE = 10 * 1024 * 1024;
@@ -35,6 +38,9 @@
   let isChatting = false;
   let isUploading = false;
   let lastFocusedElement = null;
+  // Voice V1 controller; null unless the browser can speak and the server
+  // reports {"tts": true}. Every hook below is a no-op while it is null.
+  let voice = null;
 
   function getText(value, fallback = "") {
     return typeof value === "string" && value.trim()
@@ -479,6 +485,9 @@
       return;
     }
 
+    // A new question silences the previous answer (speech only; never the chat).
+    voice?.cancel();
+
     isChatting = true;
 
     try {
@@ -714,6 +723,8 @@
       });
       // Announce the answer once it is complete, not every streamed chunk.
       loadingMessage.message.setAttribute("aria-busy", "true");
+      // Voice: this question's turn; only its completed answer can be spoken.
+      const voiceTurn = voice ? voice.questionStarted() : 0;
 
       el.question.value = "";
       updateCharacterCount();
@@ -804,6 +815,9 @@
         complete(data) {
           finish();
           renderFinalAnswer(data, question);
+          // The one completion point for streamed and /api/chat answers;
+          // deltas, failures and rejections are never spoken.
+          voice?.answerCompleted(voiceTurn, data.answer);
         },
 
         fail(message) {
@@ -858,7 +872,10 @@
 
   let pageAbort = new AbortController();
 
-  window.addEventListener("pagehide", () => pageAbort.abort());
+  window.addEventListener("pagehide", () => {
+    pageAbort.abort();
+    voice?.cancel(); // speech never outlives the page
+  });
   window.addEventListener("pageshow", (event) => {
     if (event.persisted) pageAbort = new AbortController();
   });
@@ -893,6 +910,208 @@
       })
     : null;
 
+  // -------------------------------------------------------------------
+  // Voice V1: read completed answers aloud
+  //
+  // Browser speech synthesis with on-device voices only (static/js/voice.js);
+  // no audio is recorded or uploaded. Offered only when the browser can speak
+  // and GET /api/voice/status answers exactly {"tts": true} (VOICE_ENABLED,
+  // off by default); the user then has to turn it on. Speech never affects
+  // the chat: stopping or cancelling it never aborts a question.
+  // -------------------------------------------------------------------
+
+  const VOICE_STATUS_URL = "/api/voice/status";
+  const VOICE_PROBE_TIMEOUT_MS = 5_000;
+  const VOICE_CONFIRMATION = "Voice responses on.";
+  const VOICE_TEXT = {
+    noVoice:
+      "Read aloud isn't available: this device has no on-device voice for this page's language.",
+    unsupported: "Read aloud isn't supported in this browser.",
+    blocked: "Your browser blocked speech. Select Read answers aloud to try again.",
+    failed: "Couldn't read the answer aloud.",
+  };
+
+  function voiceIsPossible() {
+    return Boolean(
+      window.BluePeakVoice &&
+        window.speechSynthesis &&
+        typeof window.SpeechSynthesisUtterance === "function" &&
+        typeof window.fetch === "function" &&
+        el.voiceToggle &&
+        el.voiceStop &&
+        el.voiceStatus
+    );
+  }
+
+  /** Only exactly {"tts": true} offers voice. */
+  function isVoiceStatus(body) {
+    return (
+      body !== null &&
+      typeof body === "object" &&
+      !Array.isArray(body) &&
+      Object.keys(body).length === 1 &&
+      body.tts === true
+    );
+  }
+
+  /** One bounded GET /api/voice/status; any failure means "not offered". */
+  async function probeVoiceStatus() {
+    const controller = new AbortController();
+    const page = pageAbort.signal;
+    const abort = () => controller.abort();
+    const timer = window.setTimeout(abort, VOICE_PROBE_TIMEOUT_MS);
+    if (page.aborted) abort();
+    else page.addEventListener("abort", abort);
+
+    try {
+      const response = await window.fetch(VOICE_STATUS_URL, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+        credentials: "same-origin",
+        signal: controller.signal,
+      });
+      if (response.status !== 200) return false;
+      return isVoiceStatus(await response.json());
+    } catch {
+      return false; // network error, timeout, page left, or a body that is not JSON
+    } finally {
+      window.clearTimeout(timer);
+      page.removeEventListener("abort", abort);
+    }
+  }
+
+  function createVoiceController() {
+    let enabled = false; // turned on by the user, with an on-device voice
+    let attempts = 0; // each turn-on check; a newer one (or turning off) ends it
+    let enabling = 0; // the attempt being checked, or 0
+    let turn = 0; // the latest question
+    let spokenTurn = 0; // the last question whose answer went to speech
+
+    const speaker = window.BluePeakVoice.createSpeaker({
+      synth: window.speechSynthesis,
+      Utterance: window.SpeechSynthesisUtterance,
+      lang: document.documentElement?.getAttribute?.("lang") || "en-US",
+      setTimeout: (fn, ms) => window.setTimeout(fn, ms),
+      clearTimeout: (id) => window.clearTimeout(id),
+      onStateChange: showSpeakingState,
+    });
+
+    function setStatus(text) {
+      el.voiceStatus.textContent = text;
+    }
+
+    function setEnabled(on) {
+      enabled = on;
+      el.voiceToggle.setAttribute("aria-pressed", String(on));
+    }
+
+    // "Stop speaking" exists only while something is being spoken. If it
+    // had focus when speech ends, focus moves to the toggle, not the page.
+    function showSpeakingState(state) {
+      const speaking = state === "speaking";
+      if (!speaking && document.activeElement === el.voiceStop) {
+        el.voiceToggle.focus();
+      }
+      el.voiceStop.hidden = !speaking;
+    }
+
+    function report(result) {
+      if (result.spoken || result.reason === "cancelled" || result.reason === "empty") return;
+
+      if (result.reason === "error" && result.error === "not-allowed") {
+        turnOff();
+        setStatus(VOICE_TEXT.blocked);
+      } else if (result.reason === "no_local_voice") {
+        turnOff();
+        setStatus(VOICE_TEXT.noVoice);
+      } else if (result.reason === "unsupported") {
+        turnOff();
+        setStatus(VOICE_TEXT.unsupported);
+      } else {
+        setStatus(VOICE_TEXT.failed); // still on: the next answer may work
+      }
+    }
+
+    function turnOff() {
+      attempts += 1; // ends a turn-on check still running
+      enabling = 0;
+      el.voiceToggle.removeAttribute("aria-busy");
+      setEnabled(false);
+      speaker.cancel();
+    }
+
+    function turnOn() {
+      // Synchronously, inside the click: Safari and iOS only allow speech a
+      // user started. Best-effort; a block is reported by speak() below.
+      speaker.prime();
+
+      attempts += 1;
+      const attempt = attempts;
+      enabling = attempt;
+      el.voiceToggle.setAttribute("aria-busy", "true");
+      setStatus("");
+
+      speaker.hasLocalVoice().then((ready) => {
+        if (enabling !== attempt) return; // turned off (or clicked again) meanwhile
+        enabling = 0;
+        el.voiceToggle.removeAttribute("aria-busy");
+
+        if (!ready) {
+          setStatus(VOICE_TEXT.noVoice);
+          return;
+        }
+        setEnabled(true);
+        speaker.speak(VOICE_CONFIRMATION).then(report);
+      });
+    }
+
+    function toggle() {
+      if (enabled || enabling) turnOff();
+      else turnOn();
+    }
+
+    return {
+      start() {
+        el.voiceToggle.hidden = false;
+        el.voiceToggle.addEventListener("click", toggle);
+        // Stops speech only: a question in progress continues.
+        el.voiceStop.addEventListener("click", () => speaker.cancel());
+      },
+
+      cancel() {
+        speaker.cancel();
+      },
+
+      isSpeaking() {
+        return speaker.state === "speaking" || speaker.state === "loading";
+      },
+
+      questionStarted() {
+        turn += 1;
+        return turn;
+      },
+
+      /** Speak a completed answer: only for the latest question, and only once. */
+      answerCompleted(questionTurn, answer) {
+        if (!enabled || questionTurn !== turn || spokenTurn === questionTurn) return;
+        spokenTurn = questionTurn;
+        setStatus(""); // an earlier "couldn't read" message no longer applies
+        speaker.speak(answer).then(report);
+      },
+    };
+  }
+
+  function startVoice() {
+    if (!voiceIsPossible()) return; // nothing is requested or shown
+
+    probeVoiceStatus().then((offered) => {
+      if (!offered) return;
+      voice = createVoiceController();
+      voice.start();
+    });
+  }
+
   function clearSession() {
     hideSessionAlert();
     hideSessionNotice();
@@ -907,6 +1126,8 @@
   }
 
   function resetConversation(options = {}) {
+    // New chat always silences speech, even while a question blocks the reset.
+    voice?.cancel();
     if (isChatting) return;
 
     const keptQuestion = options.keepQuestion ? el.question.value : "";
@@ -1208,12 +1429,16 @@
     });
 
     document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+
       const modalOpen =
         el.uploadModal &&
         !el.uploadModal.classList.contains("hidden");
 
-      if (event.key === "Escape" && modalOpen) {
-        closeUploadModal();
+      if (modalOpen) {
+        closeUploadModal(); // an open dialog comes first; speech continues
+      } else if (voice?.isSpeaking()) {
+        voice.cancel();
       }
     });
   }
@@ -1221,4 +1446,5 @@
   bindEvents();
   updateCharacterCount();
   resetTrace();
+  startVoice();
 })();

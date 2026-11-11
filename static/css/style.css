@@ -673,6 +673,43 @@ textarea:focus-visible,
   height: 14px;
 }
 
+/* Voice V1: "Read answers aloud", "Stop speaking" and their status line */
+
+.conversation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* .text-button sets display, which would override the hidden attribute. */
+.voice-toggle[hidden],
+.voice-stop[hidden] {
+  display: none;
+}
+
+.voice-toggle[aria-pressed="true"] {
+  color: var(--primary);
+  border-color: #cfcfff;
+  background: #f5f5ff;
+}
+
+.voice-toggle[aria-busy="true"] {
+  cursor: progress;
+}
+
+/* Always rendered (a live region), empty and zero-height when there is no message. */
+.voice-status {
+  margin: 0 2px;
+  color: var(--muted-dark);
+  font-size: 10px;
+}
+
+.voice-status:not(:empty) {
+  margin-bottom: 8px;
+}
+
 /* =========================================================
    WELCOME SCREEN
    ========================================================= */
@@ -2082,6 +2119,8 @@ textarea:focus-visible,
   }
 
   .conversation-toolbar {
+    flex-wrap: wrap;
+    gap: 8px;
     padding: 12px 0;
   }
 

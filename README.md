@@ -864,13 +864,29 @@ Session errors have the body `{"detail": {"code": "...", "message": "..."}}`. Me
 - **Request load.** A question asked in a session that already has saved turns makes one more model call (the standalone rewrite) than the same question without a session.
 - **Rate limits.** `POST /api/sessions` has no rate limit or authentication. Apply limits at the proxy.
 
-### Voice status (in development, disabled by default)
+### Read answers aloud (voice V1, disabled by default)
 
-Voice is under development and is **not available in the user interface**: no page calls this endpoint yet, and enabling it changes nothing a user sees. It reports only whether spoken answers may be offered. The planned speech is the browser's own speech synthesis with on-device voices; the server calls no speech provider, and no audio is uploaded or stored.
+With `VOICE_ENABLED=true`, the web interface can read completed answers aloud using the **browser's own speech synthesis and on-device voices only**. The server calls no speech provider, and nothing is recorded, uploaded, or stored; there is no microphone input or transcription. Even when enabled, it is **opt-in for each user** and starts off on every page load.
 
 | Setting | Default | Allowed | Purpose |
 | ------- | ------- | ------- | ------- |
-| `VOICE_ENABLED` | `false` | `true` or `false` only (any case) | Enables `GET /api/voice/status`. Any other value, including `1`, `yes`, or an empty value, stops the application at startup. |
+| `VOICE_ENABLED` | `false` | `true` or `false` only (any case) | Offers the **Read answers aloud** toggle by enabling `GET /api/voice/status`. Any other value, including `1`, `yes`, or an empty value, stops the application at startup. |
+
+How the page behaves:
+
+- **When it is offered.** In a browser with speech synthesis, the page requests `GET /api/voice/status` once per page load (at most 5 seconds). Only a `200` with exactly `{"tts": true}` shows the toggle; anything else (`404`, an error, a timeout, another body) leaves it hidden without a message. Browsers without speech synthesis make no request.
+- **Turning it on.** Selecting **Read answers aloud** checks for an on-device voice in the page's language before turning on, then says "Voice responses on." Without one, it stays off and explains why. Voices that would send text to an online service are never used. If the browser blocks speech, the page says so and turns it off; selecting the toggle again retries.
+- **What is spoken.** Each completed answer, once, for both streamed and non-streamed answers, as plain text: Markdown, links, URLs, citation markers, code blocks, and tables are not read out, and long answers stop after 1,500 characters with "The full answer is on screen." Partial (streaming) text, failed questions, and error messages are never spoken.
+- **Stopping.** **Stop speaking** (shown only while speaking) and the Escape key stop speech; Escape closes an open dialog first. A new question, **New chat**, turning the toggle off, and leaving the page also stop it. Stopping speech never cancels a question that is still being answered.
+
+Limitations:
+
+- **Safari and iOS** only allow speech that the user started. The toggle unlocks speech when it is selected, but this is best-effort and has not yet been checked manually on every browser.
+- **Screen readers** already read new answers aloud, so both may speak at once; the toggle's description suggests turning it off when using a screen reader.
+- While voice is disabled, each page load in a browser with speech synthesis still makes one `GET /api/voice/status` request that returns `404`.
+- Voice quality and the voices available depend on the device and browser.
+
+The status endpoint:
 
 | Request | Disabled (default) | Enabled |
 | ------- | ------------------ | ------- |
