@@ -32,13 +32,28 @@ class FakeIndexApi:
             return index_info(dimension=info.dimension, ready=False, host=info.host)
         return info
 
+    def create_index(self, create_index_request, **kwargs):
+        # Recorded in ``pinecone.created`` (not ``calls``), as the public
+        # create_index() used to be: (name, dimension, metric, kwargs).
+        request = create_index_request
+        self.pinecone.created.append((request.name, request.dimension, request.metric, kwargs))
+        self.pinecone.create_requests.append(request)
+        if self.pinecone.create_error is not None:
+            error, existing = self.pinecone.create_error
+            if existing is not None:  # another creator got there first
+                self.pinecone.indexes[request.name] = existing
+            raise error
+        self.pinecone.indexes[request.name] = index_info(dimension=request.dimension)
+
 
 class FakePinecone:
     """Minimal stand-in for the Pinecone client."""
 
-    def __init__(self, indexes=None, polls_until_ready=0):
+    def __init__(self, indexes=None, polls_until_ready=0, create_error=None):
         self.indexes = dict(indexes or {})
         self.created = []
+        self.create_requests = []
+        self.create_error = create_error  # (exception, index_info that exists afterwards or None)
         self.opened = []
         self.polls_until_ready = polls_until_ready
         self.on_describe = lambda: None
@@ -51,17 +66,16 @@ class FakePinecone:
     def control_calls(self):
         return self.db.index._index_api.calls
 
-    # The public list and describe calls take no HTTP timeout; ensure_index()
-    # must not use them.
+    # The public list, describe and create calls take no HTTP timeout;
+    # ensure_index() must not use them.
     def list_indexes(self):
         raise AssertionError("untimed list_indexes() was called")
 
     def describe_index(self, name):
         raise AssertionError("untimed describe_index() was called")
 
-    def create_index(self, name, dimension, metric, spec, timeout=None):
-        self.created.append((name, dimension, metric, timeout))
-        self.indexes[name] = index_info(dimension=dimension)
+    def create_index(self, *args, **kwargs):
+        raise AssertionError("untimed create_index() was called")
 
     def Index(self, name="", host=""):
         # Without a host, the SDK would describe the index again (untimed).
@@ -160,12 +174,106 @@ def test_missing_index_skips_sdk_polling_and_polls_with_the_timeout(pinecone, se
 
     ensure_index()
 
-    [(_, _, _, sdk_timeout)] = fake.created
-    assert sdk_timeout == -1  # the SDK returns at once instead of polling without a limit
     timeout = {"_request_timeout": settings.pinecone_timeout_seconds}
+    # H1-4: the create request goes through the generated API with the
+    # per-attempt timeout, so the SDK's own (unlimited) polling never runs.
+    assert fake.created == [(name, 1536, "cosine", timeout)]
     assert fake.control_calls == [("list_indexes", (), timeout)] + [("describe_index", (name,), timeout)] * 3
     assert clock.sleeps == [2, 2]
     assert fake.opened == [(name, HOST)]
+
+
+# ---------------------------------------------------------------------------
+# H1-4: the index create request has a per-attempt timeout; HTTP 409 waits
+# ---------------------------------------------------------------------------
+
+def conflict():
+    from pinecone.exceptions import PineconeApiException
+
+    return PineconeApiException(status=409, reason="Conflict")
+
+
+def test_the_create_request_body_matches_the_public_sdk_method(pinecone, settings):
+    # The request the public create_index() builds, from the same SDK factory
+    # and with its default arguments spelled out.
+    from pinecone import ServerlessSpec
+    from pinecone.db_control.request_factory import PineconeDBControlRequestFactory
+
+    fake = pinecone({})
+
+    ensure_index()
+
+    expected = PineconeDBControlRequestFactory.create_index_request(
+        name=settings.pinecone_index_name,
+        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+        dimension=1536,
+        metric="cosine",
+        deletion_protection="disabled",
+        vector_type="dense",
+        tags=None,
+    )
+    [request] = fake.create_requests
+    assert request.to_dict() == expected.to_dict()
+    assert request.to_dict() == {
+        "name": settings.pinecone_index_name,
+        "dimension": 1536,
+        "metric": "cosine",
+        "spec": {"serverless": {"cloud": "aws", "region": "us-east-1"}},
+        "deletion_protection": "disabled",
+        "vector_type": "dense",
+        "tags": {},  # the factory always sends tags, as the public method does
+    }
+
+
+def test_a_conflict_on_create_waits_for_the_existing_index(pinecone, settings, clock, caplog):
+    name = settings.pinecone_index_name
+    fake = pinecone({}, polls_until_ready=1, create_error=(conflict(), index_info()))
+
+    with caplog.at_level("INFO", logger="app.rag.vectorstore"):
+        assert ensure_index() == f"index:{name}"
+
+    timeout = {"_request_timeout": settings.pinecone_timeout_seconds}
+    assert len(fake.created) == 1  # not sent again
+    assert fake.control_calls == [("list_indexes", (), timeout)] + [("describe_index", (name,), timeout)] * 2
+    assert clock.sleeps == [2]
+    assert fake.opened == [(name, HOST)]
+    assert "already exists (HTTP 409)" in caplog.text
+
+
+def test_a_conflicting_index_with_another_dimension_is_refused(pinecone, settings, clock):
+    fake = pinecone({}, create_error=(conflict(), index_info(dimension=3072)))
+
+    with pytest.raises(RuntimeError, match="Index dimension is 3072"):
+        ensure_index()
+
+    assert settings.pinecone_index_name in fake.indexes  # never deleted
+    assert fake.opened == []
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 422, 429, 500])
+def test_other_create_errors_still_fail(pinecone, clock, status):
+    from pinecone.exceptions import PineconeApiException
+
+    fake = pinecone({}, create_error=(PineconeApiException(status=status, reason="error"), None))
+
+    with pytest.raises(PineconeApiException) as raised:
+        ensure_index()
+
+    assert raised.value.status == status
+    assert [call[0] for call in fake.control_calls] == ["list_indexes"]  # no readiness wait
+    assert fake.opened == []
+
+
+def test_a_create_timeout_is_not_treated_as_a_conflict(pinecone, clock):
+    from urllib3.exceptions import MaxRetryError
+
+    fake = pinecone({}, create_error=(MaxRetryError(None, "/indexes", "read timed out"), None))
+
+    with pytest.raises(MaxRetryError):
+        ensure_index()
+
+    assert [call[0] for call in fake.control_calls] == ["list_indexes"]
+    assert fake.opened == []
 
 
 class FakeClock:
@@ -256,8 +364,16 @@ def test_installed_pinecone_sdk_has_the_control_plane_methods_ensure_index_uses(
     assert "_request_timeout" in api.list_indexes.params_map["all"]
     assert "_request_timeout" in api.describe_index.params_map["all"]
     assert api.describe_index.params_map["required"] == ["index_name"]
-    assert "timeout" in inspect.signature(RealPinecone.create_index).parameters
     assert "host" in inspect.signature(RealPinecone.Index).parameters
+    # H1-4: the create request uses the generated method and the SDK's own
+    # request factory, and recognizes a conflict by its HTTP status.
+    from pinecone.db_control.request_factory import PineconeDBControlRequestFactory
+    from pinecone.exceptions import PineconeApiException
+
+    assert "_request_timeout" in api.create_index.params_map["all"]
+    assert api.create_index.params_map["required"] == ["create_index_request"]
+    assert callable(PineconeDBControlRequestFactory.create_index_request)
+    assert PineconeApiException(status=409).status == 409
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +471,147 @@ def test_a_stalled_setup_call_times_out_instead_of_blocking(loopback_pinecone, s
     assert not thread.is_alive(), "the setup call was still blocked after 30 seconds"
     assert type(outcome.get("error")).__name__ == "MaxRetryError"
     assert elapsed < 20.0
+
+
+# ---------------------------------------------------------------------------
+# H1-4 against a loopback server, with the real Pinecone SDK
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def create_server(settings):
+    """A loopback control plane without the configured index.
+
+    ``mode`` decides how ``POST /indexes`` answers: ``created`` (201),
+    ``conflict`` (409, as Pinecone answers for an existing name) or
+    ``stall`` (never answers until the test ends). Readiness describes
+    answer ready, so the readiness wait does not sleep.
+    """
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    name = settings.pinecone_index_name
+    state = {"mode": "created", "requests": [], "bodies": [], "release": threading.Event()}
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, status, body):
+            payload = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):
+            state["requests"].append(("GET", self.path))
+            if self.path == "/indexes":
+                self._send(200, {"indexes": []})
+            else:
+                self._send(200, index_json(name))
+
+        def do_POST(self):
+            state["requests"].append(("POST", self.path))
+            length = int(self.headers.get("Content-Length", 0))
+            state["bodies"].append(json.loads(self.rfile.read(length)))
+            if state["mode"] == "stall":
+                state["release"].wait(30)
+                return
+            if state["mode"] == "conflict":
+                self._send(409, {"error": {"code": "ALREADY_EXISTS", "message": "Resource already exists"}, "status": 409})
+                return
+            self._send(201, index_json(name, ready=False))
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    state["base_url"] = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        yield state
+    finally:
+        state["release"].set()
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+
+
+def test_real_sdk_sends_the_create_request_with_the_expected_body(loopback_pinecone, create_server, settings):
+    name = settings.pinecone_index_name
+    loopback_pinecone(create_server["base_url"])
+
+    index = ensure_index()
+
+    assert create_server["requests"] == [("GET", "/indexes"), ("POST", "/indexes"), ("GET", f"/indexes/{name}")]
+    assert create_server["bodies"] == [
+        {
+            "name": name,
+            "dimension": 1536,
+            "metric": "cosine",
+            "spec": {"serverless": {"cloud": "aws", "region": "us-east-1"}},
+            "deletion_protection": "disabled",
+            "vector_type": "dense",
+            "tags": {},
+        }
+    ]
+    assert index.config.host == f"https://{HOST}"
+
+    # The public method (what ensure_index() used before H1-4) sends the same body.
+    from pinecone import Pinecone as RealPinecone, ServerlessSpec
+
+    RealPinecone(api_key="test-key", host=create_server["base_url"]).create_index(
+        name=name,
+        dimension=1536,
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+        timeout=-1,
+    )
+    assert len(create_server["bodies"]) == 2
+    assert create_server["bodies"][1] == create_server["bodies"][0]
+
+
+def test_real_sdk_conflict_on_create_uses_the_existing_index(loopback_pinecone, create_server, settings):
+    name = settings.pinecone_index_name
+    create_server["mode"] = "conflict"
+    loopback_pinecone(create_server["base_url"])
+
+    index = ensure_index()
+
+    assert create_server["requests"] == [("GET", "/indexes"), ("POST", "/indexes"), ("GET", f"/indexes/{name}")]
+    assert index.config.host == f"https://{HOST}"
+
+
+def test_a_stalled_create_request_times_out_instead_of_blocking(loopback_pinecone, create_server, settings, monkeypatch):
+    # The server reads the create request and never answers. Each attempt
+    # times out after 0.2 s. The SDK retries a POST after a read error, so
+    # the create request is sent 6 times (1 + 5 retries) with about 8 s of
+    # backoff; this test takes ~10 s. Before H1-4 this call never returned.
+    import threading
+    import time
+
+    monkeypatch.setattr(settings, "pinecone_timeout_seconds", 0.2)
+    create_server["mode"] = "stall"
+    loopback_pinecone(create_server["base_url"])
+    outcome = {}
+
+    def setup():
+        try:
+            ensure_index()
+        except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
+            outcome["error"] = exc
+
+    started = time.monotonic()
+    thread = threading.Thread(target=setup, daemon=True)
+    thread.start()
+    thread.join(30.0)
+    elapsed = time.monotonic() - started
+
+    assert not thread.is_alive(), "the create request was still blocked after 30 seconds"
+    assert type(outcome.get("error")).__name__ == "MaxRetryError"
+    assert elapsed < 20.0
+    posts = [request for request in create_server["requests"] if request[0] == "POST"]
+    assert len(posts) == 6  # the SDK resends the create request after each read timeout
 
 
 def test_add_documents_with_no_chunks_skips_pinecone():
