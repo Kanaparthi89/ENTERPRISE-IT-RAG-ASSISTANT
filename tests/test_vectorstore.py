@@ -58,6 +58,7 @@ class FakePinecone:
         self.polls_until_ready = polls_until_ready
         self.on_describe = lambda: None
         self.db = SimpleNamespace(index=SimpleNamespace(_index_api=FakeIndexApi(self)))
+        self._openapi_config = SimpleNamespace(retries=None)  # H1-5 (A) sets a policy here
 
     def __call__(self, api_key):
         return self
@@ -612,6 +613,123 @@ def test_a_stalled_create_request_times_out_instead_of_blocking(loopback_pinecon
     assert elapsed < 20.0
     posts = [request for request in create_server["requests"] if request[0] == "POST"]
     assert len(posts) == 6  # the SDK resends the create request after each read timeout
+
+
+# ---------------------------------------------------------------------------
+# H1-5 (A): the optional Retry-After cap
+# ---------------------------------------------------------------------------
+
+def test_ensure_index_leaves_the_retry_policy_alone_by_default(pinecone, settings):
+    fake = pinecone({settings.pinecone_index_name: index_info()})
+
+    ensure_index()
+
+    assert settings.pinecone_retry_after_max_seconds is None
+    assert fake._openapi_config.retries is None
+
+
+def test_ensure_index_installs_the_capped_policy_before_its_first_call(pinecone, settings, monkeypatch):
+    monkeypatch.setattr(settings, "pinecone_retry_after_max_seconds", 30)
+    fake = pinecone({settings.pinecone_index_name: index_info()})
+    seen = []
+    fake.on_describe = lambda: seen.append(fake._openapi_config.retries)
+
+    ensure_index()
+
+    [policy] = seen  # already installed when the describe call ran
+    assert policy.retry_after_max == 30
+    assert fake._openapi_config.retries is policy
+
+
+@pytest.fixture
+def retry_after_server(settings):
+    """A loopback control plane whose first answer is ``429`` with
+    ``Retry-After: 3600``; later requests succeed for an existing index."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    name = settings.pinecone_index_name
+    state = {"requests": []}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            state["requests"].append(self.path)
+            if len(state["requests"]) == 1:
+                status, body, extra = 429, {"error": {"code": "RESOURCE_EXHAUSTED"}}, {"Retry-After": "3600"}
+            elif self.path == "/indexes":
+                status, body, extra = 200, {"indexes": [index_json(name)]}, {}
+            else:
+                status, body, extra = 200, index_json(name), {}
+            payload = json.dumps(body).encode()
+            self.send_response(status)
+            for header, value in {"Content-Type": "application/json", "Content-Length": str(len(payload)), **extra}.items():
+                self.send_header(header, value)
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    state["base_url"] = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+
+
+@pytest.fixture
+def retry_sleeps(monkeypatch):
+    """Records the waits urllib3's retry logic asks for, without sleeping."""
+    import time as real_time
+
+    import urllib3.util.retry as retry_module
+
+    sleeps = []
+    monkeypatch.setattr(
+        retry_module, "time", SimpleNamespace(sleep=sleeps.append, time=real_time.time)
+    )
+    return sleeps
+
+
+@pytest.mark.parametrize(
+    "cap, expected",
+    [
+        (None, [3600]),  # default: the SDK honors the header (up to 6 hours)
+        (30, [30]),  # shortened to the cap
+        (2, [2]),
+    ],
+)
+def test_real_sdk_retry_after_wait_follows_the_cap(
+    loopback_pinecone, retry_after_server, retry_sleeps, settings, monkeypatch, cap, expected
+):
+    monkeypatch.setattr(settings, "pinecone_retry_after_max_seconds", cap)
+    loopback_pinecone(retry_after_server["base_url"])
+
+    index = ensure_index()
+
+    name = settings.pinecone_index_name
+    assert retry_after_server["requests"] == ["/indexes", "/indexes", f"/indexes/{name}"]  # retried once
+    assert retry_sleeps == expected
+    assert index.config.host == f"https://{HOST}"
+
+
+def test_real_sdk_cap_of_zero_falls_back_to_the_normal_backoff(
+    loopback_pinecone, retry_after_server, retry_sleeps, settings, monkeypatch
+):
+    monkeypatch.setattr(settings, "pinecone_retry_after_max_seconds", 0)
+    loopback_pinecone(retry_after_server["base_url"])
+
+    ensure_index()
+
+    # The first retry's backoff is 0 s plus up to 0.25 s of jitter (JitterRetry).
+    assert len(retry_after_server["requests"]) == 3
+    assert all(0 <= seconds <= 0.25 for seconds in retry_sleeps)
 
 
 def test_add_documents_with_no_chunks_skips_pinecone():

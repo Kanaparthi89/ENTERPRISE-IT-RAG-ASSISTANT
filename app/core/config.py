@@ -51,6 +51,23 @@ class Settings(BaseSettings):
     pinecone_timeout_seconds: float = Field(default=10.0, gt=0, le=15)
     tavily_timeout_seconds: float = Field(default=15.0, gt=0, le=30)
 
+    # H1-5 (A): the longest wait the Pinecone SDK honors for one
+    # ``Retry-After`` header (HTTP 413, 429, 503). Unset (the default) keeps
+    # the SDK's policy unchanged: up to 21,600 s (6 hours) per retry. When
+    # set, every other retry setting stays the SDK default; a longer
+    # Retry-After is shortened to this value (0: the normal backoff is used
+    # instead). Not a deadline: retries and per-attempt timeouts still add up.
+    pinecone_retry_after_max_seconds: int | None = Field(default=None, ge=0, le=21600)
+
+    # H1-5 (B): optional deadline for a stateless POST /api/chat question,
+    # counted from when its handler starts. Unset (the default): no deadline,
+    # as before. When set, a question past it starts no further external
+    # call (OpenAI, Pinecone, Tavily) and fails with the generic 500 and
+    # audit error type TimeoutError. A call already in progress is not
+    # interrupted, so a question can run past this value. Session questions
+    # use SESSION_TURN_MAX_SECONDS instead.
+    chat_deadline_seconds: float | None = Field(default=None, gt=0, le=3600)
+
     # Streaming chat (POST /api/chat/stream). Disabled by default: a
     # controlled prototype, not production-ready. Pinecone and Tavily calls
     # now have per-attempt timeouts (above), but no call has a total

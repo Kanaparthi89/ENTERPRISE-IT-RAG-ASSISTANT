@@ -791,6 +791,170 @@ def test_an_unexpected_chat_error_is_still_logged_with_its_traceback(client, fak
 
 
 # ---------------------------------------------------------------------------
+# H1-5 (B): optional CHAT_DEADLINE_SECONDS for stateless /api/chat
+# ---------------------------------------------------------------------------
+
+class DeadlineClock:
+    """Replaces cancellation.monotonic(); moves only when a test advances it."""
+
+    def __init__(self):
+        self.now = 500.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+@pytest.fixture
+def deadline_clock(monkeypatch):
+    clock = DeadlineClock()
+    monkeypatch.setattr(cancellation, "monotonic", clock)
+    return clock
+
+
+def test_a_deadline_check_returns_its_reason_once_the_time_has_passed(deadline_clock):
+    check = cancellation.deadline_check(30, cancellation.CHAT_DEADLINE)
+
+    assert check() is None
+    deadline_clock.advance(29.9)
+    assert check() is None
+    deadline_clock.advance(0.1)  # exactly at the deadline
+    assert check() == cancellation.CHAT_DEADLINE
+    deadline_clock.advance(100)
+    assert check() == cancellation.CHAT_DEADLINE
+
+
+def test_a_deadline_check_counts_from_when_it_is_created(deadline_clock):
+    deadline_clock.advance(1000)  # time before the check exists does not count
+    check = cancellation.deadline_check(30, cancellation.CHAT_DEADLINE)
+
+    assert check() is None
+
+
+def test_the_chat_deadline_is_off_by_default(settings):
+    assert settings.chat_deadline_seconds is None
+    assert routes._stateless_stop_check() is routes._no_deadline
+
+
+@pytest.mark.parametrize("sessions", [False, True])
+def test_stateless_chat_stops_at_its_deadline_before_the_next_call(
+    client, monkeypatch, settings, fake_rag, deadline_clock, sessions, caplog
+):
+    monkeypatch.setattr(settings, "sessions_enabled", sessions)  # no X-Session-ID either way
+    monkeypatch.setattr(settings, "chat_deadline_seconds", 30.0)
+    log = []
+
+    def slow_route(label):  # the routing call outlasts the deadline
+        if label == "RouteDecision":
+            deadline_clock.advance(31)
+
+    kb_fakes(fake_rag, log, on_call=slow_route)
+    caplog.set_level(logging.INFO, logger=routes.__name__)
+
+    response = client.post("/api/chat", json={"question": "VPN?"})
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["message"] == "Unable to process the question."  # generic
+    assert log == ["RouteDecision"]  # the in-flight call finished; no later call started
+    audit = only_audit(response)
+    assert (audit["status"], audit["error_type"]) == ("failed", "TimeoutError")
+    [record] = [r for r in caplog.records if r.name == routes.__name__ and "request_id" in r.getMessage()]
+    assert record.levelno == logging.WARNING and record.exc_info is None
+    assert record.getMessage() == f"Chat request stopped for request_id={audit['request_id']} (TimeoutError)"
+
+
+def test_stateless_chat_within_its_deadline_is_unchanged(client, monkeypatch, settings, fake_rag, deadline_clock):
+    monkeypatch.setattr(settings, "chat_deadline_seconds", 30.0)
+    log = []
+
+    def steady(label):  # every call takes 7 s: 21 s in all, within 30 s
+        deadline_clock.advance(7)
+
+    kb_fakes(fake_rag, log, on_call=steady)
+
+    response = client.post("/api/chat", json={"question": "VPN?"})
+
+    assert response.status_code == 200
+    assert response.json()["answer"] == "Use GlobalProtect."
+    assert log == ["RouteDecision", "retriever", "EvidenceGrade", "llm"]
+    assert only_audit(response)["status"] == "success"
+
+
+def test_a_deadline_passed_during_the_last_call_still_answers(client, monkeypatch, settings, fake_rag, deadline_clock):
+    # Cooperative: only calls not yet started are skipped. The answer call
+    # was already running when the deadline passed, so its answer is used.
+    monkeypatch.setattr(settings, "chat_deadline_seconds", 30.0)
+    log = []
+
+    def slow_answer(label):
+        if label == "llm":
+            deadline_clock.advance(31)
+
+    kb_fakes(fake_rag, log, on_call=slow_answer)
+
+    response = client.post("/api/chat", json={"question": "VPN?"})
+
+    assert response.status_code == 200
+    assert log == ["RouteDecision", "retriever", "EvidenceGrade", "llm"]
+    assert only_audit(response)["status"] == "success"
+
+
+def test_each_stateless_question_gets_its_own_deadline(client, monkeypatch, settings, fake_rag, deadline_clock):
+    monkeypatch.setattr(settings, "chat_deadline_seconds", 30.0)
+    first_log, second_log = [], []
+    kb_fakes(fake_rag, first_log)  # scripted fakes answer one question
+    first = client.post("/api/chat", json={"question": "VPN?"})
+
+    deadline_clock.advance(1000)  # long after the first question's deadline
+    kb_fakes(fake_rag, second_log)
+    second = client.post("/api/chat", json={"question": "VPN?"})
+
+    assert first.status_code == second.status_code == 200
+    assert second_log == ["RouteDecision", "retriever", "EvidenceGrade", "llm"]  # not stopped
+
+
+def test_the_shutdown_signal_still_wins_over_the_deadline(client, monkeypatch, settings, fake_rag, deadline_clock):
+    monkeypatch.setattr(settings, "chat_deadline_seconds", 30.0)
+    log = []
+
+    def both(label):  # shutdown and the deadline arrive during the same call
+        if label == "RouteDecision":
+            deadline_clock.advance(31)
+            cancellation.signal_shutdown()
+
+    kb_fakes(fake_rag, log, on_call=both)
+
+    response = client.post("/api/chat", json={"question": "VPN?"})
+
+    assert response.status_code == 500
+    assert log == ["RouteDecision"]
+    assert only_audit(response)["error_type"] == "ServerShutdown"
+
+
+def test_the_chat_deadline_does_not_apply_to_session_questions(
+    client, sessions_enabled, monkeypatch, settings, fake_rag, deadline_clock
+):
+    # Session questions keep their own limit (SESSION_TURN_MAX_SECONDS).
+    monkeypatch.setattr(settings, "chat_deadline_seconds", 30.0)
+    token = new_session(client)
+    log = []
+
+    def slow_route(label):  # past CHAT_DEADLINE_SECONDS, within the turn limit
+        if label == "RouteDecision":
+            deadline_clock.advance(31)
+
+    kb_fakes(fake_rag, log, on_call=slow_route)
+
+    response = client.post("/api/chat", json={"question": "VPN?"}, headers={"X-Session-ID": token})
+
+    assert response.status_code == 200
+    assert log == ["RouteDecision", "retriever", "EvidenceGrade", "llm"]
+    assert response.json()["session"]["turn_saved"] is True
+
+
+# ---------------------------------------------------------------------------
 # Lifespan: the signal is set after the stream drain, and cleared at startup
 # ---------------------------------------------------------------------------
 

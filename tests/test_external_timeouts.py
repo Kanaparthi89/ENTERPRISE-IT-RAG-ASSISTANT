@@ -69,6 +69,47 @@ def test_timeouts_out_of_range_are_rejected(name, value):
         IsolatedSettings(**{name: value})
 
 
+# H1-5: both new limits are off unless configured.
+def test_h1_5_settings_are_unset_by_default():
+    fields = config.Settings.model_fields
+
+    assert fields["pinecone_retry_after_max_seconds"].default is None
+    assert fields["chat_deadline_seconds"].default is None
+    settings = IsolatedSettings()
+    assert settings.pinecone_retry_after_max_seconds is None
+    assert settings.chat_deadline_seconds is None
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("pinecone_retry_after_max_seconds", 0),
+        ("pinecone_retry_after_max_seconds", 30),
+        ("pinecone_retry_after_max_seconds", 21600),
+        ("chat_deadline_seconds", 0.5),
+        ("chat_deadline_seconds", 3600),
+    ],
+)
+def test_h1_5_settings_within_range_are_accepted(name, value):
+    assert getattr(IsolatedSettings(**{name: value}), name) == value
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("pinecone_retry_after_max_seconds", -1),
+        ("pinecone_retry_after_max_seconds", 21601),
+        ("pinecone_retry_after_max_seconds", 1.5),  # whole seconds, as urllib3's retry_after_max
+        ("chat_deadline_seconds", 0),
+        ("chat_deadline_seconds", -1),
+        ("chat_deadline_seconds", 3600.01),
+    ],
+)
+def test_h1_5_settings_out_of_range_are_rejected(name, value):
+    with pytest.raises(ValidationError):
+        IsolatedSettings(**{name: value})
+
+
 # ---------------------------------------------------------------------------
 # Tavily wrapper
 # ---------------------------------------------------------------------------
@@ -449,6 +490,82 @@ def test_installed_pinecone_default_retry_policy_matches_the_readme():
             retry = retry.increment(method="POST", url="/", error=None, response=_FakeResponse(503))
             backoffs.append(retry.get_backoff_time())
         assert all(0 <= b - base <= 0.25 for b, base in zip(backoffs, [0, 0.5, 1, 2, 4], strict=True))
+
+
+# ---------------------------------------------------------------------------
+# H1-5 (A): optional cap on Pinecone's Retry-After wait
+# ---------------------------------------------------------------------------
+
+# Every setting urllib3's Retry.new() copies from one retry to the next.
+RETRY_SETTINGS = (
+    "total", "connect", "read", "redirect", "status", "other", "allowed_methods",
+    "status_forcelist", "backoff_factor", "backoff_max", "retry_after_max",
+    "raise_on_redirect", "raise_on_status", "remove_headers_on_redirect",
+    "respect_retry_after_header", "backoff_jitter",
+)
+
+
+def _policies(pc):
+    """The retry policy each Pinecone HTTP client uses: (control plane, data plane)."""
+    control = vectorstore._index_api(pc).api_client.rest_client
+    data = pc.Index(host="test-index.example.invalid")._vector_api.api_client.rest_client
+    return [client.pool_manager.connection_pool_kw["retries"] for client in (control, data)]
+
+
+@pytest.fixture
+def real_pinecone_client(monkeypatch, settings):
+    """vectorstore._pinecone_client() with the real SDK class (no request is sent)."""
+    from pinecone import Pinecone as RealPinecone
+    from pydantic import SecretStr
+
+    monkeypatch.setattr(vectorstore, "Pinecone", RealPinecone)
+    monkeypatch.setattr(settings, "pinecone_api_key", SecretStr("test-key"))
+    return vectorstore._pinecone_client
+
+
+def test_without_a_cap_the_client_keeps_the_sdk_retry_policy(real_pinecone_client, settings):
+    from pinecone import Pinecone as RealPinecone
+
+    assert settings.pinecone_retry_after_max_seconds is None
+    pc = real_pinecone_client()
+
+    assert pc._openapi_config.retries is None  # nothing installed: the SDK chooses
+    sdk_default = _policies(RealPinecone(api_key="test-key"))[0]
+    for policy in _policies(pc):
+        assert type(policy) is type(sdk_default)
+        assert {name: getattr(policy, name) for name in RETRY_SETTINGS} == {
+            name: getattr(sdk_default, name) for name in RETRY_SETTINGS
+        }
+        assert policy.retry_after_max == 21600
+
+
+@pytest.mark.parametrize("cap", [0, 30, 21600])
+def test_a_cap_changes_only_retry_after_max(real_pinecone_client, settings, monkeypatch, cap):
+    # Compared setting by setting with the installed SDK's own default, so
+    # an SDK upgrade that changes its default policy fails here.
+    from pinecone import Pinecone as RealPinecone
+
+    monkeypatch.setattr(settings, "pinecone_retry_after_max_seconds", cap)
+    sdk_default = _policies(RealPinecone(api_key="test-key"))[0]
+
+    for policy in _policies(real_pinecone_client()):  # setup calls and queries alike
+        assert type(policy) is type(sdk_default)  # Pinecone's JitterRetry
+        assert policy.retry_after_max == cap
+        assert {name: getattr(policy, name) for name in RETRY_SETTINGS if name != "retry_after_max"} == {
+            name: getattr(sdk_default, name) for name in RETRY_SETTINGS if name != "retry_after_max"
+        }
+
+
+def test_a_cap_survives_each_retry_and_shortens_a_long_retry_after(real_pinecone_client, settings, monkeypatch):
+    monkeypatch.setattr(settings, "pinecone_retry_after_max_seconds", 30)
+    [policy, _] = _policies(real_pinecone_client())
+
+    retry = policy.increment(method="GET", url="/", error=None, response=_FakeResponse(429))
+    retry = retry.increment(method="GET", url="/", error=None, response=_FakeResponse(503))
+
+    assert type(retry) is type(policy) and retry.retry_after_max == 30  # Retry.new() keeps both
+    assert retry.parse_retry_after("3600") == 30  # shortened, not refused
+    assert retry.parse_retry_after("12") == 12  # a shorter value is kept
 
 
 class _FakeResponse:

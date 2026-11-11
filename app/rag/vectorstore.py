@@ -4,6 +4,7 @@ import time
 from pinecone import Pinecone, ServerlessSpec
 from pinecone.db_control.request_factory import PineconeDBControlRequestFactory
 from pinecone.exceptions import PineconeApiException
+from pinecone.openapi_support.retry_urllib3 import JitterRetry
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
 
@@ -59,6 +60,40 @@ def get_embeddings():
 INDEX_READY_POLLS = 60
 INDEX_READY_POLL_SECONDS = 2
 INDEX_READY_DEADLINE_SECONDS = 120
+
+
+def _retry_policy(retry_after_max: int) -> JitterRetry:
+    """The SDK's default retry policy with a capped ``Retry-After`` (H1-5 A).
+
+    These are the arguments ``pinecone.openapi_support.rest_urllib3`` uses
+    when no policy is configured (pinecone 7.3.0); a test compares every
+    retry setting against the installed SDK's own default, so an SDK
+    upgrade that changes them fails loudly. Only ``retry_after_max``
+    differs: urllib3 shortens a longer ``Retry-After`` to it.
+    """
+    return JitterRetry(
+        total=5,
+        backoff_factor=0.25,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=None,
+        retry_after_max=retry_after_max,
+    )
+
+
+def _pinecone_client():
+    """A Pinecone client, with the optional retry cap installed (H1-5 A).
+
+    Without ``PINECONE_RETRY_AFTER_MAX_SECONDS`` the client is unchanged.
+    With it, the policy is set on the client's (private) OpenAPI
+    configuration before any request: the SDK builds its HTTP clients
+    lazily from that configuration, and both the control plane (setup
+    calls) and ``pc.Index()`` (queries and upserts) read it.
+    """
+    pc = Pinecone(api_key=settings.pinecone_api_key.get_secret_value())
+    retry_after_max = settings.pinecone_retry_after_max_seconds
+    if retry_after_max is not None:
+        pc._openapi_config.retries = _retry_policy(retry_after_max)
+    return pc
 
 
 def _index_api(pc):
@@ -139,9 +174,7 @@ def ensure_index():
 
     dimension = get_embedding_dimension()
 
-    pc = Pinecone(
-        api_key=settings.pinecone_api_key.get_secret_value()
-    )
+    pc = _pinecone_client()
 
     index_names = _list_index_names(pc)
 

@@ -19,6 +19,7 @@ background threads see the run's check.
 
 import logging
 import threading
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Callable, Iterator
@@ -30,8 +31,29 @@ logger = logging.getLogger(__name__)
 SERVER_SHUTDOWN = "server_shutdown"
 SESSION_TURN_EXPIRED = "session_turn_expired"
 SESSION_LEASE_LOST = "session_lease_lost"
+CHAT_DEADLINE = "chat_deadline"  # H1-5 (B): stateless /api/chat past CHAT_DEADLINE_SECONDS
 
 StopCheck = Callable[[], "str | None"]
+
+
+def monotonic() -> float:
+    """The clock deadline checks read (a seam for tests)."""
+    return time.monotonic()
+
+
+def deadline_check(seconds: float, reason: str) -> StopCheck:
+    """A stop check that returns ``reason`` once ``seconds`` have passed from now.
+
+    Cooperative like every check here: it stops the run before its next
+    external call, never during one.
+    """
+    deadline = monotonic() + seconds
+
+    def check() -> str | None:
+        return reason if monotonic() >= deadline else None
+
+    return check
+
 
 _check: ContextVar[StopCheck | None] = ContextVar("workflow_stop_check", default=None)
 _shutdown = threading.Event()

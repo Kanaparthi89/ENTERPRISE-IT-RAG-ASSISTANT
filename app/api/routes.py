@@ -290,6 +290,7 @@ _STOP_ERROR_TYPES = {
     cancellation.SESSION_TURN_EXPIRED: "SessionTurnExpired",
     cancellation.SESSION_LEASE_LOST: "SessionLeaseLost",
     cancellation.SERVER_SHUTDOWN: "ServerShutdown",
+    cancellation.CHAT_DEADLINE: "TimeoutError",  # H1-5 (B), as a stream's deadline is recorded
 }
 
 
@@ -310,8 +311,21 @@ def _log_chat_failure(exc: Exception, request_id: str) -> None:
 
 
 def _no_deadline() -> str | None:
-    """Stateless /api/chat has no deadline; only the shutdown signal stops it."""
+    """Stateless /api/chat without CHAT_DEADLINE_SECONDS: only the shutdown signal stops it."""
     return None
+
+
+def _stateless_stop_check():
+    """The stop check for a stateless /api/chat question (H1-5 B).
+
+    Unset ``CHAT_DEADLINE_SECONDS`` (the default) keeps the previous
+    behavior: no deadline. When set, the deadline counts from now (the
+    handler's start) and stops the question before its next external call.
+    """
+    seconds = settings.chat_deadline_seconds
+    if seconds is None:
+        return _no_deadline
+    return cancellation.deadline_check(seconds, cancellation.CHAT_DEADLINE)
 
 
 def _chat_with_session(question: str, request_id: str, token: str) -> dict:
@@ -404,8 +418,9 @@ def chat(payload: ChatRequest, session_token: str | None = Depends(_session_toke
         return _chat_with_session(question, request_id, session_token)
 
     try:
-        # No deadline (H1-3a); the shutdown signal still applies before each external call.
-        with cancellation.stop_checks(_no_deadline):
+        # The optional CHAT_DEADLINE_SECONDS (H1-5 B, off by default) and the
+        # shutdown signal (H1-3a) apply before each external call.
+        with cancellation.stop_checks(_stateless_stop_check()):
             result = ask(question)
         response = _chat_response(result, request_id, question)
 
