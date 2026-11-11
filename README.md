@@ -894,6 +894,52 @@ The status endpoint:
 
 The endpoint reads only this setting: it returns no other configuration and makes no external call, audit record, or storage change. Other methods on the path return FastAPI's standard `405`, also while voice is disabled.
 
+### Speech-to-text (voice V2 backend, disabled by default)
+
+`POST /api/voice/transcribe` turns one short recording into text with OpenAI. It is a **backend endpoint only**: no page uses it yet (there is no microphone button), and it never sends anything to the chat. The transcript is returned to the caller, who decides what to do with it.
+
+| Setting | Default | Allowed | Purpose |
+| ------- | ------- | ------- | ------- |
+| `VOICE_TRANSCRIPTION_ENABLED` | `false` | `true` or `false` only | Enables the endpoint. Separate from `VOICE_ENABLED`. Any other value stops the application at startup. |
+| `VOICE_TRANSCRIPTION_MODEL` | `whisper-1` | Non-empty | The OpenAI transcription model. Check that your account can use the model you set. |
+| `VOICE_TRANSCRIPTION_TIMEOUT_SECONDS` | `30` | 1–120 | Timeout for each OpenAI attempt. |
+| `VOICE_TRANSCRIPTION_MAX_RETRIES` | `0` | 0–2 | OpenAI retries. Default none, so one recording costs at most one attempt. |
+
+The request is `multipart/form-data` with exactly one file part named `audio`: WebM, Ogg, MP4/M4A, MP3, or WAV. The file's extension, its declared type, and the start of its content must agree. The response is `200` with `{"text": "..."}` (empty if no speech was recognised).
+
+**Size limits (fixed in code).** The **audio file** may be at most **2 MiB** (2,097,152 bytes). The **whole request body**, which also contains the multipart boundaries and the part's headers, may be at most **2 MiB + 16 KiB** (2,113,536 bytes). The extra 16 KiB covers normal multipart framing (a boundary of at most 70 characters and part headers, which are limited to 4 KiB). A body over the request limit is refused (from its `Content-Length` before reading, or while reading); a body within it whose audio is over 2 MiB is refused after parsing.
+
+| Status | Code | When |
+| ------ | ---- | ---- |
+| `404` | (`{"detail": "Not Found"}`) | Disabled (the default), the same as an unknown route |
+| `403` | `origin_not_allowed` | A browser request from another site (`Sec-Fetch-Site` other than `same-origin`, or an `Origin` that does not match the host) |
+| `415` | `unsupported_media_type` | Not `multipart/form-data` with a boundary |
+| `413` | `audio_too_large` | The request body is over 2 MiB + 16 KiB (by its `Content-Length`, before any of the body is read, or while reading), or the audio file is over 2 MiB |
+| `503` | `transcription_unavailable` | `OPENAI_API_KEY` is not set (before any of the body is read), or OpenAI refused or failed |
+| `408` | `upload_timeout` | The upload took longer than 15 seconds |
+| `400` | `invalid_upload` | Not exactly one file in the `audio` field, empty, too short, malformed, or truncated |
+| `415` | `unsupported_audio` | Another format, or the extension, type, and content disagree |
+| `422` | `audio_not_transcribable` | OpenAI could not transcribe the audio |
+| `504` | `transcription_timeout` | OpenAI did not answer in time |
+| `500` | `transcription_failed` | An unexpected error |
+
+Errors are generic `{"detail": {"code", "message"}}` objects; every response from an enabled endpoint has `Cache-Control: no-store`. Other methods on the path return FastAPI's standard `405`.
+
+How it is protected:
+
+- **Bounded upload.** The body is never buffered beyond the request limit: an oversized `Content-Length` is refused before reading, and the stream is read chunk by chunk and abandoned as soon as it passes the limit (also for uploads without a length). The body is parsed in memory, never spooled to disk.
+- **No storage.** Audio and transcripts exist only in memory during the request: no files, audit records, or session data. Logs record only the format, size, timing, and error class, never the audio, transcript, file name, or provider messages; the multipart parser's own messages (which can quote a byte of the request) are suppressed while a voice upload is parsed. The client's file name is never sent to OpenAI.
+- **No chat side effects.** The endpoint never calls the RAG workflow or `/api/chat`.
+- **Bounded provider calls.** One timeout per attempt and at most two retries (none by default). The provider connection is closed after every call, including on errors and when the request is cancelled (for example during shutdown).
+
+Not protected, so **do not enable it on a reachable server yet**:
+
+- **No authentication or rate limit.** Anyone who can reach the server can send recordings and spend OpenAI credit. The origin check stops other websites, not scripts. Put authentication and a rate limit (for example at a reverse proxy) in front first.
+- **Microphone use needs HTTPS.** Browsers allow the microphone only on HTTPS or localhost, which the planned page integration (V3) will need.
+- **Privacy.** Recordings are sent to OpenAI under your account's data terms; tell users before they record.
+- **Capacity.** Concurrent transcriptions are limited only by the server's capacity. Each one briefly holds about three copies of its upload while reading and parsing (around 6 MiB at the limit) and keeps the audio until the provider answers or times out.
+- **Disconnects do not stop the provider call.** If the browser goes away while OpenAI is transcribing, the call continues until it finishes or times out (and is still billed).
+
 ---
 
 ## 10. Validation and Testing

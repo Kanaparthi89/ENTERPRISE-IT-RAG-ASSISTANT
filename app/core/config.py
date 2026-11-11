@@ -108,6 +108,17 @@ class Settings(BaseSettings):
     # toggle. Strict: only true or false.
     voice_enabled: bool = False
 
+    # Voice V2: POST /api/voice/transcribe (speech-to-text with OpenAI).
+    # Disabled by default and separate from VOICE_ENABLED. Audio is held in
+    # memory for one request (at most 2 MiB, a fixed limit in code) and never
+    # stored; the transcript is returned, never stored or sent to the chat.
+    # The provider timeout applies to each attempt; retries are bounded
+    # (default none). Strict: only true or false.
+    voice_transcription_enabled: bool = False
+    voice_transcription_model: str = "whisper-1"
+    voice_transcription_timeout_seconds: float = Field(default=30.0, ge=1, le=120)
+    voice_transcription_max_retries: int = Field(default=0, ge=0, le=2)
+
     # Application authentication
     admin_api_key: SecretStr = SecretStr("")
 
@@ -133,7 +144,7 @@ class Settings(BaseSettings):
         validate_default=True,
     )
 
-    @field_validator("voice_enabled", mode="before")
+    @field_validator("voice_enabled", "voice_transcription_enabled", mode="before")
     @classmethod
     def validate_strict_boolean(cls, value):
         """Accept only a real boolean or the words true/false (any case).
@@ -149,7 +160,7 @@ class Settings(BaseSettings):
             return value.strip().lower() == "true"
         raise ValueError("This setting must be true or false.")
 
-    @field_validator("pinecone_index_name", "pinecone_namespace")
+    @field_validator("pinecone_index_name", "pinecone_namespace", "voice_transcription_model")
     @classmethod
     def validate_non_empty_names(cls, value: str) -> str:
         value = value.strip()

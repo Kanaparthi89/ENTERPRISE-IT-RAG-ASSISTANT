@@ -23,8 +23,10 @@ from app.rag import cancellation
 from app.rag.workflow import ask, history_window
 from app.rag.vectorstore import add_documents
 from app.services import sessions as session_service
+from app.services import transcription
 from app.services.ingestion import load_file, chunk_documents, SUPPORTED
 from app.services.audit import write_audit
+from starlette.requests import ClientDisconnect
 
 settings = get_settings()
 
@@ -642,6 +644,99 @@ async def voice_status(response: Response):
         raise HTTPException(status_code=404, detail="Not Found")
     response.headers["Cache-Control"] = "no-store"  # the flag can change on restart
     return {"tts": True}
+
+
+# Voice V2: speech-to-text. Every error is generic and never includes the
+# audio, the transcript, the filename or provider details.
+VOICE_ERRORS = {
+    "origin_not_allowed": (403, "Request origin not allowed."),
+    "unsupported_media_type": (415, "Send the audio as multipart/form-data."),
+    "audio_too_large": (413, "Audio must be 2 MiB or smaller."),
+    "upload_timeout": (408, "The audio upload took too long."),
+    "invalid_upload": (400, 'Send exactly one audio file in the "audio" field.'),
+    "unsupported_audio": (415, "Unsupported audio. Use WebM, Ogg, MP4/M4A, MP3 or WAV."),
+    "audio_not_transcribable": (422, "The audio could not be transcribed."),
+    "transcription_timeout": (504, "Transcription took too long. Please try again."),
+    "transcription_unavailable": (503, "Transcription is temporarily unavailable."),
+    "transcription_failed": (500, "Transcription failed."),
+}
+NO_STORE = {"Cache-Control": "no-store"}
+
+
+def _voice_error(code: str) -> HTTPException:
+    status_code, message = VOICE_ERRORS[code]
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+        headers=NO_STORE,
+    )
+
+
+def _check_voice_origin(request: Request) -> None:
+    """Refuse cross-site browser requests (a form can POST multipart without a preflight).
+
+    A browser's ``Sec-Fetch-Site`` must be ``same-origin``; an ``Origin``
+    header must match the host. Clients that send neither (curl, scripts) are
+    not browsers and are allowed: this is CSRF protection, not authentication.
+    """
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site is not None and fetch_site.strip().lower() != "same-origin":
+        raise _voice_error("origin_not_allowed")
+    origin = request.headers.get("origin")
+    if origin is not None and not _origin_matches_host(origin, request.headers.get("host", "")):
+        raise _voice_error("origin_not_allowed")
+
+
+@router.post("/voice/transcribe")
+async def voice_transcribe(request: Request, response: Response):
+    """Transcribe one short audio recording to text (Voice V2).
+
+    404 (the same body as an unknown route) while
+    ``VOICE_TRANSCRIPTION_ENABLED`` is off, the default. The request is
+    ``multipart/form-data`` with one file part named ``audio`` (WebM, Ogg,
+    MP4/M4A, MP3 or WAV; at most 2 MiB). Returns ``{"text": "..."}``. The
+    transcript is only returned: it is not stored, audited or sent to the
+    chat. In order, before any of the body is read: the flag (404), the
+    origin (403), the content type (415), the declared length (413) and the
+    provider key (503). Then the bounded read (408, 413), validation (400,
+    413, 415) and the provider call (422, 503, 504).
+
+    The handler takes only ``request``, so FastAPI never parses or buffers
+    the body itself (``File(...)`` would spool the whole upload first).
+    """
+    if not settings.voice_transcription_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+    _check_voice_origin(request)
+
+    content_type = request.headers.get("content-type")
+    try:
+        transcription.multipart_boundary(content_type)
+        transcription.check_declared_length(request.headers.get("content-length"))
+        api_key = settings.openai_api_key.get_secret_value()
+        if not api_key:
+            logger.error("Voice transcription is enabled but OPENAI_API_KEY is not set.")
+            raise transcription.VoiceUploadError("transcription_unavailable")
+
+        body = await transcription.read_bounded_body(request.stream())
+        upload = transcription.parse_audio_upload(body, content_type)
+        del body
+        text = await transcription.transcribe(
+            upload,
+            api_key=api_key,
+            model=settings.voice_transcription_model,
+            timeout_seconds=settings.voice_transcription_timeout_seconds,
+            max_retries=settings.voice_transcription_max_retries,
+        )
+    except transcription.VoiceUploadError as exc:
+        raise _voice_error(exc.code) from None
+    except ClientDisconnect:
+        raise _voice_error("invalid_upload") from None
+    except Exception as exc:  # noqa: BLE001 - never echo details; log the class only
+        logger.error("Voice transcription failed unexpectedly (%s).", type(exc).__name__)
+        raise _voice_error("transcription_failed") from None
+
+    response.headers["Cache-Control"] = "no-store"
+    return {"text": text}
 
 
 @router.post("/ingest")
