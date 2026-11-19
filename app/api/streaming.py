@@ -376,6 +376,7 @@ class StreamLease:
     def __init__(self, capacity: StreamCapacity, on_release: Callable[[], None] | None):
         self._capacity = capacity
         self._on_release = on_release
+        self._release_callbacks: list[Callable[[], None]] = []  # S1-4b: for example a quota ticket
         self._lock = threading.Lock()
         self.worker_done = False
         self.consumer_done = False
@@ -401,6 +402,19 @@ class StreamLease:
             self._attach_state = "abandoned"
             return True
 
+    def add_release_callback(self, callback: Callable[[], None]) -> None:
+        """Also call ``callback`` when the slot is released (S1-4b).
+
+        The release happens only after both the worker and the consumer are
+        done, so no provider work of the run is still active then. Added after
+        the release, the callback runs at once.
+        """
+        with self._lock:
+            if not self.released:
+                self._release_callbacks.append(callback)
+                return
+        self._run_callback(callback)
+
     def mark_worker_done(self) -> bool:
         return self._mark("worker_done")
 
@@ -414,10 +428,46 @@ class StreamLease:
             if release:
                 self.released = True
         if release:  # outside the lease lock
-            self._capacity._release()
-            if self._on_release is not None:
-                self._on_release()
+            self._release_steps()
         return release
+
+    def _release_steps(self) -> None:
+        """Capacity, the registry cleanup, then any added callbacks; each runs once.
+
+        A step failing with an exception is logged (class only) and the next
+        steps still run. A KeyboardInterrupt or SystemExit is not swallowed:
+        the remaining steps (short, non-blocking cleanup) still run first, so
+        an interrupt can't leave a slot or a quota ticket held, and then the
+        first interrupt is raised again.
+        """
+        with self._lock:
+            callbacks = self._release_callbacks
+            self._release_callbacks = []
+        steps = [("capacity", self._capacity._release)]
+        if self._on_release is not None:
+            steps.append(("callback", self._on_release))
+        steps.extend(("callback", callback) for callback in callbacks)
+        interrupt = None
+        for kind, step in steps:
+            try:
+                step()
+            except Exception as exc:  # noqa: BLE001 - logged by class only
+                if kind == "capacity":
+                    logger.error("Stream capacity release failed (%s).", type(exc).__name__)
+                else:
+                    logger.error("Stream release callback failed (%s).", type(exc).__name__)
+            except BaseException as exc:  # an interrupt: finish the cleanup, then re-raise it
+                if interrupt is None:
+                    interrupt = exc
+        if interrupt is not None:
+            raise interrupt
+
+    @staticmethod
+    def _run_callback(callback: Callable[[], None]) -> None:
+        try:
+            callback()
+        except Exception as exc:  # noqa: BLE001 - logged by class only
+            logger.error("Stream release callback failed (%s).", type(exc).__name__)
 
 
 # -------------------------------------------------------------------
@@ -937,30 +987,30 @@ class StreamService:
             raise RuntimeError("This reservation has already been used.")
         reservation.used = True
         lease = reservation.lease
-        run = StreamRun(
-            question=question,
-            request_id=request_id,
-            lease=lease,
-            loop=loop,
-            timeout_seconds=self.timeout_seconds,
-            clock=self.clock,
-            poll_seconds=self.poll_seconds,
-            workflow_stream=self.workflow_stream,
-            audit_writer=self.audit_writer,
-            session=session,
-        )
-        reservation.run_key.append(id(run))
-        with self._registry_lock:
-            self._active[id(run)] = run
-
         try:
+            run = StreamRun(
+                question=question,
+                request_id=request_id,
+                lease=lease,
+                loop=loop,
+                timeout_seconds=self.timeout_seconds,
+                clock=self.clock,
+                poll_seconds=self.poll_seconds,
+                workflow_stream=self.workflow_stream,
+                audit_writer=self.audit_writer,
+                session=session,
+            )
+            reservation.run_key.append(id(run))
+            with self._registry_lock:
+                self._active[id(run)] = run
             run._future = self._executor.submit(run._run_worker)
-            run._future.add_done_callback(run._on_worker_future_done)
-        except RuntimeError:
+        except Exception:  # nothing was submitted: no worker runs, so the slot is free (S1-4b)
             logger.exception("Could not start stream worker for request_id=%s", request_id)
             lease.mark_worker_done()
             lease.mark_consumer_done()
             return None
+        # Submitted: from here only the worker's own exit marks it done.
+        run._future.add_done_callback(run._on_worker_future_done)
         return run
 
     def active_runs(self) -> list[StreamRun]:

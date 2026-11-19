@@ -518,6 +518,16 @@ def access_throttle_cleared():
 
 
 @pytest.fixture(autouse=True)
+def quota_engine_cleared():
+    """The S1-4b chat quota engine is process-wide; each test starts without one."""
+    from app.services import quota_runtime
+
+    quota_runtime.reset_quota_engine()
+    yield
+    quota_runtime.reset_quota_engine()
+
+
+@pytest.fixture(autouse=True)
 def shutdown_signal_cleared():
     """The H1-3a shutdown signal is process-wide; an app lifespan's shutdown sets it."""
     cancellation.reset_shutdown()

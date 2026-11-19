@@ -23,6 +23,8 @@ from app.rag import cancellation
 from app.rag.workflow import ask, history_window
 from app.rag.vectorstore import add_documents
 from app.services import access as access_service
+from app.services import quota as quota_service
+from app.services import quota_runtime
 from app.services import sessions as session_service
 from app.services import transcription
 from app.services.ingestion import load_file, chunk_documents, SUPPORTED
@@ -331,95 +333,220 @@ def _stateless_stop_check():
     return cancellation.deadline_check(seconds, cancellation.CHAT_DEADLINE)
 
 
-def _chat_with_session(question: str, request_id: str, token: str) -> dict:
+# ---------------------------------------------------------------------------
+# Security S1-4b: chat quotas
+#
+# Every chat route admits a question with the process-wide QuotaEngine before
+# any provider call, after request validation and session checks (so a
+# validation error, a session conflict or an expired session never uses
+# quota). A refusal calls no provider. The ticket's concurrency slot is
+# released only when the question's provider work has stopped: after ask()
+# returns (or raises) for /api/chat, and when both the stream worker and its
+# consumer are done for /api/chat/stream. Disabled by default (QUOTA_ENABLED).
+# ---------------------------------------------------------------------------
+
+QUOTA_ERRORS = {
+    quota_service.HOURLY_LIMIT: ("quota_hourly_limit", {
+        quota_service.CODE_SCOPE: "You've reached the hourly question limit. Please try again later.",
+        quota_service.GLOBAL_SCOPE: "The service has reached its hourly question limit. Please try again later.",
+    }),
+    quota_service.DAILY_LIMIT: ("quota_daily_limit", {
+        quota_service.CODE_SCOPE: "You've reached today's question limit. Please try again tomorrow.",
+        quota_service.GLOBAL_SCOPE: "The service has reached today's question limit. Please try again tomorrow.",
+    }),
+    quota_service.BUSY: ("quota_busy", {
+        quota_service.CODE_SCOPE: "Your previous question is still being answered. Please wait for it to finish.",
+        quota_service.GLOBAL_SCOPE: "The service is busy answering other questions. Please try again shortly.",
+    }),
+    quota_service.CAPACITY: ("quota_capacity", {
+        quota_service.GLOBAL_SCOPE: "The service is at capacity. Please try again later.",
+    }),
+}
+QUOTA_UNAVAILABLE_MESSAGE = "Questions are temporarily unavailable. Please try again shortly."
+
+
+def _quota_identity(request: Request | None) -> tuple[str, str | None]:
+    """(identity, log pseudonym): a verified access code's id, else the shared anonymous bucket.
+
+    Only an access cookie that verifies identifies a code; nothing else the
+    client sends is trusted. Invalid, expired, revoked or replaced cookies,
+    and every request while access codes are disabled, share ANONYMOUS.
+    """
+    if request is None or not settings.access_enabled:
+        return quota_service.ANONYMOUS, None
+    try:
+        config = access_service.AccessConfig.from_settings(settings)
+    except access_service.AccessConfigError:
+        return quota_service.ANONYMOUS, None  # the stricter, shared bucket
+    grant = access_service.verify_cookie(
+        config, request.cookies.get(config.cookie_name), access_service.wall_clock()
+    )
+    if grant is None:
+        return quota_service.ANONYMOUS, None
+    return grant.code_id, access_service.code_reference(config, grant.code_id)
+
+
+def _quota_error(status_code: int, code: str, message: str, retry_after: int) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+        headers={"Retry-After": str(max(1, int(retry_after))), **NO_STORE},
+    )
+
+
+def _admit_chat(request: Request | None, request_id: str) -> "quota_service.Ticket | None":
+    """Admit one chat question (None while quotas are disabled); raises 429 or 503.
+
+    Call it before any provider call. A refusal reserves nothing.
+    """
+    if not settings.quota_enabled:
+        return None
+    busy = settings.quota_busy_retry_after_seconds
+    try:
+        identity, code_ref = _quota_identity(request)
+        result = quota_runtime.get_quota_engine(settings).admit(quota_service.CHAT, identity)
+    except Exception as exc:  # noqa: BLE001 - fail closed; logged by class only
+        logger.error("Chat quota unavailable for request_id=%s (%s).", request_id, type(exc).__name__)
+        raise _quota_error(503, "quota_unavailable", QUOTA_UNAVAILABLE_MESSAGE, busy) from None
+    if isinstance(result, quota_service.Ticket):
+        return result
+    known = QUOTA_ERRORS.get(result.reason)
+    if known is None:  # unavailable (or anything unexpected): fail closed
+        logger.error("Chat quota unavailable for request_id=%s (%s).", request_id, result.reason)
+        raise _quota_error(503, "quota_unavailable", QUOTA_UNAVAILABLE_MESSAGE, result.retry_after or busy)
+    code, messages = known
+    message = messages.get(result.scope) or messages[quota_service.GLOBAL_SCOPE]
+    logger.warning(
+        "Chat refused by quota for request_id=%s: reason=%s scope=%s code_ref=%s",
+        request_id, result.reason, result.scope, code_ref or "-",
+    )
+    raise _quota_error(429, code, message, result.retry_after or busy)
+
+
+def _release_ticket(ticket: "quota_service.Ticket | None") -> None:
+    """Give back a question's concurrency slot (idempotent); never raises."""
+    if ticket is None:
+        return
+    try:
+        ticket.release()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Chat quota release failed (%s).", type(exc).__name__)
+
+
+def _chat_with_session(question: str, request_id: str, token: str, request: Request | None = None) -> dict:
     """Session-aware /api/chat (design §10).
 
-    Order: take the lease (history is read with it) → ask() → build the
-    response → save the turn (fenced) → set turn_saved → audit with the
-    internal session UUID → release the lease. The lease is released in
-    ``finally`` on every path. A 409 is returned before anything runs, so a
-    concurrent duplicate never executes.
+    Order: take the lease (history is read with it) → admit the question
+    (S1-4b) → ask() → build the response → save the turn (fenced) → set
+    turn_saved → audit with the internal session UUID → release the lease.
+    A 409 is returned before anything runs, so a concurrent duplicate never
+    executes. Once the lease is taken, everything runs inside one cleanup
+    scope: on every path the lease is released (without saving unless the
+    turn was saved) and the quota ticket, if any, is released once.
     """
     runtime, lease = _acquire_session_lease(token, request_id)
-    history = [{"question": turn.question, "answer": turn.answer} for turn in lease.history]
-    turns_used = len(history_window(history))
+    ticket = None
     finished = False
-
-    def stop_reason() -> str | None:
-        """H1-3a: after the turn limit or a lost lease, start no further external calls."""
-        return runtime.manager.turn_stop_reason(lease)
-
     try:
-        with cancellation.stop_checks(stop_reason):
-            result = ask(question, history=history)
-        response = _chat_response(result, request_id, question)
-
-        if not response["answer"]:
-            raise RuntimeError("The RAG workflow returned an empty answer.")
-
-        # True only if the fenced save actually committed.
-        turn_saved = runtime.manager.finish(
-            lease, (question, response["answer"], response["source_used"])
-        )
-        finished = True
-        response["session"] = {"history_turns_used": turns_used, "turn_saved": bool(turn_saved)}
-
+        # S1-4b: after the session checks (a conflict or an expired session
+        # never uses quota), before any provider call. A refusal (429/503)
+        # propagates as is; the cleanup below releases the lease unsaved.
+        ticket = _admit_chat(request, request_id)
         try:
-            write_audit(
-                question=question,
-                source_used=response["source_used"],
-                trace=response["trace"],
-                citations=response["citations"],
-                request_id=request_id,
-                status=_audit_status(response["source_used"]),
-                session_id=lease.session_id,
+            history = [{"question": turn.question, "answer": turn.answer} for turn in lease.history]
+            turns_used = len(history_window(history))
+
+            def stop_reason() -> str | None:
+                """H1-3a: after the turn limit or a lost lease, start no further external calls."""
+                return runtime.manager.turn_stop_reason(lease)
+
+            with cancellation.stop_checks(stop_reason):
+                result = ask(question, history=history)
+            response = _chat_response(result, request_id, question)
+
+            if not response["answer"]:
+                raise RuntimeError("The RAG workflow returned an empty answer.")
+
+            # True only if the fenced save actually committed.
+            turn_saved = runtime.manager.finish(
+                lease, (question, response["answer"], response["source_used"])
             )
-        except Exception:
-            logger.exception("Audit write failed for request_id=%s", request_id)
+            finished = True
+            response["session"] = {"history_turns_used": turns_used, "turn_saved": bool(turn_saved)}
 
-        return response
+            try:
+                write_audit(
+                    question=question,
+                    source_used=response["source_used"],
+                    trace=response["trace"],
+                    citations=response["citations"],
+                    request_id=request_id,
+                    status=_audit_status(response["source_used"]),
+                    session_id=lease.session_id,
+                )
+            except Exception:
+                logger.exception("Audit write failed for request_id=%s", request_id)
 
-    except Exception as exc:
-        _log_chat_failure(exc, request_id)
+            return response
 
-        try:
-            write_audit(
-                question=question,
-                source_used="error",
-                trace=[],
-                request_id=request_id,
-                status="failed",
-                error_type=_chat_error_type(exc),
-                session_id=lease.session_id,
-            )
-        except Exception:
-            logger.exception("Failed to audit chat error for request_id=%s", request_id)
+        except Exception as exc:
+            _log_chat_failure(exc, request_id)
 
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "message": "Unable to process the question.",
-                "request_id": request_id,
-            },
-        ) from exc
+            try:
+                write_audit(
+                    question=question,
+                    source_used="error",
+                    trace=[],
+                    request_id=request_id,
+                    status="failed",
+                    error_type=_chat_error_type(exc),
+                    session_id=lease.session_id,
+                )
+            except Exception:
+                logger.exception("Failed to audit chat error for request_id=%s", request_id)
+
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "message": "Unable to process the question.",
+                    "request_id": request_id,
+                },
+            ) from exc
 
     finally:
-        if not finished:
-            runtime.manager.finish(lease)  # release without saving
+        try:
+            if not finished:
+                runtime.manager.finish(lease)  # release without saving
+        finally:
+            _release_ticket(ticket)  # ask() has returned (or never ran): no provider work is left
 
 
 @router.post("/chat")
-def chat(payload: ChatRequest, session_token: str | None = Depends(_session_token)):
+def chat(
+    payload: ChatRequest,
+    session_token: str | None = Depends(_session_token),
+    request: Request = None,
+):
     """Answer a question using the RAG workflow and record an audit event.
 
     Without ``X-Session-ID`` the behaviour is exactly as before (stateless).
+    With quotas enabled (S1-4b), the question is admitted first (429/503).
     """
     request_id = str(uuid4())
     question = payload.question.strip()
 
     if session_token is not None:
-        return _chat_with_session(question, request_id, session_token)
+        return _chat_with_session(question, request_id, session_token, request)
 
+    ticket = _admit_chat(request, request_id)
+    try:
+        return _chat_stateless(question, request_id)
+    finally:
+        _release_ticket(ticket)  # ask() has returned (or raised): no provider work is left
+
+
+def _chat_stateless(question: str, request_id: str) -> dict:
+    """Stateless /api/chat: ask() → response → audit (unchanged by S1-4b)."""
     try:
         # The optional CHAT_DEADLINE_SECONDS (H1-5 B, off by default) and the
         # shutdown signal (H1-3a) apply before each external call.
@@ -502,7 +629,7 @@ class StreamingFlagRoute(APIRoute):
         return route_handler
 
 
-async def _chat_stream_with_session(question: str, request_id: str, token: str):
+async def _chat_stream_with_session(question: str, request_id: str, token: str, request: Request | None = None):
     """Session-aware streaming (design revision 8 §11).
 
     Admission order: stream capacity first (503 ``stream_busy``, the session
@@ -515,6 +642,11 @@ async def _chat_stream_with_session(question: str, request_id: str, token: str):
     if reservation is None:
         return streaming.busy_response(settings.stream_retry_after_seconds, code="stream_busy")
 
+    # From here until service.start() takes the reservation, every failure
+    # releases what this request owns: the session lease (unsaved), then the
+    # capacity slot, whose release also releases an attached quota ticket.
+    lease = runtime = ticket = None
+    attached = handed_over = False
     try:
         # Shielded: once a lease is taken in the worker thread, this request
         # must not be cancelled before handing it to the run (or releasing it).
@@ -522,16 +654,31 @@ async def _chat_stream_with_session(question: str, request_id: str, token: str):
             runtime, lease = await anyio.to_thread.run_sync(
                 _acquire_session_lease, token, request_id
             )
+        # S1-4b: after the stream capacity and the session checks, before the
+        # worker starts. Released with the stream's slot, only once both the
+        # worker and the consumer are done.
+        ticket = _admit_chat(request, request_id)
+        if ticket is not None:
+            reservation.lease.add_release_callback(ticket.release)
+            attached = True
+        history = [{"question": turn.question, "answer": turn.answer} for turn in lease.history]
+        turns_used = len(history_window(history))
+        session = streaming.StreamSession(
+            manager=runtime.manager, lease=lease, history=history, history_turns_used=turns_used
+        )
+        handed_over = True  # start() owns the reservation now: it releases it if it can't start
+        run = service.start(reservation, question, request_id, asyncio.get_running_loop(), session=session)
     except BaseException:
-        service.cancel(reservation)
+        if not handed_over:
+            try:
+                if lease is not None:
+                    with anyio.CancelScope(shield=True):
+                        await anyio.to_thread.run_sync(runtime.manager.finish, lease)  # not saved
+            finally:
+                service.cancel(reservation)  # even if releasing the lease failed
+                if ticket is not None and not attached:
+                    _release_ticket(ticket)
         raise
-
-    history = [{"question": turn.question, "answer": turn.answer} for turn in lease.history]
-    turns_used = len(history_window(history))
-    session = streaming.StreamSession(
-        manager=runtime.manager, lease=lease, history=history, history_turns_used=turns_used
-    )
-    run = service.start(reservation, question, request_id, asyncio.get_running_loop(), session=session)
     if run is None:
         with anyio.CancelScope(shield=True):
             await anyio.to_thread.run_sync(runtime.manager.finish, lease)
@@ -550,20 +697,46 @@ async def _chat_stream_with_session(question: str, request_id: str, token: str):
     )
 
 
-async def chat_stream(payload: ChatRequest, session_token: str | None = Depends(_session_token)):
+async def chat_stream(
+    payload: ChatRequest,
+    session_token: str | None = Depends(_session_token),
+    request: Request = None,
+):
     """Answer a question as Server-Sent Events (controlled prototype, off by default).
 
     Without ``X-Session-ID`` the behaviour is exactly as before (stateless).
+    With quotas enabled (S1-4b): stream capacity first (503), then the quota
+    (429/503), then the worker starts.
     """
     request_id = str(uuid4())
     question = payload.question
 
     if session_token is not None:
-        return await _chat_stream_with_session(question, request_id, session_token)
+        return await _chat_stream_with_session(question, request_id, session_token, request)
 
-    run = streaming.get_stream_service().start_run(
-        question, request_id, asyncio.get_running_loop()
-    )
+    if not settings.quota_enabled:
+        run = streaming.get_stream_service().start_run(
+            question, request_id, asyncio.get_running_loop()
+        )
+    else:
+        service = streaming.get_stream_service()
+        reservation = service.reserve()
+        if reservation is None:
+            return streaming.busy_response(settings.stream_retry_after_seconds)
+        ticket = None
+        try:
+            ticket = _admit_chat(request, request_id)
+            # Released with the stream's slot: only after both the worker and
+            # the consumer are done (also on a failed start or a cancel).
+            reservation.lease.add_release_callback(ticket.release)
+            ticket = None  # owned by the stream's slot now
+        except BaseException:
+            try:
+                service.cancel(reservation)
+            finally:
+                _release_ticket(ticket)  # admitted but never attached
+            raise
+        run = service.start(reservation, question, request_id, asyncio.get_running_loop())
     if run is None:
         return streaming.busy_response(settings.stream_retry_after_seconds)
 

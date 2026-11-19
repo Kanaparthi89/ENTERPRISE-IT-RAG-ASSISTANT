@@ -146,6 +146,28 @@ class Settings(BaseSettings):
     access_failure_window_seconds: float = Field(default=900.0, ge=60, le=86400)
     access_max_global_failed_attempts: int = Field(default=200, ge=1, le=100000)
 
+    # Security S1-4b: chat quotas (app/services/quota.py). Disabled by default.
+    # When enabled, every chat route (stateless and session /api/chat and
+    # /api/chat/stream) shares one in-memory quota pool per process: per access
+    # code (from a verified access cookie; everyone else shares one anonymous
+    # bucket) and globally. Limits are read once, when the engine is created;
+    # changing them needs a restart. Enabling quotas also requires bounded
+    # deadlines (validated below): CHAT_DEADLINE_SECONDS and
+    # STREAM_TIMEOUT_SECONDS at most 90, OPENAI_TIMEOUT_SECONDS at most 30,
+    # OPENAI_MAX_RETRIES at most 1, SESSION_TURN_MAX_SECONDS at most 105 and
+    # PINECONE_RETRY_AFTER_MAX_SECONDS set, from 0 to 5. A deadline stops a question before its next
+    # external call; a provider call already in progress still finishes (with
+    # its own timeout and retries). Strict: only true or false.
+    quota_enabled: bool = False
+    quota_chat_per_code_hourly: int = Field(default=10, ge=1, le=100000)
+    quota_chat_per_code_daily: int = Field(default=25, ge=1, le=100000)
+    quota_chat_global_hourly: int = Field(default=60, ge=1, le=100000)
+    quota_chat_global_daily: int = Field(default=150, ge=1, le=100000)
+    quota_chat_per_code_concurrent: int = Field(default=1, ge=1, le=100)
+    quota_chat_global_concurrent: int = Field(default=2, ge=1, le=100)
+    quota_max_identities: int = Field(default=1000, ge=1, le=100000)
+    quota_busy_retry_after_seconds: int = Field(default=5, ge=1, le=300)
+
     # Storage paths
     audit_db_path: Path = BASE_DIR / "data" / "audit.db"
     upload_dir: Path = BASE_DIR / "uploads"
@@ -174,6 +196,7 @@ class Settings(BaseSettings):
         "access_enabled",
         "access_cookie_secure",
         "access_trust_socket_peer",
+        "quota_enabled",
         mode="before",
     )
     @classmethod
@@ -229,6 +252,19 @@ class Settings(BaseSettings):
             try:
                 AccessConfig.from_settings(self)
             except AccessConfigError as exc:
+                raise ValueError(str(exc)) from None
+        return self
+
+    @model_validator(mode="after")
+    def validate_quota(self) -> "Settings":
+        """Quotas must never switch on with invalid limits or unbounded deadlines."""
+        if self.quota_enabled:
+            from app.services.quota import QuotaConfigError
+            from app.services.quota_runtime import check_settings
+
+            try:
+                check_settings(self)
+            except QuotaConfigError as exc:
                 raise ValueError(str(exc)) from None
         return self
 
