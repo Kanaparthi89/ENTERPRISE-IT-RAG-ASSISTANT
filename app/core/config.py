@@ -157,7 +157,11 @@ class Settings(BaseSettings):
     # OPENAI_MAX_RETRIES at most 1, SESSION_TURN_MAX_SECONDS at most 105 and
     # PINECONE_RETRY_AFTER_MAX_SECONDS set, from 0 to 5. A deadline stops a question before its next
     # external call; a provider call already in progress still finishes (with
-    # its own timeout and retries). Strict: only true or false.
+    # its own timeout and retries). With transcription enabled too:
+    # VOICE_TRANSCRIPTION_TIMEOUT_SECONDS at most 30 and
+    # VOICE_TRANSCRIPTION_MAX_RETRIES=0. In production, transcription is refused
+    # until S1-5 enforces verified access on it (ACCESS_ENABLED alone does not;
+    # validated below, with no bypass setting). Strict: only true or false.
     quota_enabled: bool = False
     quota_chat_per_code_hourly: int = Field(default=10, ge=1, le=100000)
     quota_chat_per_code_daily: int = Field(default=25, ge=1, le=100000)
@@ -167,6 +171,14 @@ class Settings(BaseSettings):
     quota_chat_global_concurrent: int = Field(default=2, ge=1, le=100)
     quota_max_identities: int = Field(default=1000, ge=1, le=100000)
     quota_busy_retry_after_seconds: int = Field(default=5, ge=1, le=300)
+    # Security S1-4c: transcription quotas (POST /api/voice/transcribe), in
+    # the same engine. Audio seconds are measured exactly from the uploaded
+    # canonical WAV before the provider is called; a recording is at most 60 s.
+    quota_transcription_per_code_daily: int = Field(default=10, ge=1, le=1000)
+    quota_transcription_per_code_daily_seconds: int = Field(default=300, ge=60, le=86400)
+    quota_transcription_global_daily_seconds: int = Field(default=1800, ge=60, le=864000)
+    quota_transcription_per_code_concurrent: int = Field(default=1, ge=1, le=10)
+    quota_transcription_global_concurrent: int = Field(default=1, ge=1, le=10)
 
     # Storage paths
     audit_db_path: Path = BASE_DIR / "data" / "audit.db"
@@ -266,6 +278,18 @@ class Settings(BaseSettings):
                 check_settings(self)
             except QuotaConfigError as exc:
                 raise ValueError(str(exc)) from None
+        return self
+
+    @model_validator(mode="after")
+    def validate_transcription_deployment(self) -> "Settings":
+        """In production, transcription is refused until verified access enforcement exists (S1-4c)."""
+        from app.services.quota import QuotaConfigError
+        from app.services.quota_runtime import check_transcription_deployment
+
+        try:
+            check_transcription_deployment(self)
+        except QuotaConfigError as exc:
+            raise ValueError(str(exc)) from None
         return self
 
     def ensure_directories(self) -> None:

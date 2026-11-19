@@ -4,7 +4,8 @@ import json
 import logging
 import math
 import secrets
-from contextlib import asynccontextmanager
+import threading
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
@@ -828,7 +829,10 @@ VOICE_ERRORS = {
     "audio_too_large": (413, "Audio must be 2 MiB or smaller."),
     "upload_timeout": (408, "The audio upload took too long."),
     "invalid_upload": (400, 'Send exactly one audio file in the "audio" field.'),
-    "unsupported_audio": (415, "Unsupported audio. Use WebM, Ogg, MP4/M4A, MP3 or WAV."),
+    "unsupported_audio": (415, "Unsupported audio. Send a 16 kHz mono 16-bit PCM WAV recording."),
+    "invalid_audio": (400, "The audio is not a valid 16 kHz mono 16-bit PCM WAV recording."),
+    "audio_too_long": (413, "Recordings must be 60 seconds or shorter."),
+    "voice_busy": (503, "Too many recordings are being sent right now. Please try again shortly."),
     "audio_not_transcribable": (422, "The audio could not be transcribed."),
     "transcription_timeout": (504, "Transcription took too long. Please try again."),
     "transcription_unavailable": (503, "Transcription is temporarily unavailable."),
@@ -837,13 +841,177 @@ VOICE_ERRORS = {
 NO_STORE = {"Cache-Control": "no-store"}
 
 
+VOICE_BUSY_RETRY_AFTER_SECONDS = 5
+
+
 def _voice_error(code: str) -> HTTPException:
     status_code, message = VOICE_ERRORS[code]
+    headers = dict(NO_STORE)
+    if code == "voice_busy":
+        headers["Retry-After"] = str(VOICE_BUSY_RETRY_AFTER_SECONDS)
     return HTTPException(
         status_code=status_code,
         detail={"code": code, "message": message},
-        headers=NO_STORE,
+        headers=headers,
     )
+
+
+# ---------------------------------------------------------------------------
+# Security S1-4c: transcription quotas and provider-task ownership
+#
+# A recording's exact duration is measured from the canonical WAV before
+# anything else (app/services/audio_duration.py); only then is it admitted,
+# reserving ceil(duration) seconds. The provider call runs as its own task,
+# which owns the quota ticket once it and its completion callback are
+# registered: the ticket is released only when the task is done (completed,
+# failed, timed out or cancelled), never while our provider request is open.
+# A client disconnect doesn't cancel the handler; a cancelled handler (for
+# example at shutdown) stops waiting, but the task keeps its ticket until it
+# ends, bounded by a hard timeout. Admitted quota is never refunded.
+# ---------------------------------------------------------------------------
+
+VOICE_UPLOAD_SLOTS = 2  # uploads read, checked or transcribed at once (each up to 2 MiB in memory)
+PROVIDER_HARD_TIMEOUT_MARGIN_SECONDS = 5.0
+# One upload slot per identity (a verified access code, or the one shared
+# anonymous bucket), and VOICE_UPLOAD_SLOTS in all: no single client or
+# bucket can hold every slot, for example with stalled uploads that never
+# reach the quota. The identity is resolved before any of the body is read.
+_voice_upload_identities: set = set()
+_voice_uploads_lock = threading.Lock()
+_transcription_tasks: set = set()  # strong references: a running provider task is never garbage-collected
+
+TRANSCRIPTION_QUOTA_ERRORS = {
+    quota_service.DAILY_LIMIT: ("quota_daily_limit", {
+        quota_service.CODE_SCOPE: "You've reached today's recording limit. Please try again tomorrow.",
+        quota_service.GLOBAL_SCOPE: "The service has reached today's recording limit. Please try again tomorrow.",
+    }),
+    quota_service.MINUTES_LIMIT: ("quota_minutes_limit", {
+        quota_service.CODE_SCOPE: "You've used today's recording time. Please try again tomorrow.",
+        quota_service.GLOBAL_SCOPE: "The service has used today's recording time. Please try again tomorrow.",
+    }),
+    quota_service.BUSY: ("quota_busy", {
+        quota_service.CODE_SCOPE: "Your previous recording is still being transcribed. Please wait for it to finish.",
+        quota_service.GLOBAL_SCOPE: "Another recording is being transcribed. Please try again shortly.",
+    }),
+    quota_service.CAPACITY: ("quota_capacity", {
+        quota_service.GLOBAL_SCOPE: "The service is at capacity. Please try again later.",
+    }),
+}
+
+
+@contextmanager
+def _voice_upload_slot(identity: str):
+    """This identity's single upload slot, or ``voice_busy`` at once (never waits).
+
+    Refused if the identity already has an upload in progress, or if every
+    slot is taken. Acquired and released under one lock; released on every
+    exit (success, error, timeout or cancellation).
+    """
+    with _voice_uploads_lock:
+        if identity in _voice_upload_identities or len(_voice_upload_identities) >= VOICE_UPLOAD_SLOTS:
+            raise transcription.VoiceUploadError("voice_busy")
+        _voice_upload_identities.add(identity)
+    try:
+        yield
+    finally:
+        with _voice_uploads_lock:
+            _voice_upload_identities.discard(identity)
+
+
+def _check_transcription_deployment() -> None:
+    """Checked per request too (fails closed): production needs quotas and access codes."""
+    try:
+        quota_runtime.check_transcription_deployment(settings)
+    except quota_service.QuotaConfigError:
+        logger.error("Voice transcription refused: not available in this deployment (production guard).")
+        raise transcription.VoiceUploadError("transcription_unavailable") from None
+
+
+def _admit_transcription(
+    identity: str, code_ref: str | None, request_id: str, seconds: int
+) -> "quota_service.Ticket | None":
+    """Admit one measured recording (None while quotas are disabled); raises 413, 429 or 503.
+
+    ``identity`` is the one resolved before the upload was read (a verified
+    access code, or ANONYMOUS), so the slot and the quota belong to the same identity.
+    """
+    if not settings.quota_enabled:
+        return None
+    busy = settings.quota_busy_retry_after_seconds
+    try:
+        result = quota_runtime.get_quota_engine(settings).admit(
+            quota_service.TRANSCRIPTION, identity, seconds=seconds
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed; logged by class only
+        logger.error("Transcription quota unavailable for request_id=%s (%s).", request_id, type(exc).__name__)
+        raise _quota_error(503, "quota_unavailable", QUOTA_UNAVAILABLE_MESSAGE, busy) from None
+    if isinstance(result, quota_service.Ticket):
+        return result
+    if result.reason == quota_service.REQUEST_TOO_LONG:
+        raise _voice_error("audio_too_long")
+    known = TRANSCRIPTION_QUOTA_ERRORS.get(result.reason)
+    if known is None:  # unavailable (or anything unexpected): fail closed
+        logger.error("Transcription quota unavailable for request_id=%s (%s).", request_id, result.reason)
+        raise _quota_error(503, "quota_unavailable", QUOTA_UNAVAILABLE_MESSAGE, result.retry_after or busy)
+    code, messages = known
+    message = messages.get(result.scope) or messages[quota_service.GLOBAL_SCOPE]
+    logger.warning(
+        "Transcription refused by quota for request_id=%s: reason=%s scope=%s code_ref=%s",
+        request_id, result.reason, result.scope, code_ref or "-",
+    )
+    raise _quota_error(429, code, message, result.retry_after or busy)
+
+
+async def _provider_transcription(upload, api_key: str, ticket) -> str:
+    """The provider call, run as its own task: bounded by a hard timeout, then settled."""
+    timeout = settings.voice_transcription_timeout_seconds
+    try:
+        async with asyncio.timeout(timeout + PROVIDER_HARD_TIMEOUT_MARGIN_SECONDS):
+            result = await transcription.transcribe(
+                upload,
+                api_key=api_key,
+                model=settings.voice_transcription_model,
+                timeout_seconds=timeout,
+                max_retries=settings.voice_transcription_max_retries,
+            )
+    except TimeoutError:
+        logger.warning("Voice transcription stopped at its hard timeout.")
+        raise transcription.VoiceUploadError("transcription_timeout") from None
+    if ticket is not None:
+        # Missing: the exact local measurement (adds nothing). Anything else
+        # goes to the engine as is: longer is charged, implausible or
+        # malformed is charged its cap; nothing is ever refunded.
+        reported = upload.seconds if result.duration is None else result.duration
+        try:
+            ticket.settle(reported)
+        except Exception as exc:  # noqa: BLE001 - the release below still happens
+            logger.error("Transcription quota settlement failed (%s).", type(exc).__name__)
+    return result.text
+
+
+def _transcription_finished(ticket):
+    def finished(task) -> None:
+        _transcription_tasks.discard(task)
+        _release_ticket(ticket)  # the provider task is done: nothing of ours is in flight
+        if not task.cancelled():
+            task.exception()  # retrieved, so an unawaited failure is never reported as lost
+    return finished
+
+
+def _start_provider_task(upload, api_key: str, ticket) -> "asyncio.Task":
+    """Start the provider task and hand it the ticket (registered before it can run)."""
+    task = asyncio.get_running_loop().create_task(_provider_transcription(upload, api_key, ticket))
+    try:
+        _transcription_tasks.add(task)
+        task.add_done_callback(_transcription_finished(ticket))
+    except BaseException:
+        # Nothing has awaited since the task was created, so it hasn't run a
+        # single step: cancelling it now means no provider call ever starts,
+        # and the caller (who still owns the ticket) releases it.
+        _transcription_tasks.discard(task)
+        task.cancel()
+        raise
+    return task
 
 
 def _check_voice_origin(request: Request) -> None:
@@ -863,17 +1031,20 @@ def _check_voice_origin(request: Request) -> None:
 
 @router.post("/voice/transcribe")
 async def voice_transcribe(request: Request, response: Response):
-    """Transcribe one short audio recording to text (Voice V2).
+    """Transcribe one short recording to text (Voice V2; Security S1-4c).
 
     404 (the same body as an unknown route) while
     ``VOICE_TRANSCRIPTION_ENABLED`` is off, the default. The request is
-    ``multipart/form-data`` with one file part named ``audio`` (WebM, Ogg,
-    MP4/M4A, MP3 or WAV; at most 2 MiB). Returns ``{"text": "..."}``. The
-    transcript is only returned: it is not stored, audited or sent to the
-    chat. In order, before any of the body is read: the flag (404), the
-    origin (403), the content type (415), the declared length (413) and the
-    provider key (503). Then the bounded read (408, 413), validation (400,
-    413, 415) and the provider call (422, 503, 504).
+    ``multipart/form-data`` with one file part named ``audio``: a canonical
+    16 kHz mono 16-bit PCM WAV of at most 60 seconds (and 2 MiB). Returns
+    ``{"text": "..."}``; the transcript is only returned, never stored,
+    audited or sent to the chat. In order, before any of the body is read:
+    the flag (404), the origin (403), the production requirements (503),
+    the content type (415), the declared length (413), the provider key
+    (503) and an upload slot: one per identity, two in all (503
+    ``voice_busy``). Then the bounded read
+    (408, 413), validation and the measured duration (400, 413, 415), the
+    quota (413, 429, 503) and the provider call (422, 503, 504).
 
     The handler takes only ``request``, so FastAPI never parses or buffers
     the body itself (``File(...)`` would spool the whole upload first).
@@ -882,8 +1053,11 @@ async def voice_transcribe(request: Request, response: Response):
         raise HTTPException(status_code=404, detail="Not Found")
     _check_voice_origin(request)
 
+    request_id = str(uuid4())
     content_type = request.headers.get("content-type")
+    ticket = None  # owned by this handler until the provider task takes it
     try:
+        _check_transcription_deployment()
         transcription.multipart_boundary(content_type)
         transcription.check_declared_length(request.headers.get("content-length"))
         api_key = settings.openai_api_key.get_secret_value()
@@ -891,16 +1065,18 @@ async def voice_transcribe(request: Request, response: Response):
             logger.error("Voice transcription is enabled but OPENAI_API_KEY is not set.")
             raise transcription.VoiceUploadError("transcription_unavailable")
 
-        body = await transcription.read_bounded_body(request.stream())
-        upload = transcription.parse_audio_upload(body, content_type)
-        del body
-        text = await transcription.transcribe(
-            upload,
-            api_key=api_key,
-            model=settings.voice_transcription_model,
-            timeout_seconds=settings.voice_transcription_timeout_seconds,
-            max_retries=settings.voice_transcription_max_retries,
-        )
+        # Only a verified access cookie identifies a code; nothing else the client sends is trusted.
+        identity, code_ref = _quota_identity(request)
+        with _voice_upload_slot(identity):
+            body = await transcription.read_bounded_body(request.stream())
+            upload = transcription.parse_audio_upload(body, content_type)  # measures the duration
+            del body
+            ticket = _admit_transcription(identity, code_ref, request_id, upload.reserved_seconds)
+            task = _start_provider_task(upload, api_key, ticket)
+            ticket = None  # handed over: released by the task's completion callback only
+            text = await asyncio.shield(task)  # a cancelled handler stops waiting; the task goes on
+    except HTTPException:
+        raise
     except transcription.VoiceUploadError as exc:
         raise _voice_error(exc.code) from None
     except ClientDisconnect:
@@ -908,6 +1084,8 @@ async def voice_transcribe(request: Request, response: Response):
     except Exception as exc:  # noqa: BLE001 - never echo details; log the class only
         logger.error("Voice transcription failed unexpectedly (%s).", type(exc).__name__)
         raise _voice_error("transcription_failed") from None
+    finally:
+        _release_ticket(ticket)  # only a ticket never handed to a provider task
 
     response.headers["Cache-Control"] = "no-store"
     return {"text": text}

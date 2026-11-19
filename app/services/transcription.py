@@ -15,9 +15,15 @@ Upload handling never buffers more than ``MAX_REQUEST_BYTES``:
   low-level parser. Starlette's form parser is not used: it spools file parts
   to temporary files, and audio must never touch the disk.
 
+Audio (Security S1-4c): only canonical 16 kHz mono 16-bit PCM WAV is
+accepted, and its exact duration is measured from the bytes received
+(``app/services/audio_duration.py``) before any provider call: at most 60
+seconds. Other formats are refused (their length can't be bounded reliably
+without decoding).
+
 Privacy: audio and transcripts are held in memory for one request and never
-written, logged or audited. Log lines carry sizes, formats, timings and error
-classes only.
+written, logged or audited. Log lines carry sizes, formats, durations,
+timings and error classes only.
 """
 
 import logging
@@ -27,6 +33,8 @@ from dataclasses import dataclass
 from pathlib import PurePath
 
 import anyio
+
+from app.services import audio_duration
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -63,8 +71,9 @@ MAX_AUDIO_BYTES = 2 * 1024 * 1024  # 2 MiB of audio
 # Room for the multipart boundaries and part headers around the audio.
 MULTIPART_OVERHEAD_BYTES = 16 * 1024
 MAX_REQUEST_BYTES = MAX_AUDIO_BYTES + MULTIPART_OVERHEAD_BYTES
-# A slow (or stalled) upload is abandoned after this long.
-UPLOAD_READ_TIMEOUT_SECONDS = 15.0
+# A slow (or stalled) upload is abandoned after this long. 60 s of the
+# accepted WAV is about 1.92 MB, about 15 s at 1 Mbit/s (S1-4c).
+UPLOAD_READ_TIMEOUT_SECONDS = 30.0
 MIN_AUDIO_BYTES = 16  # enough to recognise the container's signature
 AUDIO_FIELD = "audio"
 MAX_PARTS = 1
@@ -122,14 +131,10 @@ _WAV = AudioFormat(
     "wav", ".wav", "audio/wav", frozenset({"audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave"}), _is_wav
 )
 
+# Accepted uploads (S1-4c): canonical PCM WAV only. The compressed formats
+# above are still recognised by their signatures, so they are refused as
+# unsupported rather than as malformed.
 FORMATS_BY_EXTENSION = {
-    ".webm": _WEBM,
-    ".ogg": _OGG,
-    ".oga": _OGG,
-    ".m4a": _MP4,
-    ".mp4": _MP4,
-    ".mp3": _MP3,
-    ".mpga": _MP3,
     ".wav": _WAV,
 }
 
@@ -138,6 +143,14 @@ FORMATS_BY_EXTENSION = {
 class AudioUpload:
     data: bytes
     format: AudioFormat
+    seconds: float = 0.0  # measured exactly from the samples (S1-4c)
+    reserved_seconds: int = 0  # whole seconds rounded up: what the quota reserves
+
+
+@dataclass(frozen=True)
+class Transcription:
+    text: str
+    duration: object = None  # the provider's reported duration (verbose_json), not trusted
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +294,14 @@ def parse_audio_upload(body: bytes, content_type: str | None) -> AudioUpload:
     ):
         raise VoiceUploadError("unsupported_audio")
 
-    return AudioUpload(data=data, format=audio_format)
+    # The duration is measured from the bytes themselves; nothing declared is trusted.
+    try:
+        measured = audio_duration.measure_canonical_wav(data)
+    except audio_duration.AudioDurationError as exc:
+        raise VoiceUploadError(exc.code) from None
+    return AudioUpload(
+        data=data, format=audio_format, seconds=measured.seconds, reserved_seconds=measured.reserved_seconds
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +315,10 @@ async def transcribe(
     model: str,
     timeout_seconds: float,
     max_retries: int,
-) -> str:
-    """The transcript of ``upload``. Raises ``VoiceUploadError`` with a public code.
+) -> Transcription:
+    """The transcript of ``upload`` and the provider's reported duration.
+
+    Raises ``VoiceUploadError`` with a public code.
 
     ``timeout_seconds`` bounds each provider attempt; ``max_retries`` (0-2)
     bounds the attempts. Provider messages and response bodies are never
@@ -312,7 +334,7 @@ async def transcribe(
             result = await client.audio.transcriptions.create(
                 model=model,
                 file=(f"audio{upload.format.extension}", upload.data, upload.format.provider_mime),
-                response_format="json",
+                response_format="verbose_json",  # includes the provider's duration (S1-4c)
             )
     except APITimeoutError:
         _log_failure("timeout", upload, started)
@@ -336,12 +358,13 @@ async def transcribe(
         raise VoiceUploadError("transcription_unavailable")
 
     logger.info(
-        "Voice transcription completed: format=%s bytes=%d duration_ms=%d",
+        "Voice transcription completed: format=%s bytes=%d audio_seconds=%.2f duration_ms=%d",
         upload.format.name,
         len(upload.data),
+        upload.seconds,
         int((time.monotonic() - started) * 1000),
     )
-    return text.strip()
+    return Transcription(text=text.strip(), duration=getattr(result, "duration", None))
 
 
 def _log_failure(reason: str, upload: AudioUpload, started: float) -> None:

@@ -5,6 +5,7 @@ test can only reach the fake provider installed by ``provider``.
 """
 
 import logging
+import struct
 from types import SimpleNamespace
 
 import anyio
@@ -24,10 +25,22 @@ NOT_FOUND = {"detail": "Not Found"}
 BOUNDARY = "BluePeakTestBoundary7MA4YWxk"
 MULTIPART = f"multipart/form-data; boundary={BOUNDARY}"
 TRANSCRIPT = "SECRET-TRANSCRIPT-how do I reset my VPN token"
-SECRET_FILENAME = "patient-jane-doe-recording.webm"
+SECRET_FILENAME = "patient-jane-doe-recording.wav"
 PROVIDER_DETAIL = "provider-internal-detail-must-not-leak"
 
-# Real container signatures, padded to a realistic minimum size.
+def canonical_wav(seconds=1.0, sample=b"\x01\x00"):
+    """A canonical 16 kHz mono 16-bit PCM WAV, the only accepted format (S1-4c)."""
+    data = sample * int(16000 * seconds)
+    return (
+        b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE"
+        + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, 16000, 32000, 2, 16)
+        + b"data" + struct.pack("<I", len(data)) + data
+    )
+
+
+AUDIO = canonical_wav(1.0)  # 32,044 bytes
+
+# Real container signatures of formats that are now refused (S1-4c), padded.
 WEBM = b"\x1a\x45\xdf\xa3" + b"\x9f" * 60
 OGG = b"OggS" + b"\x00" * 60
 MP4 = b"\x00\x00\x00\x20ftypM4A " + b"\x00" * 52
@@ -46,12 +59,12 @@ def multipart(*parts, boundary=BOUNDARY, close=True) -> bytes:
     return body
 
 
-def audio_part(data=WEBM, filename="clip.webm", content_type="audio/webm", name="audio"):
+def audio_part(data=AUDIO, filename="clip.wav", content_type="audio/wav", name="audio"):
     headers = f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\nContent-Type: {content_type}'
     return (headers, data)
 
 
-def upload(data=WEBM, filename="clip.webm", content_type="audio/webm"):
+def upload(data=AUDIO, filename="clip.wav", content_type="audio/wav"):
     return multipart(audio_part(data, filename, content_type))
 
 
@@ -357,18 +370,20 @@ def test_a_chunked_upload_without_a_length_is_still_capped(client, stt_on, provi
     assert fake.requests == []
 
 
-def test_audio_of_exactly_2_mib_is_accepted_and_one_byte_more_is_not(client, stt_on, provider):
+def test_the_2_mib_limit_still_applies_before_the_duration(client, stt_on, provider):
+    # Exactly 2 MiB passes the size limit (then 65.5 s of audio is too long);
+    # one byte more is refused by size. Neither reaches the provider.
     fake = provider()
     limit = transcription.MAX_AUDIO_BYTES
-    exact = WEBM + b"\x00" * (limit - len(WEBM))
+    exact = canonical_wav((limit - 44) / 32000)
+    assert len(exact) == limit
 
-    assert post(client, body=upload(data=exact)).status_code == 200
-    assert len(fake.requests[0]["file"][1]) == limit
+    response = post(client, body=upload(data=exact))
+    assert (response.status_code, error_code(response)) == (413, "audio_too_long")
 
     response = post(client, body=upload(data=exact + b"\x00"))
-    assert response.status_code == 413
-    assert error_code(response) == "audio_too_large"
-    assert len(fake.requests) == 1
+    assert (response.status_code, error_code(response)) == (413, "audio_too_large")
+    assert fake.requests == []
 
 
 # ---------------------------------------------------------------------------
@@ -422,17 +437,10 @@ def test_malformed_uploads_are_400(client, stt_on, provider, body):
 @pytest.mark.parametrize(
     "data, filename, content_type, provider_name, provider_mime",
     [
-        (WEBM, "clip.webm", "audio/webm", "audio.webm", "audio/webm"),
-        (WEBM, "clip.webm", "audio/webm;codecs=opus", "audio.webm", "audio/webm"),  # Chrome's MediaRecorder
-        (WEBM, "clip.webm", "video/webm", "audio.webm", "audio/webm"),
-        (OGG, "clip.ogg", "audio/ogg; codecs=opus", "audio.ogg", "audio/ogg"),  # Firefox
-        (OGG, "clip.oga", "audio/ogg", "audio.ogg", "audio/ogg"),
-        (MP4, "clip.mp4", "audio/mp4", "audio.m4a", "audio/mp4"),  # Safari
-        (MP4, "clip.m4a", "audio/x-m4a", "audio.m4a", "audio/mp4"),
-        (MP3_ID3, "clip.mp3", "audio/mpeg", "audio.mp3", "audio/mpeg"),
-        (MP3_FRAME, "clip.mp3", "audio/mpeg", "audio.mp3", "audio/mpeg"),
-        (WAV, "clip.wav", "audio/wav", "audio.wav", "audio/wav"),
-        (WAV, "CLIP.WAV", "audio/x-wav", "audio.wav", "audio/wav"),
+        (AUDIO, "clip.wav", "audio/wav", "audio.wav", "audio/wav"),
+        (AUDIO, "CLIP.WAV", "audio/x-wav", "audio.wav", "audio/wav"),
+        (AUDIO, "clip.wav", "audio/wave", "audio.wav", "audio/wav"),
+        (AUDIO, "clip.wav", "audio/vnd.wave", "audio.wav", "audio/wav"),
     ],
 )
 def test_allowed_formats_are_transcribed(client, stt_on, provider, data, filename, content_type, provider_name, provider_mime):
@@ -457,6 +465,14 @@ def test_allowed_formats_are_transcribed(client, stt_on, provider, data, filenam
         pytest.param(OGG, "clip.webm", "audio/webm", id="content does not match"),
         pytest.param(b"#!/bin/sh\necho owned " + b"x" * 60, "clip.webm", "audio/webm", id="script renamed as audio"),
         pytest.param(b"<html><script>x()</script>" + b"x" * 60, "clip.mp3", "audio/mpeg", id="html renamed as audio"),
+        # S1-4c: compressed formats are refused (their duration can't be bounded).
+        pytest.param(WEBM, "clip.webm", "audio/webm", id="webm"),
+        pytest.param(WEBM, "clip.webm", "audio/webm;codecs=opus", id="webm opus (Chrome)"),
+        pytest.param(OGG, "clip.ogg", "audio/ogg; codecs=opus", id="ogg opus (Firefox)"),
+        pytest.param(MP4, "clip.m4a", "audio/mp4", id="m4a (Safari)"),
+        pytest.param(MP3_ID3, "clip.mp3", "audio/mpeg", id="mp3"),
+        pytest.param(WAV, "clip.wav", "audio/wav", id="non-canonical WAV header"),
+        pytest.param(OGG, "clip.wav", "audio/wav", id="ogg renamed as wav"),
     ],
 )
 def test_inconsistent_or_disallowed_audio_is_415(client, stt_on, provider, data, filename, content_type):
@@ -474,7 +490,7 @@ def test_the_client_filename_is_never_sent_or_trusted(client, stt_on, provider):
 
     assert response.status_code == 200
     [request] = fake.requests
-    assert request["file"][0] == "audio.webm"
+    assert request["file"][0] == "audio.wav"
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +510,7 @@ def test_success_returns_only_the_transcript_with_no_store(client, stt_on, provi
     assert client_used.closed is True
     [request] = fake.requests
     assert request["model"] == "whisper-1"
-    assert request["response_format"] == "json"
+    assert request["response_format"] == "verbose_json"
     assert set(request) == {"model", "file", "response_format"}
 
 
@@ -584,7 +600,7 @@ def test_a_cancelled_transcription_closes_the_provider_client(monkeypatch):
         return made
 
     monkeypatch.setattr(transcription, "AsyncOpenAI", make_client)
-    audio = transcription.AudioUpload(data=WEBM, format=transcription.FORMATS_BY_EXTENSION[".webm"])
+    audio = transcription.AudioUpload(data=AUDIO, format=transcription.FORMATS_BY_EXTENSION[".wav"], seconds=1.0)
 
     async def run():
         with anyio.move_on_after(0.05) as scope:
@@ -653,9 +669,9 @@ def test_nothing_is_logged_stored_audited_or_sent_to_the_chat(
     # Logs: size and format only; never the transcript, the audio, the name or the key.
     assert TRANSCRIPT not in caplog.text
     assert SECRET_FILENAME not in caplog.text
-    assert repr(WEBM[:8]) not in caplog.text
+    assert repr(AUDIO[:8]) not in caplog.text and repr(AUDIO[44:52]) not in caplog.text
     assert "sk-test-not-a-real-key" not in caplog.text
-    assert "Voice transcription completed: format=webm bytes=64" in caplog.text
+    assert "Voice transcription completed: format=wav bytes=32044 audio_seconds=1.00" in caplog.text
     # Nothing written, audited, or started.
     assert {p for p in tmp_path.rglob("*")} == files_before
     assert not settings.upload_dir.exists() or not any(settings.upload_dir.iterdir())

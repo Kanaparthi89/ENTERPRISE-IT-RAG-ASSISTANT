@@ -24,12 +24,15 @@ timeout and retries, and Pinecone's longest honoured ``Retry-After``
 
 import threading
 
-from app.services.quota import ChatLimits, QuotaConfig, QuotaConfigError, QuotaEngine
+from app.services.audio_duration import MAX_DURATION_SECONDS
+from app.services.quota import ChatLimits, QuotaConfig, QuotaConfigError, QuotaEngine, TranscriptionLimits
 
 MAX_DEADLINE_SECONDS = 90.0  # CHAT_DEADLINE_SECONDS and STREAM_TIMEOUT_SECONDS
 MAX_OPENAI_TIMEOUT_SECONDS = 30.0
 MAX_OPENAI_RETRIES = 1
 MAX_PINECONE_RETRY_AFTER_SECONDS = 5  # per retry; the SDK's 5 retries and backoff are unchanged
+MAX_TRANSCRIPTION_TIMEOUT_SECONDS = 30.0  # S1-4c: with quotas and transcription on
+MAX_TRANSCRIPTION_RETRIES = 0
 
 
 def config_from_settings(settings) -> QuotaConfig:
@@ -42,6 +45,18 @@ def config_from_settings(settings) -> QuotaConfig:
             global_daily=settings.quota_chat_global_daily,
             per_code_concurrent=settings.quota_chat_per_code_concurrent,
             global_concurrent=settings.quota_chat_global_concurrent,
+        ),
+        transcription=TranscriptionLimits(
+            per_code_daily=settings.quota_transcription_per_code_daily,
+            per_code_daily_seconds=settings.quota_transcription_per_code_daily_seconds,
+            global_daily_seconds=settings.quota_transcription_global_daily_seconds,
+            per_code_concurrent=settings.quota_transcription_per_code_concurrent,
+            global_concurrent=settings.quota_transcription_global_concurrent,
+            max_request_seconds=MAX_DURATION_SECONDS,  # the measured-duration limit (S1-4c)
+            # The most one recording can be charged: the per-code daily budget
+            # (see app/services/quota.py), so one bad provider report refuses
+            # only that code for the day.
+            max_settle_seconds=settings.quota_transcription_per_code_daily_seconds,
         ),
         max_identities=settings.quota_max_identities,
         busy_retry_after_seconds=settings.quota_busy_retry_after_seconds,
@@ -81,7 +96,42 @@ def check_settings(settings) -> QuotaConfig:
         raise QuotaConfigError(
             f"QUOTA_ENABLED requires SESSION_TURN_MAX_SECONDS of at most {longest_turn:g}."
         )
+    if settings.voice_transcription_enabled:  # S1-4c
+        if not 0 < settings.voice_transcription_timeout_seconds <= MAX_TRANSCRIPTION_TIMEOUT_SECONDS:
+            raise QuotaConfigError(
+                "QUOTA_ENABLED with transcription requires VOICE_TRANSCRIPTION_TIMEOUT_SECONDS "
+                f"of at most {MAX_TRANSCRIPTION_TIMEOUT_SECONDS:g}."
+            )
+        if settings.voice_transcription_max_retries != MAX_TRANSCRIPTION_RETRIES:
+            raise QuotaConfigError(
+                "QUOTA_ENABLED with transcription requires VOICE_TRANSCRIPTION_MAX_RETRIES=0."
+            )
     return config
+
+
+def check_transcription_deployment(settings) -> None:
+    """Production transcription is refused (S1-4c); raises ``QuotaConfigError``.
+
+    ACCESS_ENABLED does not yet make the transcription route require a
+    verified access code (that is S1-5), so in production anonymous users
+    could still transcribe. Until S1-5 enforces verified access on this
+    route, production transcription never starts, whatever the settings:
+    there is deliberately no setting to bypass this. S1-5 must replace the
+    final ``raise`` below with a check that verified access is enforced.
+
+    Development and testing may enable transcription alone, so local work
+    (everything disabled by default) is unaffected.
+    """
+    if not settings.voice_transcription_enabled or settings.app_env != "production":
+        return
+    if not (settings.quota_enabled and settings.access_enabled):
+        raise QuotaConfigError(
+            "VOICE_TRANSCRIPTION_ENABLED in production requires QUOTA_ENABLED=true and ACCESS_ENABLED=true."
+        )
+    raise QuotaConfigError(
+        "VOICE_TRANSCRIPTION_ENABLED is not available in production until verified access "
+        "enforcement (S1-5) is implemented."
+    )
 
 
 _engine: QuotaEngine | None = None
