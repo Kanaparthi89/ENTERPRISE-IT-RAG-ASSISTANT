@@ -22,6 +22,7 @@ from app.core.config import get_settings
 from app.rag import cancellation
 from app.rag.workflow import ask, history_window
 from app.rag.vectorstore import add_documents
+from app.services import access as access_service
 from app.services import sessions as session_service
 from app.services import transcription
 from app.services.ingestion import load_file, chunk_documents, SUPPORTED
@@ -754,6 +755,171 @@ async def voice_transcription_status(response: Response):
         raise HTTPException(status_code=404, detail="Not Found")
     response.headers["Cache-Control"] = "no-store"  # the flag can change on restart
     return {"stt": True}
+
+
+# ---------------------------------------------------------------------------
+# Security S1-3: access codes (Architecture C)
+#
+# Redeems an access code for a signed, HttpOnly, SameSite=Strict cookie and
+# reports or ends that access. Nothing else requires access yet. All three
+# routes are 404 (like an unknown route) while ACCESS_ENABLED is off, the
+# default. Errors are generic, and codes, cookies, secrets and client
+# addresses are never logged (see app/services/access.py).
+# ---------------------------------------------------------------------------
+
+ACCESS_ERRORS = {
+    "access_denied": (401, "Invalid or expired access code."),
+    "access_throttled": (429, "Too many attempts. Please try again later."),
+    "access_unavailable": (503, "Access is temporarily unavailable."),
+    "origin_not_allowed": (403, "Request origin not allowed."),
+    "unsupported_media_type": (415, "Use application/json."),
+    "invalid_request": (400, 'Send {"code": "<access code>"}.'),
+}
+
+
+def _access_error(code: str, headers: dict[str, str] | None = None) -> HTTPException:
+    status_code, message = ACCESS_ERRORS[code]
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+        headers={**NO_STORE, **(headers or {})},
+    )
+
+
+def _access_config() -> access_service.AccessConfig:
+    """Validated per request too: settings changed at runtime must not weaken it (fails closed)."""
+    try:
+        return access_service.AccessConfig.from_settings(settings)
+    except access_service.AccessConfigError:
+        logger.error("Access codes are enabled but their settings are invalid.")
+        raise _access_error("access_unavailable") from None
+
+
+def _check_access_origin(request: Request) -> None:
+    """Refuse cross-site browser requests; a form can POST without a preflight."""
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site is not None and fetch_site.strip().lower() != "same-origin":
+        raise _access_error("origin_not_allowed")
+    origin = request.headers.get("origin")
+    if origin is not None and not _origin_matches_host(origin, request.headers.get("host", "")):
+        raise _access_error("origin_not_allowed")
+
+
+async def _read_body_up_to(request: Request, limit: int) -> bytes | None:
+    """The request body, or None if it is longer than ``limit`` (never read further)."""
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _redeemed_code(body: bytes | None) -> str | None:
+    """The code from exactly ``{"code": "<string>"}``, or None."""
+    if body is None:
+        return None
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or set(data) != {"code"} or not isinstance(data["code"], str):
+        return None
+    return data["code"].strip()
+
+
+@router.post("/access")
+async def redeem_access(request: Request, response: Response):
+    """Exchange an access code for a signed access cookie (Security S1-3).
+
+    In order: the flag (404), the settings (503), the origin (403), a
+    trustworthy client address (503), the failed-attempt throttle (429 with
+    Retry-After), then the content type (415), the bounded body (400) and the
+    code (401). Every attempt that gets past the throttle counts as a failure
+    unless it succeeds. Success: 200 with ``{"authenticated": true,
+    "expires_at"}`` and the cookie; the code itself is never returned.
+    """
+    if not settings.access_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+    config = _access_config()
+    _check_access_origin(request)
+
+    client = access_service.client_key(
+        request.client.host if request.client else None, request.headers, config.client_ip_header
+    )
+    if client is None:
+        logger.warning("Access code redemption refused: no trustworthy client address.")
+        raise _access_error("access_unavailable")
+
+    throttle = access_service.get_throttle(settings)
+    retry_after, stamp = throttle.attempt(client)
+    if retry_after is not None:
+        logger.warning("Access code rejected (throttled).")
+        raise _access_error("access_throttled", {"Retry-After": str(math.ceil(retry_after))})
+
+    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if media_type != "application/json":
+        raise _access_error("unsupported_media_type")
+    candidate = _redeemed_code(await _read_body_up_to(request, access_service.MAX_REDEEM_BODY_BYTES))
+    if candidate is None:
+        raise _access_error("invalid_request")
+
+    now = access_service.wall_clock()
+    code = access_service.match_code(config, candidate, now)
+    if code is None:
+        logger.warning("Access code rejected (invalid or expired).")
+        raise _access_error("access_denied")
+
+    throttle.succeeded(client, stamp)
+    value, expires_at = access_service.issue_cookie(config, code, now)
+    response.set_cookie(
+        config.cookie_name,  # __Host-bp_access when Secure (no Domain attribute is ever set)
+        value,
+        max_age=max(0, expires_at - int(now)),
+        expires=datetime.fromtimestamp(expires_at, tz=timezone.utc),
+        path="/",
+        secure=config.secure,
+        httponly=True,
+        samesite="strict",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    logger.info("Access granted: code_ref=%s", access_service.code_reference(config, code.code_id))
+    return {"authenticated": True, "expires_at": _iso_utc(expires_at)}
+
+
+@router.get("/access/status")
+async def access_status(request: Request, response: Response):
+    """Whether this browser holds a valid access cookie (never 401)."""
+    if not settings.access_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+    config = _access_config()
+    response.headers["Cache-Control"] = "no-store"
+    grant = access_service.verify_cookie(
+        config, request.cookies.get(config.cookie_name), access_service.wall_clock()
+    )
+    if grant is None:
+        return {"authenticated": False}
+    return {"authenticated": True, "expires_at": _iso_utc(grant.expires_at)}
+
+
+@router.post("/access/logout", status_code=204)
+async def access_logout(request: Request):
+    """End access in this browser: the cookie is deleted (idempotent)."""
+    if not settings.access_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+    _check_access_origin(request)
+    response = Response(status_code=204, headers=NO_STORE)
+    # Both names, each with the attributes a browser requires to replace it.
+    for secure in (True, False):
+        response.delete_cookie(
+            access_service.cookie_name(secure),
+            path="/",
+            secure=secure,
+            httponly=True,
+            samesite="strict",
+        )
+    return response
 
 
 @router.post("/ingest")

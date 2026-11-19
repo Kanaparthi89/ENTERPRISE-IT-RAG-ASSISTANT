@@ -122,6 +122,30 @@ class Settings(BaseSettings):
     # Application authentication
     admin_api_key: SecretStr = SecretStr("")
 
+    # Security S1-3: access codes for live AI features (Architecture C).
+    # Disabled by default. Enabling it exposes /api/access only: no other
+    # route requires access yet. When enabled, every setting below must be
+    # valid or the application refuses to start (app/services/access.py).
+    # Codes are stored as SHA-256 digests only: "id:digest" or
+    # "id:digest:YYYY-MM-DD", comma-separated. The cookie secret signs access
+    # cookies (HMAC-SHA256); previous secrets only verify cookies until they
+    # expire. Throttling needs a trusted client identity: ACCESS_CLIENT_IP_HEADER
+    # (a header verified to be set, not passed through, by the platform) or
+    # ACCESS_TRUST_SOCKET_PEER=true (clients connect directly). In production
+    # one of them is required; elsewhere the socket peer is the default.
+    # ACCESS_COOKIE_SECURE=false is allowed only with APP_ENV=development.
+    access_enabled: bool = False
+    access_code_hashes: str = ""
+    access_cookie_secret: SecretStr = SecretStr("")
+    access_cookie_previous_secrets: SecretStr = SecretStr("")
+    access_cookie_max_age_seconds: int = Field(default=7 * 24 * 3600, ge=300, le=30 * 24 * 3600)
+    access_cookie_secure: bool = True
+    access_client_ip_header: str = ""
+    access_trust_socket_peer: bool = False
+    access_max_failed_attempts: int = Field(default=5, ge=1, le=100)
+    access_failure_window_seconds: float = Field(default=900.0, ge=60, le=86400)
+    access_max_global_failed_attempts: int = Field(default=200, ge=1, le=100000)
+
     # Storage paths
     audit_db_path: Path = BASE_DIR / "data" / "audit.db"
     upload_dir: Path = BASE_DIR / "uploads"
@@ -144,7 +168,14 @@ class Settings(BaseSettings):
         validate_default=True,
     )
 
-    @field_validator("voice_enabled", "voice_transcription_enabled", mode="before")
+    @field_validator(
+        "voice_enabled",
+        "voice_transcription_enabled",
+        "access_enabled",
+        "access_cookie_secure",
+        "access_trust_socket_peer",
+        mode="before",
+    )
     @classmethod
     def validate_strict_boolean(cls, value):
         """Accept only a real boolean or the words true/false (any case).
@@ -187,6 +218,18 @@ class Settings(BaseSettings):
                 "session_lease_margin_seconds must be smaller than one renewal interval "
                 "(session_lease_ttl_seconds / 3)."
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_access(self) -> "Settings":
+        """Access codes must never switch on with missing, weak or malformed settings."""
+        if self.access_enabled:
+            from app.services.access import AccessConfig, AccessConfigError
+
+            try:
+                AccessConfig.from_settings(self)
+            except AccessConfigError as exc:
+                raise ValueError(str(exc)) from None
         return self
 
     def ensure_directories(self) -> None:

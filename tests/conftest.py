@@ -508,6 +508,16 @@ def stream_app(monkeypatch, settings):
 
 
 @pytest.fixture(autouse=True)
+def access_throttle_cleared():
+    """The S1-3 access-code throttle is process-wide; each test starts with a fresh one."""
+    from app.services import access
+
+    access.reset_throttle()
+    yield
+    access.reset_throttle()
+
+
+@pytest.fixture(autouse=True)
 def shutdown_signal_cleared():
     """The H1-3a shutdown signal is process-wide; an app lifespan's shutdown sets it."""
     cancellation.reset_shutdown()
