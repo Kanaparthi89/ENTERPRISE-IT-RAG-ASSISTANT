@@ -387,14 +387,17 @@ ENTERPRISE-IT-RAG-ASSISTANT/
 │   └── services/
 │       ├── audit.py             # Audit persistence (SQLite)
 │       ├── ingestion.py         # Document ingestion pipeline
-│       └── sessions.py          # Conversation session storage and leases (SQLite)
+│       ├── sessions.py          # Conversation session storage and leases (SQLite)
+│       └── transcription.py     # Speech-to-text upload checks and OpenAI call
 ├── templates/
 │   └── index.html               # Web interface template
 ├── static/
 │   ├── css/style.css            # Web interface styles
 │   └── js/
 │       ├── app.js               # Web interface behavior
-│       └── chat-stream.js       # Chat client: streaming, fallback, sessions
+│       ├── chat-stream.js       # Chat client: streaming, fallback, sessions
+│       ├── voice.js             # Read answers aloud (browser speech synthesis)
+│       └── recorder.js          # Dictation: microphone recording and upload
 ├── data/
 │   └── sample_kb/               # Sample knowledge-base documents
 ├── tests/                       # Python tests (pytest)
@@ -866,7 +869,7 @@ Session errors have the body `{"detail": {"code": "...", "message": "..."}}`. Me
 
 ### Read answers aloud (voice V1, disabled by default)
 
-With `VOICE_ENABLED=true`, the web interface can read completed answers aloud using the **browser's own speech synthesis and on-device voices only**. The server calls no speech provider, and nothing is recorded, uploaded, or stored; there is no microphone input or transcription. Even when enabled, it is **opt-in for each user** and starts off on every page load.
+With `VOICE_ENABLED=true`, the web interface can read completed answers aloud using the **browser's own speech synthesis and on-device voices only**. The server calls no speech provider, and reading aloud records, uploads, and stores nothing. (Dictation, which uses the microphone, is a separate feature with its own setting; see [Dictation in the web interface](#dictation-in-the-web-interface-voice-v3-disabled-by-default).) Even when enabled, it is **opt-in for each user** and starts off on every page load.
 
 | Setting | Default | Allowed | Purpose |
 | ------- | ------- | ------- | ------- |
@@ -877,7 +880,8 @@ How the page behaves:
 - **When it is offered.** In a browser with speech synthesis, the page requests `GET /api/voice/status` once per page load (at most 5 seconds). Only a `200` with exactly `{"tts": true}` shows the toggle; anything else (`404`, an error, a timeout, another body) leaves it hidden without a message. Browsers without speech synthesis make no request.
 - **Turning it on.** Selecting **Read answers aloud** checks for an on-device voice in the page's language before turning on, then says "Voice responses on." Without one, it stays off and explains why. Voices that would send text to an online service are never used. If the browser blocks speech, the page says so and turns it off; selecting the toggle again retries.
 - **What is spoken.** Each completed answer, once, for both streamed and non-streamed answers, as plain text: Markdown, links, URLs, citation markers, code blocks, and tables are not read out, and long answers stop after 1,500 characters with "The full answer is on screen." Partial (streaming) text, failed questions, and error messages are never spoken.
-- **Stopping.** **Stop speaking** (shown only while speaking) and the Escape key stop speech; Escape closes an open dialog first. A new question, **New chat**, turning the toggle off, and leaving the page also stop it. Stopping speech never cancels a question that is still being answered.
+- **Stopping.** **Stop speaking** (shown only while speaking) and the Escape key stop speech; Escape closes an open dialog first, then ends dictation if it is active, and only then stops speech. A new question, **New chat**, turning the toggle off, starting dictation, and leaving the page also stop it. Stopping speech never cancels a question that is still being answered.
+- **While dictating.** While dictation is active (waiting for microphone permission, recording, or transcribing), completed answers are not read aloud, and turning the toggle on does not say "Voice responses on.", so speech is never recorded. An answer that completes during dictation is not read aloud later.
 
 Limitations:
 
@@ -894,13 +898,13 @@ The status endpoint:
 
 The endpoint reads only this setting: it returns no other configuration and makes no external call, audit record, or storage change. Other methods on the path return FastAPI's standard `405`, also while voice is disabled.
 
-### Speech-to-text (voice V2 backend, disabled by default)
+### Speech-to-text (voice V2, disabled by default)
 
-`POST /api/voice/transcribe` turns one short recording into text with OpenAI. It is a **backend endpoint only**: no page uses it yet (there is no microphone button), and it never sends anything to the chat. The transcript is returned to the caller, who decides what to do with it.
+`POST /api/voice/transcribe` turns one short recording into text with OpenAI. The web interface's **Dictate** button uses it (see [Dictation in the web interface](#dictation-in-the-web-interface-voice-v3-disabled-by-default)). The endpoint never sends anything to the chat: the transcript is returned to the caller, who decides what to do with it.
 
 | Setting | Default | Allowed | Purpose |
 | ------- | ------- | ------- | ------- |
-| `VOICE_TRANSCRIPTION_ENABLED` | `false` | `true` or `false` only | Enables the endpoint. Separate from `VOICE_ENABLED`. Any other value stops the application at startup. |
+| `VOICE_TRANSCRIPTION_ENABLED` | `false` | `true` or `false` only | Enables the endpoint and `GET /api/voice/transcription/status`, which offers the **Dictate** button. Separate from `VOICE_ENABLED`. Any other value stops the application at startup. |
 | `VOICE_TRANSCRIPTION_MODEL` | `whisper-1` | Non-empty | The OpenAI transcription model. Check that your account can use the model you set. |
 | `VOICE_TRANSCRIPTION_TIMEOUT_SECONDS` | `30` | 1–120 | Timeout for each OpenAI attempt. |
 | `VOICE_TRANSCRIPTION_MAX_RETRIES` | `0` | 0–2 | OpenAI retries. Default none, so one recording costs at most one attempt. |
@@ -935,10 +939,39 @@ How it is protected:
 Not protected, so **do not enable it on a reachable server yet**:
 
 - **No authentication or rate limit.** Anyone who can reach the server can send recordings and spend OpenAI credit. The origin check stops other websites, not scripts. Put authentication and a rate limit (for example at a reverse proxy) in front first.
-- **Microphone use needs HTTPS.** Browsers allow the microphone only on HTTPS or localhost, which the planned page integration (V3) will need.
+- **Microphone use needs HTTPS.** Browsers allow the microphone only on HTTPS or localhost, so the **Dictate** button is offered only there.
 - **Privacy.** Recordings are sent to OpenAI under your account's data terms; tell users before they record.
 - **Capacity.** Concurrent transcriptions are limited only by the server's capacity. Each one briefly holds about three copies of its upload while reading and parsing (around 6 MiB at the limit) and keeps the audio until the provider answers or times out.
 - **Disconnects do not stop the provider call.** If the browser goes away while OpenAI is transcribing, the call continues until it finishes or times out (and is still billed).
+
+### Dictation in the web interface (voice V3, disabled by default)
+
+With `VOICE_TRANSCRIPTION_ENABLED=true`, the page offers a **Dictate** button next to **Ask agent**. It records one short question with the browser's microphone, sends it to `POST /api/voice/transcribe`, and adds the text to the question box. It is separate from `VOICE_ENABLED` (read answers aloud): either, both, or neither can be on. The recording code is `static/js/recorder.js`; the page only starts it and handles the result.
+
+How the page behaves:
+
+- **When it is offered.** Only in a secure context (HTTPS, or `localhost`), in a browser with microphone access (`navigator.mediaDevices`), `MediaRecorder`, and one of the recording formats the server accepts: WebM/Opus (Chrome, Edge), Ogg/Opus (Firefox), or MP4 (Safari). Such a browser requests `GET /api/voice/transcription/status` once per page load (at most 5 seconds). Only a `200` with exactly `{"stt": true}` shows the button and its privacy note, together; anything else (`404`, an error, a timeout, another body) leaves both hidden without a message. Other browsers, and plain-HTTP addresses other than localhost, make no request and show nothing.
+- **Privacy note.** Shown with the button, before any recording can start: "Dictation sends your recording to OpenAI for transcription. This app doesn't store the audio. The text is added to your question for you to review; it isn't sent automatically." Recordings are processed by OpenAI under your account's data terms; this application makes no statement about what OpenAI retains.
+- **Permission.** The browser asks for microphone permission only when **Dictate** is selected, never on page load. If access is blocked, the page says how to allow it, and does not ask again until **Dictate** is selected again.
+- **Recording.** While recording, the button reads **Stop dictation**; selecting it ends the recording and starts the transcription (the button then reads **Cancel transcription**). Recording also stops by itself after 60 seconds, or when the audio reaches about 1.9 MiB, and is then transcribed. Audio over 2 MiB is never uploaded, and an upload that takes longer than 45 seconds is abandoned. The microphone is released as soon as recording ends, on every path, so the browser's "microphone in use" indicator turns off.
+- **The transcript.** Added to the end of the question box (after a space when needed), so typed text is kept. It is **never sent automatically**: review it, then send it yourself. If the question would become longer than 3,000 characters, the transcript is not added (nothing is cut short) and the page says why. Failures show a short message (for example, microphone blocked, no speech recognised, transcription unavailable). A `404` from the transcription endpoint (dictation was turned off after the page loaded) hides the button.
+- **Cancelling.** Selecting the button while waiting for permission or while transcribing, the Escape key (after closing an open dialog), sending a question, **New chat**, and leaving the page each end dictation: the microphone is released, an upload in progress is aborted, and a result that arrives later is ignored. Sending a question discards a recording or transcription that is still in progress.
+- **Read aloud, streaming, and sessions.** Starting dictation stops speech, and answers are not read aloud while dictation is active (see [Read answers aloud](#read-answers-aloud-voice-v1-disabled-by-default)). Streaming and sessions are unaffected: the upload never carries the session token (`X-Session-ID`) and never calls the chat.
+
+The status endpoint:
+
+| Request | Disabled (default) | Enabled |
+| ------- | ------------------ | ------- |
+| `GET /api/voice/transcription/status` | `404` with `{"detail": "Not Found"}`, the same as an unknown route | `200` with exactly `{"stt": true}` and `Cache-Control: no-store` |
+
+It reads only `VOICE_TRANSCRIPTION_ENABLED`: it does not report whether `OPENAI_API_KEY` is set, and makes no external call, audit record, or storage change. Other methods on the path return FastAPI's standard `405`, also while dictation is disabled. `GET /api/voice/status` (read aloud) is unchanged and independent of it.
+
+Limitations:
+
+- **No authentication or rate limit.** As described for `POST /api/voice/transcribe` above, anyone who can reach the server can send recordings and spend OpenAI credit. Do not enable dictation on a reachable server without authentication and a rate limit in front of it.
+- **One extra request per page load.** While dictation is disabled, each page load in a browser that can record securely still makes one `GET /api/voice/transcription/status` request that returns `404`. `static/js/recorder.js` is loaded on every page (it does nothing until dictation is offered and used).
+- **A missing API key is reported only on use.** With dictation enabled but `OPENAI_API_KEY` unset, the button is offered, and each attempt fails with "Transcription is temporarily unavailable."
+- **Manual browser checks are partial.** On macOS at `http://localhost` (2026-11-18): a full dictation worked in Chrome, Safari's M4A (MP4) recording was accepted (`200`), and VoiceOver announced the dictation states. Not yet verified by hand: the cancellation paths, keyboard-only use, the four `VOICE_ENABLED`/`VOICE_TRANSCRIPTION_ENABLED` combinations, phone layouts, Firefox, iOS Safari, and HTTPS deployments.
 
 ---
 

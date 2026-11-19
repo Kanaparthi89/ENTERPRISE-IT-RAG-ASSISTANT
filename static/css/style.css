@@ -1236,6 +1236,95 @@ textarea:focus-visible,
   outline-offset: 2px;
 }
 
+/* Voice V3b: "Dictate" button, privacy note and dictation status line */
+.dictate-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 0 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  color: var(--muted-dark);
+  background: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 160ms ease, color 160ms ease;
+}
+
+.dictate-btn:hover:not(:disabled) {
+  color: var(--primary);
+  border-color: #cfcfff;
+}
+
+.dictate-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* .dictate-btn sets display, which would override the hidden attribute. */
+.dictate-btn[hidden],
+.dictation-note[hidden] {
+  display: none;
+}
+
+.dictate-btn[aria-busy="true"] {
+  cursor: progress;
+}
+
+/* Recording: a red dot before the label (the label itself also changes). */
+.dictate-btn[data-state="recording"] {
+  color: #b42318;
+  border-color: #f3b4ad;
+  background: #fff5f4;
+}
+
+.dictate-btn[data-state="recording"]::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: dictation-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes dictation-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.dictation-note {
+  margin: 6px 2px 0;
+  color: var(--muted-dark);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* Always rendered (a live region), empty and zero-height when there is no message. */
+.dictation-status {
+  margin: 0 2px;
+  color: var(--muted-dark);
+  font-size: 10px;
+}
+
+.dictation-status:not(:empty) {
+  margin-top: 6px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dictate-btn[data-state="recording"]::before {
+    animation: none;
+  }
+}
+
 .disclaimer {
   margin: 10px 0 0;
   color: #a0a7b5;
@@ -2158,6 +2247,11 @@ textarea:focus-visible,
   .send-btn {
     min-height: 35px;
     padding: 0 11px;
+  }
+
+  .dictate-btn {
+    min-height: 35px;
+    padding: 0 10px;
   }
 
   .trace-panel {

@@ -739,6 +739,23 @@ async def voice_transcribe(request: Request, response: Response):
     return {"text": text}
 
 
+@router.get("/voice/transcription/status")
+async def voice_transcription_status(response: Response):
+    """Whether dictation may be offered (Voice V3b).
+
+    404 (the same body as an unknown route) while
+    ``VOICE_TRANSCRIPTION_ENABLED`` is off, the default. When on:
+    ``{"stt": true}``, meaning the page may offer dictation through
+    ``POST /api/voice/transcribe``. Separate from ``GET /api/voice/status``
+    (``VOICE_ENABLED``), whose contract is unchanged. Reads one setting and
+    nothing else: no provider, credentials, storage or audit.
+    """
+    if not settings.voice_transcription_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+    response.headers["Cache-Control"] = "no-store"  # the flag can change on restart
+    return {"stt": True}
+
+
 @router.post("/ingest")
 async def ingest(
     file: UploadFile = File(...),

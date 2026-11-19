@@ -30,6 +30,9 @@
     voiceToggle: $("#voiceToggle"),
     voiceStop: $("#voiceStop"),
     voiceStatus: $("#voiceStatus"),
+    dictateBtn: $("#dictateBtn"),
+    dictationNote: $("#dictationNote"),
+    dictationStatus: $("#dictationStatus"),
   };
 
   const MAX_FILE_SIZE = 10 * 1024 * 1024;
@@ -41,6 +44,9 @@
   // Voice V1 controller; null unless the browser can speak and the server
   // reports {"tts": true}. Every hook below is a no-op while it is null.
   let voice = null;
+  // Voice V3b dictation controller; null unless the browser can record
+  // securely and the server reports {"stt": true}. Hooks are no-ops while null.
+  let dictation = null;
 
   function getText(value, fallback = "") {
     return typeof value === "string" && value.trim()
@@ -487,6 +493,8 @@
 
     // A new question silences the previous answer (speech only; never the chat).
     voice?.cancel();
+    // ...and ends a dictation in progress; its transcript is discarded.
+    dictation?.cancel({ announce: true });
 
     isChatting = true;
 
@@ -875,6 +883,7 @@
   window.addEventListener("pagehide", () => {
     pageAbort.abort();
     voice?.cancel(); // speech never outlives the page
+    dictation?.cancel(); // nor does the microphone, or an upload in progress
   });
   window.addEventListener("pageshow", (event) => {
     if (event.persisted) pageAbort = new AbortController();
@@ -955,7 +964,16 @@
   }
 
   /** One bounded GET /api/voice/status; any failure means "not offered". */
-  async function probeVoiceStatus() {
+  function probeVoiceStatus() {
+    return probeFeatureStatus(VOICE_STATUS_URL, isVoiceStatus);
+  }
+
+  /**
+   * One bounded, abortable GET of a feature status URL (5 seconds; aborted
+   * when the page is left). Offered only when ``accept`` approves the body;
+   * any failure means "not offered".
+   */
+  async function probeFeatureStatus(url, accept) {
     const controller = new AbortController();
     const page = pageAbort.signal;
     const abort = () => controller.abort();
@@ -964,7 +982,7 @@
     else page.addEventListener("abort", abort);
 
     try {
-      const response = await window.fetch(VOICE_STATUS_URL, {
+      const response = await window.fetch(url, {
         method: "GET",
         headers: { Accept: "application/json" },
         cache: "no-store",
@@ -972,7 +990,7 @@
         signal: controller.signal,
       });
       if (response.status !== 200) return false;
-      return isVoiceStatus(await response.json());
+      return accept(await response.json());
     } catch {
       return false; // network error, timeout, page left, or a body that is not JSON
     } finally {
@@ -1062,7 +1080,8 @@
           return;
         }
         setEnabled(true);
-        speaker.speak(VOICE_CONFIRMATION).then(report);
+        // Never speak into a recording (Voice V3b).
+        if (!dictation?.isActive()) speaker.speak(VOICE_CONFIRMATION).then(report);
       });
     }
 
@@ -1095,6 +1114,7 @@
       /** Speak a completed answer: only for the latest question, and only once. */
       answerCompleted(questionTurn, answer) {
         if (!enabled || questionTurn !== turn || spokenTurn === questionTurn) return;
+        if (dictation?.isActive()) return; // never speak into a recording (Voice V3b)
         spokenTurn = questionTurn;
         setStatus(""); // an earlier "couldn't read" message no longer applies
         speaker.speak(answer).then(report);
@@ -1112,6 +1132,185 @@
     });
   }
 
+  // -------------------------------------------------------------------
+  // Voice V3b: microphone dictation
+  //
+  // Records one short clip with static/js/recorder.js (which alone owns the
+  // microphone, the audio and the upload) and adds the transcript to the
+  // question box for the user to review: never sent automatically. Offered
+  // only in a secure context that can record, and only when
+  // GET /api/voice/transcription/status answers exactly {"stt": true}
+  // (VOICE_TRANSCRIPTION_ENABLED, off by default). The button and the
+  // privacy note are shown together, before any recording can start.
+  // -------------------------------------------------------------------
+
+  const DICTATION_STATUS_URL = "/api/voice/transcription/status";
+  const QUESTION_MAX_LENGTH = 3000;
+  const DICTATION_LABEL = {
+    idle: "Dictate",
+    requesting: "Cancel dictation",
+    recording: "Stop dictation",
+    uploading: "Cancel transcription",
+  };
+  const DICTATION_TEXT = {
+    requesting: "Allow microphone access to dictate.",
+    recording: "Recording… Select Stop dictation to finish (up to 60 seconds).",
+    uploading: "Transcribing…",
+    added: "Transcript added to your question. Review it before you send it.",
+    tooLong:
+      "The transcript wasn't added: your question would be longer than 3,000 characters.",
+  };
+
+  /** Only exactly {"stt": true} offers dictation. */
+  function isDictationStatus(body) {
+    return (
+      body !== null &&
+      typeof body === "object" &&
+      !Array.isArray(body) &&
+      Object.keys(body).length === 1 &&
+      body.stt === true
+    );
+  }
+
+  function dictationIsPossible() {
+    return Boolean(
+      window.BluePeakRecorder &&
+        window.isSecureContext === true &&
+        window.navigator?.mediaDevices &&
+        typeof window.MediaRecorder === "function" &&
+        typeof window.fetch === "function" &&
+        el.dictateBtn &&
+        el.dictationNote &&
+        el.dictationStatus &&
+        el.question
+    );
+  }
+
+  function createDictationController(recorder) {
+    const { STATES, ERROR_MESSAGES } = window.BluePeakRecorder;
+    const label = $(".dictate-label", el.dictateBtn);
+    // Each session gets a number; an outcome whose number is no longer the
+    // current one (cancelled, reset, page left) is ignored.
+    let session = 0;
+
+    function setStatus(text) {
+      el.dictationStatus.textContent = text;
+    }
+
+    /** Mirrors the recorder's state on the button (the outcome sets the final message). */
+    function showState(state) {
+      el.dictateBtn.dataset.state = state;
+      if (label) label.textContent = DICTATION_LABEL[state] || DICTATION_LABEL.idle;
+      if (state === STATES.REQUESTING || state === STATES.UPLOADING) {
+        el.dictateBtn.setAttribute("aria-busy", "true");
+      } else {
+        el.dictateBtn.removeAttribute("aria-busy");
+      }
+      if (DICTATION_TEXT[state]) setStatus(DICTATION_TEXT[state]);
+    }
+
+    function hide() {
+      const hadFocus = document.activeElement === el.dictateBtn;
+      el.dictateBtn.hidden = true;
+      el.dictationNote.hidden = true;
+      if (hadFocus) el.question.focus();
+    }
+
+    /** Appends to what is already there; never submits, never truncates. */
+    function insertTranscript(text) {
+      const current = el.question.value;
+      const separator = current === "" || /\s$/.test(current) ? "" : " ";
+      const combined = current + separator + text;
+
+      if (combined.length > QUESTION_MAX_LENGTH) {
+        setStatus(DICTATION_TEXT.tooLong);
+        el.question.focus();
+        return;
+      }
+      el.question.value = combined;
+      updateCharacterCount();
+      setStatus(DICTATION_TEXT.added);
+      el.question.focus();
+      if (typeof el.question.setSelectionRange === "function") {
+        el.question.setSelectionRange(combined.length, combined.length);
+      }
+    }
+
+    function finish(id, outcome) {
+      if (id !== session) return; // cancelled, reset or page left meanwhile
+      if (outcome.ok) {
+        insertTranscript(outcome.text);
+        return;
+      }
+      setStatus(ERROR_MESSAGES[outcome.code] || ERROR_MESSAGES.transcription_failed);
+      // Switched off on the server since the page loaded: stop offering it.
+      if (outcome.code === "transcription_disabled") hide();
+    }
+
+    function begin(event) {
+      session += 1;
+      const id = session;
+      setStatus("");
+      // Synchronously inside the click: the recorder asks for the microphone
+      // before anything is awaited, and only for a trusted (real user) click.
+      const outcome = recorder.start(event);
+      // A session started: stop read-aloud before any audio is captured.
+      if (recorder.state !== STATES.IDLE) voice?.cancel();
+      outcome.then((result) => finish(id, result));
+    }
+
+    /** Ends a session at once (microphone released, upload aborted); its outcome is ignored. */
+    function cancel({ announce = false } = {}) {
+      if (recorder.state === STATES.IDLE) return;
+      session += 1;
+      recorder.cancel();
+      setStatus(announce ? ERROR_MESSAGES.cancelled : "");
+    }
+
+    function onClick(event) {
+      if (recorder.state === STATES.IDLE) begin(event);
+      else if (recorder.state === STATES.RECORDING) recorder.stop(); // then transcribe
+      else cancel({ announce: true }); // waiting for permission, or uploading
+    }
+
+    return {
+      start() {
+        el.dictationNote.hidden = false; // the disclosure, before any recording
+        el.dictateBtn.hidden = false;
+        el.dictateBtn.addEventListener("click", onClick);
+      },
+      showState,
+      cancel,
+      isActive() {
+        return recorder.state !== STATES.IDLE;
+      },
+    };
+  }
+
+  function startDictation() {
+    if (!dictationIsPossible()) return; // nothing is requested or shown
+
+    let controller = null;
+    const recorder = window.BluePeakRecorder.createRecorder({
+      // Browser objects are passed in; recorder.js alone uses them.
+      mediaDevices: window.navigator.mediaDevices,
+      MediaRecorder: window.MediaRecorder,
+      isSecureContext: window.isSecureContext === true,
+      fetchImpl: (url, init) => window.fetch(url, init),
+      setTimeout: (fn, ms) => window.setTimeout(fn, ms),
+      clearTimeout: (id) => window.clearTimeout(id),
+      onStateChange: (state) => controller?.showState(state),
+    });
+    if (!recorder.supported || !window.BluePeakRecorder.chooseFormat(window.MediaRecorder)) return;
+
+    probeFeatureStatus(DICTATION_STATUS_URL, isDictationStatus).then((offered) => {
+      if (!offered) return;
+      controller = createDictationController(recorder);
+      dictation = controller;
+      controller.start();
+    });
+  }
+
   function clearSession() {
     hideSessionAlert();
     hideSessionNotice();
@@ -1126,8 +1325,10 @@
   }
 
   function resetConversation(options = {}) {
-    // New chat always silences speech, even while a question blocks the reset.
+    // New chat always silences speech and ends dictation, even while a
+    // question blocks the reset.
     voice?.cancel();
+    dictation?.cancel();
     if (isChatting) return;
 
     const keptQuestion = options.keepQuestion ? el.question.value : "";
@@ -1437,6 +1638,8 @@
 
       if (modalOpen) {
         closeUploadModal(); // an open dialog comes first; speech continues
+      } else if (dictation?.isActive()) {
+        dictation.cancel({ announce: true }); // then dictation
       } else if (voice?.isSpeaking()) {
         voice.cancel();
       }
@@ -1447,4 +1650,5 @@
   updateCharacterCount();
   resetTrace();
   startVoice();
+  startDictation();
 })();

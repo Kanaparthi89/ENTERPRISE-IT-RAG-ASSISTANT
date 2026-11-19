@@ -370,6 +370,21 @@
               </div>
 
               <div class="composer-actions">
+                <!-- Voice V3b: shown, with #dictationNote, only when dictation is confirmed available. -->
+                <button
+                  class="dictate-btn"
+                  type="button"
+                  id="dictateBtn"
+                  data-state="idle"
+                  aria-describedby="dictationNote"
+                  hidden
+                >
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Zm-6 9a6 6 0 0 0 12 0M12 18v3"
+                      stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  <span class="dictate-label">Dictate</span>
+                </button>
                 <span class="character-count" id="characterCount">0 / 3000</span>
                 <button type="submit" class="send-btn" id="sendBtn">
                   <span>Ask agent</span>
@@ -381,6 +396,13 @@
               </div>
             </div>
           </form>
+
+          <!-- Voice V3b: the privacy note is shown together with #dictateBtn, before any recording. -->
+          <p id="dictationNote" class="dictation-note" hidden>
+            Dictation sends your recording to OpenAI for transcription. This app doesn't store the audio.
+            The text is added to your question for you to review; it isn't sent automatically.
+          </p>
+          <p id="dictationStatus" class="dictation-status" role="status" aria-live="polite"></p>
 
           <p class="disclaimer">
             AI-generated responses may need verification. Follow your organization's security policies.
@@ -560,6 +582,7 @@
   <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
   <script src="/static/js/chat-stream.js"></script>
   <script src="/static/js/voice.js"></script>
+  <script src="/static/js/recorder.js"></script>
   <script src="/static/js/app.js"></script>
 </body>
 </html>
