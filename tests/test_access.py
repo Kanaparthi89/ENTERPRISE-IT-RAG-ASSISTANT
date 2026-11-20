@@ -707,20 +707,23 @@ def test_no_code_cookie_secret_id_or_address_is_logged(client, access_on, monkey
 
 
 # ---------------------------------------------------------------------------
-# Existing routes are unchanged (no enforcement in S1-3)
+# Public routes are unchanged; paid AI routes need the full configuration (S1-5)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_existing_routes_do_not_require_access(client, monkeypatch, settings, clock, enabled):
-    from tests.test_chat_api import workflow_result
-
+def test_public_routes_stay_open_and_chat_is_refused_without_quotas(client, monkeypatch, settings, clock, enabled):
+    # S1-3 enforced nothing; S1-5 refuses paid AI routes unless access, quotas
+    # and PUBLIC_ORIGINS are all configured (tests/test_access_enforcement.py).
+    calls = []
     monkeypatch.setattr(settings, "access_enabled", enabled)
     monkeypatch.setattr(settings, "access_code_hashes", entry("alice", CODE_ALICE))
     monkeypatch.setattr(settings, "access_cookie_secret", SecretStr(SECRET))
-    monkeypatch.setattr(routes, "ask", lambda question: workflow_result())
+    monkeypatch.setattr(routes, "ask", lambda question, history=None: calls.append(question))
 
     assert client.get("/api/health").status_code == 200
-    assert client.post("/api/chat", json={"question": "How do I connect to the VPN?"}).status_code == 200
+    chat = client.post("/api/chat", json={"question": "How do I connect to the VPN?"})
+    assert chat.status_code == 503 and chat.json()["detail"]["code"] == "access_unavailable"
+    assert calls == []
     assert client.post("/api/chat/stream", json={"question": "VPN?"}).json() == NOT_FOUND
     assert client.post("/api/sessions", json={}).status_code == 404
     assert client.get("/api/voice/status").status_code == 404

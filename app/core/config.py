@@ -123,8 +123,10 @@ class Settings(BaseSettings):
     admin_api_key: SecretStr = SecretStr("")
 
     # Security S1-3: access codes for live AI features (Architecture C).
-    # Disabled by default. Enabling it exposes /api/access only: no other
-    # route requires access yet. When enabled, every setting below must be
+    # Disabled by default. Security S1-5: every paid AI route (chat,
+    # streaming, sessions, transcription) requires a verified access cookie,
+    # so with access disabled those routes answer 503 (read-only mode) and
+    # only the page, static files and status routes work. When enabled, every setting below must be
     # valid or the application refuses to start (app/services/access.py).
     # Codes are stored as SHA-256 digests only: "id:digest" or
     # "id:digest:YYYY-MM-DD", comma-separated. The cookie secret signs access
@@ -145,6 +147,12 @@ class Settings(BaseSettings):
     access_max_failed_attempts: int = Field(default=5, ge=1, le=100)
     access_failure_window_seconds: float = Field(default=900.0, ge=60, le=86400)
     access_max_global_failed_attempts: int = Field(default=200, ge=1, le=100000)
+    # Security S1-5: the exact browser origins (scheme://host[:port],
+    # comma-separated, at most 10, https in production) that may call the
+    # paid AI routes. Cross-site checks compare against this list only, never
+    # against the request's Host or forwarded headers. Empty (the default):
+    # paid AI routes answer 503. A malformed value refuses to start.
+    public_origins: str = ""
 
     # Security S1-4b: chat quotas (app/services/quota.py). Disabled by default.
     # When enabled, every chat route (stateless and session /api/chat and
@@ -265,6 +273,17 @@ class Settings(BaseSettings):
                 AccessConfig.from_settings(self)
             except AccessConfigError as exc:
                 raise ValueError(str(exc)) from None
+        return self
+
+    @model_validator(mode="after")
+    def validate_public_origins(self) -> "Settings":
+        """A set PUBLIC_ORIGINS must be exact origins; empty leaves paid AI routes off (S1-5)."""
+        from app.services.access_policy import PublicOriginsError, public_origins
+
+        try:
+            public_origins(self)
+        except PublicOriginsError as exc:
+            raise ValueError(str(exc)) from None
         return self
 
     @model_validator(mode="after")

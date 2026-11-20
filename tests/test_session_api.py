@@ -192,8 +192,9 @@ def test_cross_origin_form_style_posts_never_create_a_session(enabled, entry, co
 
     response = TestClient(application).post("/api/sessions", headers=headers, content=body)
 
-    assert response.status_code == 415
-    assert detail(response) == {"code": "unsupported_media_type", "message": "Use application/json."}
+    # S1-5: the origin is checked (by the route class) before the content type and body.
+    assert response.status_code == 403
+    assert detail(response) == {"code": "origin_not_allowed", "message": "Request origin not allowed."}
     assert count_session_rows(enabled.session_db_path) == 0
 
 
@@ -207,6 +208,8 @@ def test_cross_origin_form_style_posts_never_create_a_session(enabled, entry, co
         {"Origin": "null"},
         {"Origin": "http://testserver:8081"},  # same host, other port
         {"Origin": "javascript:alert(1)"},
+        {"Sec-Fetch-Site": "none"},  # S1-5: only same-origin
+        {"Origin": "https://testserver", "Host": "testserver:443"},  # S1-5: Host is never trusted
     ],
 )
 def test_cross_origin_json_requests_are_refused(enabled, entry, headers):
@@ -223,14 +226,30 @@ def test_cross_origin_json_requests_are_refused(enabled, entry, headers):
     "headers",
     [
         {"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"},
-        {"Sec-Fetch-Site": "none"},
-        {},  # curl-style: neither header
-        {"Origin": "https://testserver", "Host": "testserver:443"},  # default ports normalised
-        {"Origin": "https://TestServer"},  # host comparison ignores case
+        {"Sec-Fetch-Site": "same-origin"},
+        # S1-5: compared with PUBLIC_ORIGINS (http://testserver here), never with Host.
+        {"Origin": "http://testserver:80"},  # default ports normalised
+        {"Origin": "http://TestServer"},  # host comparison ignores case
     ],
 )
-def test_same_origin_and_non_browser_requests_are_allowed(client, enabled, headers):
+def test_same_origin_requests_are_allowed(client, enabled, headers):
     response = client.post("/api/sessions", headers={**JSON, **headers}, content=b"{}")
+
+    assert response.status_code == 201
+
+
+def test_legacy_shim_only_a_request_without_origin_headers_creates_a_session(client, enabled):
+    """SHIM-ONLY behaviour, not production: see tests/conftest.py (legacy_access_compat).
+
+    The shim lets this module's header-less test clients through. In
+    production, a request with neither Origin nor Sec-Fetch-Site is refused
+    with 403 before the body is read:
+    tests/test_access_enforcement.py::test_session_creation_without_origin_headers_is_refused_in_production.
+    """
+    from app.services import access_policy
+
+    assert access_policy.origin_allowed.__module__ == "tests.conftest"  # the shim is what allows it
+    response = client.post("/api/sessions", headers=JSON, content=b"{}")
 
     assert response.status_code == 201
 
@@ -284,16 +303,19 @@ def test_other_bodies_get_415_and_never_touch_storage(enabled, no_session_storag
     assert not enabled.session_db_path.exists()  # no session, and the database was never opened
 
 
-def test_body_is_checked_before_the_origin_checks(enabled, no_session_storage):
-    """Design order: content type and body (415), then Sec-Fetch-Site and Origin (403)."""
+def test_the_origin_is_checked_before_the_body(enabled, no_session_storage):
+    """S1-5 order: access and the origin (403, by the route class), then content type and body (415)."""
     client = TestClient(app.main.app)
     bad_body_cross_origin = client.post(
         "/api/sessions", headers={**JSON, "Origin": "https://evil.example"}, content=b'{"a": 1}')
     good_body_cross_origin = client.post(
         "/api/sessions", headers={**JSON, "Origin": "https://evil.example"}, content=b"{}")
+    bad_body_same_origin = client.post(
+        "/api/sessions", headers={**JSON, "Origin": "http://testserver"}, content=b'{"a": 1}')
 
-    assert bad_body_cross_origin.status_code == 415
+    assert bad_body_cross_origin.status_code == 403
     assert good_body_cross_origin.status_code == 403
+    assert bad_body_same_origin.status_code == 415
     assert not enabled.session_db_path.exists()
 
 

@@ -24,6 +24,7 @@ from app.rag import cancellation
 from app.rag.workflow import ask, history_window
 from app.rag.vectorstore import add_documents
 from app.services import access as access_service
+from app.services import access_policy
 from app.services import quota as quota_service
 from app.services import quota_runtime
 from app.services import sessions as session_service
@@ -248,23 +249,16 @@ def _is_empty_json_body(body: bytes | None) -> bool:
 
 
 async def _check_session_creation_request(request: Request) -> None:
-    """Block cross-origin forms and scripts from creating sessions (§14.3).
+    """Session creation accepts only an empty body or ``{}`` as JSON (§14.3): else 415.
 
-    A form can send a simple POST cross-origin without a preflight; CORS only
-    hides the response. In design order: content type and body (415), then
-    Sec-Fetch-Site and Origin (403). All checked before any database access.
+    Checked before any database access. Access and the origin (S1-5) were
+    already checked by the route class, before this reads the body.
     """
     media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if media_type != "application/json":
         raise _session_error("unsupported_media_type")
     if not _is_empty_json_body(await _read_session_create_body(request)):
         raise _session_error("unsupported_media_type")
-    fetch_site = request.headers.get("sec-fetch-site")
-    if fetch_site is not None and fetch_site.strip().lower() not in ("same-origin", "none"):
-        raise _session_error("origin_not_allowed")
-    origin = request.headers.get("origin")
-    if origin is not None and not _origin_matches_host(origin, request.headers.get("host", "")):
-        raise _session_error("origin_not_allowed")
 
 
 def _iso_utc(timestamp: float) -> str:
@@ -367,24 +361,47 @@ QUOTA_UNAVAILABLE_MESSAGE = "Questions are temporarily unavailable. Please try a
 
 
 def _quota_identity(request: Request | None) -> tuple[str, str | None]:
-    """(identity, log pseudonym): a verified access code's id, else the shared anonymous bucket.
+    """(identity, log pseudonym) from the request's verified access decision (S1-5).
 
-    Only an access cookie that verifies identifies a code; nothing else the
-    client sends is trusted. Invalid, expired, revoked or replaced cookies,
-    and every request while access codes are disabled, share ANONYMOUS.
+    The route class decided access before the body was read and stored the
+    decision on ``request.state.access``; the cookie is never verified a
+    second time here. There is no anonymous identity for a paid route: a
+    missing, refused or malformed decision fails closed (503).
     """
-    if request is None or not settings.access_enabled:
-        return quota_service.ANONYMOUS, None
-    try:
-        config = access_service.AccessConfig.from_settings(settings)
-    except access_service.AccessConfigError:
-        return quota_service.ANONYMOUS, None  # the stricter, shared bucket
-    grant = access_service.verify_cookie(
-        config, request.cookies.get(config.cookie_name), access_service.wall_clock()
-    )
-    if grant is None:
-        return quota_service.ANONYMOUS, None
-    return grant.code_id, access_service.code_reference(config, grant.code_id)
+    state = getattr(request, "state", None) if request is not None else None
+    decision = getattr(state, "access", None) if state is not None else None
+    if not isinstance(decision, access_policy.AccessDecision) or not decision.granted:
+        logger.error("Paid request without a verified access decision: refused.")
+        raise _paid_access_error("access_unavailable")
+    identity = decision.grant.code_id
+    if (
+        not isinstance(identity, str)
+        or identity == quota_service.ANONYMOUS
+        or not access_service.CODE_ID_PATTERN.fullmatch(identity)
+    ):
+        logger.error("Paid request with an invalid access identity: refused.")
+        raise _paid_access_error("access_unavailable")
+    return identity, decision.code_ref
+
+
+def _require_paid_configuration() -> None:
+    """Defence in depth while quotas are off: paid work needs the full configuration (503)."""
+    problem = access_policy.configuration_problem(settings)
+    if problem is not None:
+        logger.error("Paid AI request refused: read-only mode (%s).", problem)
+        raise _paid_access_error("access_unavailable")
+
+
+def _recheck_paid_request(request: Request | None) -> None:
+    """Defence in depth (S1-5): recheck before a handler allocates anything (503).
+
+    The route class already decided access before the body was read; this
+    re-validates, without verifying the cookie again, what may have changed
+    since: the configuration (access, quotas and PUBLIC_ORIGINS, all enabled
+    and valid) and the verified identity on ``request.state.access``.
+    """
+    _require_paid_configuration()
+    _quota_identity(request)
 
 
 def _quota_error(status_code: int, code: str, message: str, retry_after: int) -> HTTPException:
@@ -401,10 +418,11 @@ def _admit_chat(request: Request | None, request_id: str) -> "quota_service.Tick
     Call it before any provider call. A refusal reserves nothing.
     """
     if not settings.quota_enabled:
+        _require_paid_configuration()  # quotas off: always refused outside the test shim
         return None
+    identity, code_ref = _quota_identity(request)  # fails closed without a verified grant
     busy = settings.quota_busy_retry_after_seconds
     try:
-        identity, code_ref = _quota_identity(request)
         result = quota_runtime.get_quota_engine(settings).admit(quota_service.CHAT, identity)
     except Exception as exc:  # noqa: BLE001 - fail closed; logged by class only
         logger.error("Chat quota unavailable for request_id=%s (%s).", request_id, type(exc).__name__)
@@ -522,7 +540,104 @@ def _chat_with_session(question: str, request_id: str, token: str, request: Requ
             _release_ticket(ticket)  # ask() has returned (or never ran): no provider work is left
 
 
-@router.post("/chat")
+# ---------------------------------------------------------------------------
+# Security S1-5: verified access on every paid AI route
+#
+# Each paid route uses a subclass of AccessEnforcedRoute, which runs before
+# FastAPI reads or parses the body (FastAPI parses it before dependencies,
+# so a dependency would be too late). In order: the route's feature flag
+# (404), access (503 read-only mode / 401), the same-origin check (403) and,
+# for JSON routes, the content type (415). Only then does the handler run:
+# body validation (422), session and stream capacity checks, the quota and
+# the provider. The decision is stored on ``request.state.access`` for the
+# quota identity. There is no bypass of any kind (address, Host, headers,
+# APP_ENV); see app/services/access_policy.py.
+# ---------------------------------------------------------------------------
+
+PAID_ACCESS_ERRORS = {
+    "access_required": (401, "Access required. Enter your access code to use this feature."),
+    "access_unavailable": (503, "This feature is not available right now."),
+    "origin_not_allowed": (403, "Request origin not allowed."),
+    "unsupported_media_type": (415, "Use application/json."),
+}
+ACCESS_UNAVAILABLE_RETRY_AFTER_SECONDS = 60
+
+
+def _paid_access_error(code: str) -> HTTPException:
+    status_code, message = PAID_ACCESS_ERRORS[code]
+    headers = dict(NO_STORE)
+    if code == "access_required":
+        headers["WWW-Authenticate"] = 'AccessCode realm="BluePeak AI Desk"'
+    elif code == "access_unavailable":
+        headers["Retry-After"] = str(ACCESS_UNAVAILABLE_RETRY_AFTER_SECONDS)
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+        headers=headers,
+    )
+
+
+def _authorize_paid_request(request: Request, *, json_body: bool) -> None:
+    """Access, then origin, then (for JSON routes) content type; raises 503/401/403/415."""
+    decision = access_policy.evaluate(request, settings)
+    request.state.access = decision
+    if decision.outcome == access_policy.UNAVAILABLE:
+        logger.error("Paid AI request refused: read-only mode (%s).", decision.reason)
+        raise _paid_access_error("access_unavailable")
+    if not decision.granted:
+        logger.info("Paid AI request refused: access required (%s).", decision.reason)
+        raise _paid_access_error("access_required")
+    try:
+        origins = access_policy.public_origins(settings)
+    except access_policy.PublicOriginsError:
+        logger.error("Paid AI request refused: PUBLIC_ORIGINS is invalid.")
+        raise _paid_access_error("access_unavailable") from None
+    if not access_policy.origin_allowed(request, origins):
+        logger.warning("Paid AI request refused: origin not allowed (code_ref=%s).", decision.code_ref)
+        raise _paid_access_error("origin_not_allowed")
+    if json_body and not access_policy.is_json_content_type(request):
+        raise _paid_access_error("unsupported_media_type")
+
+
+class AccessEnforcedRoute(APIRoute):
+    """A paid AI route: flag, access, origin and content type before the body is read.
+
+    Subclasses set ``feature_flag`` (a settings attribute; None if the route
+    has none) and ``json_body`` (True to require ``application/json``).
+    """
+
+    feature_flag: str | None = None
+    json_body: bool = False
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+        feature_flag, json_body = self.feature_flag, self.json_body
+
+        async def route_handler(request):
+            if feature_flag is not None and getattr(settings, feature_flag) is not True:
+                raise HTTPException(status_code=404, detail="Not Found")
+            _authorize_paid_request(request, json_body=json_body)
+            return await handler(request)
+
+        return route_handler
+
+
+class ChatRoute(AccessEnforcedRoute):
+    json_body = True
+
+
+class SessionCreateRoute(AccessEnforcedRoute):
+    feature_flag = "sessions_enabled"  # its body rule (empty or {}) is checked by the handler
+
+
+class SessionDeleteRoute(AccessEnforcedRoute):
+    pass  # no flag (204 while sessions are off, as before) and no body
+
+
+class TranscriptionRoute(AccessEnforcedRoute):
+    feature_flag = "voice_transcription_enabled"  # multipart, checked by the handler
+
+
 def chat(
     payload: ChatRequest,
     session_token: str | None = Depends(_session_token),
@@ -535,6 +650,9 @@ def chat(
     """
     request_id = str(uuid4())
     question = payload.question.strip()
+
+    # S1-5: on both paths, before the session lease, quota admission or provider.
+    _recheck_paid_request(request)
 
     if session_token is not None:
         return _chat_with_session(question, request_id, session_token, request)
@@ -606,28 +724,27 @@ def _chat_stateless(question: str, request_id: str) -> dict:
         ) from exc
 
 
+# Registered with add_api_route: the route-class override is not available
+# on the @router.post decorator.
+router.add_api_route("/chat", chat, methods=["POST"], route_class_override=ChatRoute)
+
+
 def require_streaming_enabled() -> None:
     """Raise 404 while the streaming endpoint is disabled."""
     if not settings.stream_enabled:
         raise HTTPException(status_code=404, detail="Not Found")
 
 
-class StreamingFlagRoute(APIRoute):
+class StreamingFlagRoute(ChatRoute):
     """Checks the streaming flag before FastAPI reads or parses the body.
 
     A disabled endpoint answers 404 for any request body, including invalid
-    JSON. When enabled, the request goes to FastAPI's normal handler, so
-    body parsing and validation errors are unchanged.
+    JSON. When enabled, access, the origin and the content type are checked
+    (S1-5, AccessEnforcedRoute), then the request goes to FastAPI's normal
+    handler, so body parsing and validation errors are unchanged.
     """
 
-    def get_route_handler(self):
-        handler = super().get_route_handler()
-
-        async def route_handler(request):
-            require_streaming_enabled()
-            return await handler(request)
-
-        return route_handler
+    feature_flag = "stream_enabled"
 
 
 async def _chat_stream_with_session(question: str, request_id: str, token: str, request: Request | None = None):
@@ -712,6 +829,9 @@ async def chat_stream(
     request_id = str(uuid4())
     question = payload.question
 
+    # S1-5: before any stream capacity, session lease, quota or worker, on both paths.
+    _recheck_paid_request(request)
+
     if session_token is not None:
         return await _chat_stream_with_session(question, request_id, session_token, request)
 
@@ -759,7 +879,6 @@ router.add_api_route(
 )
 
 
-@router.post("/sessions", status_code=201)
 async def create_session(request: Request, response: Response):
     """Start a conversation session (design §10, §14.3).
 
@@ -769,8 +888,9 @@ async def create_session(request: Request, response: Response):
     The token is returned once, never stored or logged. The database work
     runs in a worker thread, never on the event loop.
     """
-    if not settings.sessions_enabled:
+    if not settings.sessions_enabled:  # also checked first by the route class
         raise HTTPException(status_code=404, detail="Not Found")
+    _recheck_paid_request(request)  # S1-5: before the body is read or a session created
     await _check_session_creation_request(request)
 
     runtime = session_service.get_session_runtime(settings)
@@ -788,14 +908,14 @@ async def create_session(request: Request, response: Response):
     }
 
 
-@router.delete("/sessions", status_code=204)
-def delete_session(session_token: str | None = Depends(_session_token)):
+def delete_session(session_token: str | None = Depends(_session_token), request: Request = None):
     """Clear conversation memory (design §10.1).
 
     204 for a deleted, unknown, expired or already-deleted session, and while
     sessions are disabled; 400 for a missing or malformed header; 503 if
     deletion can't be confirmed. Audit records are not affected.
     """
+    _recheck_paid_request(request)  # S1-5: before anything is deleted
     if session_token is None or not session_service.is_well_formed_token(session_token):
         raise _session_error("invalid_session_id")
     runtime = session_service.get_session_runtime(settings)
@@ -804,6 +924,14 @@ def delete_session(session_token: str | None = Depends(_session_token)):
     except session_service.SessionStoreUnavailable as exc:
         raise _session_error("session_unavailable") from exc
     return Response(status_code=204)
+
+
+router.add_api_route(
+    "/sessions", create_session, methods=["POST"], status_code=201, route_class_override=SessionCreateRoute
+)
+router.add_api_route(
+    "/sessions", delete_session, methods=["DELETE"], status_code=204, route_class_override=SessionDeleteRoute
+)
 
 
 @router.get("/voice/status")
@@ -872,8 +1000,7 @@ def _voice_error(code: str) -> HTTPException:
 
 VOICE_UPLOAD_SLOTS = 2  # uploads read, checked or transcribed at once (each up to 2 MiB in memory)
 PROVIDER_HARD_TIMEOUT_MARGIN_SECONDS = 5.0
-# One upload slot per identity (a verified access code, or the one shared
-# anonymous bucket), and VOICE_UPLOAD_SLOTS in all: no single client or
+# One upload slot per identity (a verified access code, S1-5), and VOICE_UPLOAD_SLOTS in all: no single client or
 # bucket can hold every slot, for example with stalled uploads that never
 # reach the quota. The identity is resolved before any of the body is read.
 _voice_upload_identities: set = set()
@@ -933,9 +1060,10 @@ def _admit_transcription(
     """Admit one measured recording (None while quotas are disabled); raises 413, 429 or 503.
 
     ``identity`` is the one resolved before the upload was read (a verified
-    access code, or ANONYMOUS), so the slot and the quota belong to the same identity.
+    access code; S1-5), so the slot and the quota belong to the same identity.
     """
     if not settings.quota_enabled:
+        _require_paid_configuration()  # quotas off: always refused outside the test shim
         return None
     busy = settings.quota_busy_retry_after_seconds
     try:
@@ -1014,22 +1142,6 @@ def _start_provider_task(upload, api_key: str, ticket) -> "asyncio.Task":
     return task
 
 
-def _check_voice_origin(request: Request) -> None:
-    """Refuse cross-site browser requests (a form can POST multipart without a preflight).
-
-    A browser's ``Sec-Fetch-Site`` must be ``same-origin``; an ``Origin``
-    header must match the host. Clients that send neither (curl, scripts) are
-    not browsers and are allowed: this is CSRF protection, not authentication.
-    """
-    fetch_site = request.headers.get("sec-fetch-site")
-    if fetch_site is not None and fetch_site.strip().lower() != "same-origin":
-        raise _voice_error("origin_not_allowed")
-    origin = request.headers.get("origin")
-    if origin is not None and not _origin_matches_host(origin, request.headers.get("host", "")):
-        raise _voice_error("origin_not_allowed")
-
-
-@router.post("/voice/transcribe")
 async def voice_transcribe(request: Request, response: Response):
     """Transcribe one short recording to text (Voice V2; Security S1-4c).
 
@@ -1039,7 +1151,8 @@ async def voice_transcribe(request: Request, response: Response):
     16 kHz mono 16-bit PCM WAV of at most 60 seconds (and 2 MiB). Returns
     ``{"text": "..."}``; the transcript is only returned, never stored,
     audited or sent to the chat. In order, before any of the body is read:
-    the flag (404), the origin (403), the production requirements (503),
+    the flag (404), verified access (503/401) and the origin (403), both
+    checked by the route class (S1-5), the production requirements (503),
     the content type (415), the declared length (413), the provider key
     (503) and an upload slot: one per identity, two in all (503
     ``voice_busy``). Then the bounded read
@@ -1049,9 +1162,9 @@ async def voice_transcribe(request: Request, response: Response):
     The handler takes only ``request``, so FastAPI never parses or buffers
     the body itself (``File(...)`` would spool the whole upload first).
     """
-    if not settings.voice_transcription_enabled:
+    if not settings.voice_transcription_enabled:  # also checked first by the route class
         raise HTTPException(status_code=404, detail="Not Found")
-    _check_voice_origin(request)
+    _recheck_paid_request(request)  # S1-5: before the upload slot and any body read
 
     request_id = str(uuid4())
     content_type = request.headers.get("content-type")
@@ -1065,7 +1178,7 @@ async def voice_transcribe(request: Request, response: Response):
             logger.error("Voice transcription is enabled but OPENAI_API_KEY is not set.")
             raise transcription.VoiceUploadError("transcription_unavailable")
 
-        # Only a verified access cookie identifies a code; nothing else the client sends is trusted.
+        # The verified access decision (S1-5): nothing else the client sends is trusted.
         identity, code_ref = _quota_identity(request)
         with _voice_upload_slot(identity):
             body = await transcription.read_bounded_body(request.stream())
@@ -1089,6 +1202,11 @@ async def voice_transcribe(request: Request, response: Response):
 
     response.headers["Cache-Control"] = "no-store"
     return {"text": text}
+
+
+router.add_api_route(
+    "/voice/transcribe", voice_transcribe, methods=["POST"], route_class_override=TranscriptionRoute
+)
 
 
 @router.get("/voice/transcription/status")

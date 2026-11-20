@@ -87,8 +87,10 @@ def test_enabled_endpoint_rejects_unparsable_bodies_like_api_chat(client, stream
     chat = client.post("/api/chat", content=body, headers=headers)
     response = client.post("/api/chat/stream", content=body, headers=headers)
 
-    assert response.status_code == chat.status_code == 422
-    assert response.json() == chat.json()  # same FastAPI error format
+    # S1-5: a body that isn't application/json is refused (415) before parsing.
+    expected = 422 if content_type == "application/json" else 415
+    assert response.status_code == chat.status_code == expected
+    assert response.json() == chat.json()  # same error format on both routes
     assert service.started == []
 
 

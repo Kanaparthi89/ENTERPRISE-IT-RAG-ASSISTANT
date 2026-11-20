@@ -18,7 +18,7 @@ from pydantic import SecretStr, ValidationError
 import app.main
 from app.api import routes
 from app.services import access, quota, quota_runtime, transcription
-from tests.conftest import IsolatedSettings
+from tests.conftest import LEGACY_IDENTITY, IsolatedSettings, legacy_access_request
 from tests.streaming_support import ASGIHarness
 from tests.test_quota_routes import CODE_ALICE, CODE_BOB, access_codes, quotas_on, release_calls  # noqa: F401
 from tests.test_voice_transcribe import (  # noqa: F401
@@ -174,8 +174,8 @@ async def wait_for(condition, timeout=GUARD):
 def test_an_admitted_recording_reserves_its_measured_seconds(client, stt_quotas, provider):
     response = post(client, seconds=1.5)
     assert response.status_code == 200 and response.json() == {"text": TRANSCRIPT}
-    assert usage(quota.ANONYMOUS)["daily"]["transcription"] == 1
-    assert usage(quota.ANONYMOUS)["seconds"] == 2  # ceil(1.5)
+    assert usage(LEGACY_IDENTITY)["daily"]["transcription"] == 1
+    assert usage(LEGACY_IDENTITY)["seconds"] == 2  # ceil(1.5)
     assert active() == 0
 
 
@@ -195,7 +195,7 @@ def test_rejected_audio_never_reaches_the_provider_or_the_quota(client, stt_quot
 
 def test_exactly_60_seconds_is_admitted(client, stt_quotas, provider):
     assert post(client, seconds=60.0).status_code == 200
-    assert usage(quota.ANONYMOUS)["seconds"] == 60
+    assert usage(LEGACY_IDENTITY)["seconds"] == 60
 
 
 def test_the_daily_recording_count_is_enforced(client, stt_quotas, provider, monkeypatch):
@@ -213,7 +213,7 @@ def test_the_per_code_audio_budget_is_enforced(client, stt_quotas, provider, mon
     assert post(client, seconds=59).status_code == 200  # N-1
     assert post(client, seconds=1).status_code == 200  # N: 60 s
     assert_refusal(post(client, seconds=0.5), 429, "quota_minutes_limit")  # N+1
-    assert provider.started == 2 and usage(quota.ANONYMOUS)["seconds"] == 60
+    assert provider.started == 2 and usage(LEGACY_IDENTITY)["seconds"] == 60
 
 
 def test_the_global_audio_budget_spans_codes(client, stt_quotas, provider, access_codes, monkeypatch):  # noqa: F811
@@ -234,7 +234,7 @@ def test_verified_and_anonymous_identities_are_separate(client, stt_quotas, prov
     forged = {"cookie": access_codes["alice"]["cookie"][:-2] + "AA"}
     assert_refusal(post(client, headers=forged), 429, "quota_daily_limit")  # a forged cookie is anonymous
     assert usage("alice")["daily"]["transcription"] == 1
-    assert usage(quota.ANONYMOUS)["daily"]["transcription"] == 1
+    assert usage(LEGACY_IDENTITY)["daily"]["transcription"] == 1
 
 
 def test_with_quotas_off_transcription_still_measures_and_creates_no_engine(client, stt_on, provider):
@@ -262,7 +262,7 @@ def test_with_quotas_off_transcription_still_measures_and_creates_no_engine(clie
 def test_settlement_uses_the_providers_duration_conservatively(client, stt_quotas, provider, reported, charged, anomaly):
     provider.result = SimpleNamespace(text=TRANSCRIPT) if reported is None else SimpleNamespace(text=TRANSCRIPT, duration=reported)
     assert post(client, seconds=1.5).status_code == 200
-    assert usage(quota.ANONYMOUS)["seconds"] == charged
+    assert usage(LEGACY_IDENTITY)["seconds"] == charged
     anomalies = engine().anomalies()
     assert anomalies == {key: (1 if key == anomaly else 0) for key in anomalies}
 
@@ -280,7 +280,7 @@ def test_provider_failures_keep_the_reservation_and_release_once(client, stt_quo
     provider.error = error
     response = post(client, seconds=3)
     assert response.status_code == status and response.json()["detail"]["code"] == code
-    assert usage(quota.ANONYMOUS)["seconds"] == 3 and usage(quota.ANONYMOUS)["daily"]["transcription"] == 1
+    assert usage(LEGACY_IDENTITY)["seconds"] == 3 and usage(LEGACY_IDENTITY)["daily"]["transcription"] == 1
     assert active() == 0 and len(release_calls) == 1
 
 
@@ -377,7 +377,7 @@ async def test_a_cancelled_handler_leaves_the_task_owning_the_ticket(stt_quotas,
     await wait_for(lambda: active() == 0)
     assert provider.finished == 1 and provider.cancelled == 0
     assert len(release_calls) == 1  # exactly once, from the task's completion
-    assert usage(quota.ANONYMOUS)["daily"]["transcription"] == 1  # counted, settled, not refunded
+    assert usage(LEGACY_IDENTITY)["daily"]["transcription"] == 1  # counted, settled, not refunded
 
 
 @pytest.mark.anyio
@@ -390,7 +390,7 @@ async def test_the_hard_timeout_bounds_the_provider_and_then_releases(stt_quotas
     assert provider.cancelled == 1 and provider.finished == 0
     await wait_for(lambda: active() == 0)
     assert len(release_calls) == 1
-    assert usage(quota.ANONYMOUS)["seconds"] == 2  # the reservation stands
+    assert usage(LEGACY_IDENTITY)["seconds"] == 2  # the reservation stands
 
 
 @pytest.mark.anyio
@@ -508,7 +508,10 @@ def test_production_is_rechecked_per_request_before_reading(client, stt_quotas, 
     if not complete:
         monkeypatch.setattr(stt_quotas, "quota_enabled", False)
     monkeypatch.setattr(stt_quotas, "app_env", "production")  # changed after startup
-    for headers in ({}, access_codes["alice"]):  # anonymous or verified: refused before S1-5
+    # S1-5: production needs https origins, or the route class refuses first
+    # (also 503, before reading); with them, the S1-4c guard itself is reached.
+    monkeypatch.setattr(stt_quotas, "public_origins", "https://testserver")
+    for headers in ({}, access_codes["alice"]):  # still refused in production (S1-4c guard kept)
         assert_refusal(post(client, headers=headers), 503, "transcription_unavailable", retry_after=False)
     assert reads == [] and provider.started == 0 and engine() is None
     assert "production guard" in caplog.text
@@ -599,7 +602,7 @@ async def test_two_stalled_anonymous_uploads_cannot_hold_both_slots(stt_quotas, 
     first = await stall()
     status, body = await asyncio.wait_for(raw_request(), GUARD)
     assert (status, body["detail"]["code"]) == (503, "voice_busy")  # the second anonymous upload is refused
-    assert held_identities() == {quota.ANONYMOUS}  # one slot held, one free
+    assert held_identities() == {LEGACY_IDENTITY}  # one slot held, one free
     await end(first)
 
 
@@ -632,15 +635,8 @@ async def test_two_codes_use_both_slots_and_a_third_identity_is_busy(stt_quotas,
     await end(*stalls)
 
 
-@pytest.mark.anyio
-async def test_forged_identities_share_the_anonymous_slot(stt_quotas, provider, access_codes):  # noqa: F811
-    first = await stall()
-    forged = {"cookie": access_codes["alice"]["cookie"][:-2] + "AA"}
-    for headers in (forged, {"x-quota-identity": "alice"}, {"x-forwarded-for": "203.0.113.9"}):
-        status, body = await asyncio.wait_for(raw_request(headers), GUARD)
-        assert (status, body["detail"]["code"]) == (503, "voice_busy"), headers
-    assert held_identities() == {quota.ANONYMOUS}
-    await end(first)
+# S1-5: forged identities are refused (401) before any slot is taken:
+# tests/test_access_enforcement.py.
 
 
 @pytest.mark.anyio
@@ -656,7 +652,7 @@ async def test_slots_recover_after_a_read_timeout(stt_quotas, provider, monkeypa
 @pytest.mark.anyio
 async def test_slots_recover_after_cancellation(stt_quotas, provider):
     stalled = await stall()
-    assert held_identities() == {quota.ANONYMOUS}
+    assert held_identities() == {LEGACY_IDENTITY}
     await end(stalled)
     assert held_identities() == set()
     assert (await asyncio.wait_for(raw_request(), GUARD))[0] == 200

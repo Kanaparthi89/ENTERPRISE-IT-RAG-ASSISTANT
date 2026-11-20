@@ -6,7 +6,7 @@ import threading
 import pytest
 
 from app.rag import cancellation, vectorstore, workflow
-from tests.conftest import FakeLLM, FakeRetriever, FakeWebSearch, kb_doc
+from tests.conftest import FakeLLM, FakeRetriever, FakeWebSearch, kb_doc, legacy_access_request
 
 
 # ---------------------------------------------------------------------------
@@ -1239,7 +1239,8 @@ async def test_lifespan_shutdown_stops_a_running_stateless_chat_before_its_next_
 
     def chat():
         try:
-            outcome["response"] = routes.chat(routes.ChatRequest(question="VPN?"), None)
+            # S1-5: a direct call must carry a verified access decision (the route class sets it).
+            outcome["response"] = routes.chat(routes.ChatRequest(question="VPN?"), None, legacy_access_request())
         except HTTPException as exc:
             outcome["error"] = exc
 

@@ -248,11 +248,26 @@ def test_cross_origin_requests_are_refused_before_reading(client, stt_on, provid
 
 @pytest.mark.parametrize(
     "headers",
-    [{}, {"sec-fetch-site": "same-origin"}, {"origin": "http://testserver"}, {"sec-fetch-site": "same-origin", "origin": "http://testserver"}],
+    [{"sec-fetch-site": "same-origin"}, {"origin": "http://testserver"}, {"sec-fetch-site": "same-origin", "origin": "http://testserver"}],
 )
-def test_same_origin_and_non_browser_requests_are_accepted(client, stt_on, provider, headers):
+def test_same_origin_requests_are_accepted(client, stt_on, provider, headers):
     provider()
     assert post(client, headers=headers).status_code == 200
+
+
+def test_legacy_shim_only_a_request_without_origin_headers_is_transcribed(client, stt_on, provider):
+    """SHIM-ONLY behaviour, not production: see tests/conftest.py (legacy_access_compat).
+
+    The shim lets this module's header-less test clients through. In
+    production, a request with neither Origin nor Sec-Fetch-Site is refused
+    with 403 before the upload is read:
+    tests/test_access_enforcement.py::test_transcription_without_origin_headers_is_refused_in_production.
+    """
+    from app.services import access_policy
+
+    assert access_policy.origin_allowed.__module__ == "tests.conftest"  # the shim is what allows it
+    provider()
+    assert post(client).status_code == 200
 
 
 @pytest.mark.parametrize(

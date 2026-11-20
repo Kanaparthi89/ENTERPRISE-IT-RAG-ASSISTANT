@@ -517,6 +517,111 @@ def access_throttle_cleared():
     access.reset_throttle()
 
 
+# -------------------------------------------------------------------
+# Security S1-5: legacy access compatibility (explicit modules only)
+# -------------------------------------------------------------------
+#
+# S1-5 makes every paid AI route require a verified access cookie, quotas,
+# PUBLIC_ORIGINS and same-origin evidence. The test modules below predate it:
+# they test chat, streaming, sessions and transcription themselves, with
+# access and quotas off and clients (TestClient, httpx, raw ASGI) that send
+# no cookie and no Origin. For those modules only, ``legacy_access_compat``
+# replaces three functions of app/services/access_policy.py, in tests only:
+#
+# * ``configuration_problem``: None (paid routes run with access or quotas off);
+# * ``evaluate``: a verified cookie still grants its own code, exactly as in
+#   production; any other request is granted the reserved test identity
+#   ``LEGACY_IDENTITY`` (where S1-4 used the anonymous bucket);
+# * ``origin_allowed``: a request with neither Origin nor Sec-Fetch-Site is
+#   allowed (a non-browser test client); one that sends either is checked
+#   for real, against PUBLIC_ORIGINS = LEGACY_PUBLIC_ORIGIN.
+#
+# The content-type check, the route class, its order and everything after
+# it are unchanged. Every other module, and every new one, runs with real
+# enforcement: tests/test_access_enforcement.py and
+# tests/test_route_inventory.py are deliberately not listed. Production code
+# has no switch for any of this.
+
+LEGACY_ACCESS_MODULES = frozenset({
+    "tests.test_audit_sessions",
+    "tests.test_cancellation",
+    "tests.test_chat_api",
+    "tests.test_chat_stream",
+    "tests.test_graceful_shutdown",
+    "tests.test_quota_routes",
+    "tests.test_session_api",
+    "tests.test_session_stream",
+    "tests.test_stream_backpressure_http",
+    "tests.test_stream_http",
+    "tests.test_stream_lifecycle",
+    "tests.test_voice_quota",
+    "tests.test_voice_status",
+    "tests.test_voice_transcribe",
+    "tests.test_workflow_history",
+})
+LEGACY_IDENTITY = "legacy-compat"
+LEGACY_PUBLIC_ORIGIN = "http://testserver"  # TestClient's default Host
+
+
+def legacy_access_decision():
+    """The decision the compatibility shim grants a request without a verified cookie."""
+    from app.services import access, access_policy
+
+    return access_policy.AccessDecision(
+        access_policy.GRANTED,
+        "legacy-compat",
+        grant=access.AccessGrant(code_id=LEGACY_IDENTITY, expires_at=2**31 - 1),
+        code_ref="legacy",
+    )
+
+
+def legacy_access_request():
+    """A stand-in request for tests that call a route function directly."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(state=SimpleNamespace(access=legacy_access_decision()))
+
+
+@pytest.fixture(autouse=True)
+def legacy_access_compat(request, monkeypatch):
+    """No-op outside LEGACY_ACCESS_MODULES; see the comment above."""
+    if request.module is None or request.module.__name__ not in LEGACY_ACCESS_MODULES:
+        yield None
+        return
+    from app.services import access, access_policy
+
+    real_origin_allowed = access_policy.origin_allowed
+
+    def evaluate(http_request, settings):
+        if settings.access_enabled:
+            try:
+                config = access.AccessConfig.from_settings(settings)
+            except access.AccessConfigError:
+                config = None
+            if config is not None:
+                grant = access.verify_cookie(
+                    config, http_request.cookies.get(config.cookie_name), access.wall_clock()
+                )
+                if grant is not None:
+                    return access_policy.AccessDecision(
+                        access_policy.GRANTED, access_policy.VERIFIED, grant=grant,
+                        code_ref=access.code_reference(config, grant.code_id),
+                    )
+        return legacy_access_decision()
+
+    def origin_allowed(http_request, origins):
+        headers = http_request.headers
+        if "origin" not in headers and "sec-fetch-site" not in headers:
+            return True
+        return real_origin_allowed(http_request, origins)
+
+    monkeypatch.setattr(TEST_SETTINGS, "public_origins", LEGACY_PUBLIC_ORIGIN)
+    monkeypatch.setattr(access_policy, "configuration_problem", lambda settings: None)
+    monkeypatch.setattr(access_policy, "evaluate", evaluate)
+    monkeypatch.setattr(access_policy, "origin_allowed", origin_allowed)
+    yield LEGACY_IDENTITY
+
+
 @pytest.fixture(autouse=True)
 def quota_engine_cleared():
     """The S1-4b chat quota engine is process-wide; each test starts without one."""

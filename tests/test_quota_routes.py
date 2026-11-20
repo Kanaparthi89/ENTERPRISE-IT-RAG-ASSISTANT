@@ -22,7 +22,7 @@ from app.api import routes, streaming
 from app.rag import cancellation
 from app.services import access, quota, quota_runtime
 from app.services import sessions as session_service
-from tests.conftest import IsolatedSettings
+from tests.conftest import LEGACY_IDENTITY, IsolatedSettings, legacy_access_request
 from tests.streaming_support import ASGIHarness, body_contains
 from tests.test_chat_api import workflow_result
 from tests.test_stream_run import Gate, ScriptedWorkflow, final_state
@@ -300,7 +300,7 @@ def test_one_engine_per_process_never_rebuilt(client, quotas_on, fake_ask, monke
         ask_chat(client)
     assert engine() is first  # same engine, same counters
     assert first.config.chat.per_code_hourly == 10  # limits apply from the next restart
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 4
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 4
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +309,7 @@ def test_one_engine_per_process_never_rebuilt(client, quotas_on, fake_ask, monke
 
 def test_an_admitted_question_counts_and_releases(client, quotas_on, fake_ask):
     assert ask_chat(client).status_code == 200
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 1
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 1
     assert active() == 0
 
 
@@ -323,7 +323,7 @@ def test_a_refused_question_calls_no_provider(client, quotas_on, fake_ask, monke
     assert response.json()["detail"]["message"] == "You've reached the hourly question limit. Please try again later."
     assert int(response.headers["retry-after"]) <= 3600
     assert fake_ask.calls == 2  # the refused question never reached ask()
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 2
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 2
     assert "Chat refused by quota for request_id=" in caplog.text
     assert QUESTION not in caplog.text
 
@@ -343,7 +343,7 @@ def test_a_provider_failure_still_counts_and_releases(client, quotas_on, fake_as
     response = ask_chat(client)
     assert response.status_code == 500
     assert "secret-detail" not in response.text
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 1
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 1
     assert active() == 0
 
 
@@ -381,7 +381,7 @@ def test_the_deadline_stops_the_question_and_releases(client, quotas_on, fake_as
     response = ask_chat(client)
     assert response.status_code == 500
     assert active() == 0
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 1
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 1
 
 
 def test_a_shutdown_stop_releases(client, quotas_on, fake_ask):
@@ -420,7 +420,7 @@ def test_50_concurrent_questions_admit_exactly_the_concurrency_limit(quotas_on, 
     def one():
         barrier.wait(GUARD)
         try:
-            routes.chat(routes.ChatRequest(question=QUESTION), None)
+            routes.chat(routes.ChatRequest(question=QUESTION), None, legacy_access_request())
             outcome = "answered"
         except HTTPException as exc:
             outcome = exc.detail["code"] if isinstance(exc.detail, dict) else str(exc.status_code)
@@ -450,42 +450,16 @@ def test_verified_codes_have_separate_buckets(client, quotas_on, fake_ask, acces
         assert ask_chat(client, access_codes["alice"]).status_code == 200
     refused(ask_chat(client, access_codes["alice"]), 429, "quota_daily_limit")
     assert ask_chat(client, access_codes["bob"]).status_code == 200  # another code
-    assert ask_chat(client).status_code == 200  # anonymous: its own bucket
+    assert ask_chat(client).status_code == 200  # no cookie: the shim's legacy identity, its own bucket
     assert usage("alice")["daily"]["chat"] == 2
     assert usage("bob")["daily"]["chat"] == 1
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 1
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 1
 
 
-def test_unverified_identities_fall_back_to_the_shared_anonymous_bucket(client, quotas_on, fake_ask, access_codes, monkeypatch):
-    alice = access_codes["alice"]["cookie"]
-    name, value = alice.split("=", 1)
-    payload, signature = value.split(".")
-    forged = f"{name}={payload}.{signature[:-2]}AA"
-    other_name = f"bp_access={value}"  # the plain-HTTP name is not the configured one
-    for headers in (
-        {"cookie": forged},
-        {"cookie": other_name},
-        {"x-forwarded-for": "203.0.113.7"},
-        {"x-quota-identity": "alice"},
-        {"x-session-id-like": "alice"},
-        {},
-    ):
-        assert ask_chat(client, headers).status_code == 200
-    assert usage("alice")["daily"]["chat"] == 0
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 6
-
-
-def test_a_revoked_codes_cookie_is_anonymous(client, quotas_on, fake_ask, access_codes, monkeypatch):
-    monkeypatch.setattr(quotas_on, "access_code_hashes", f"bob:{access.hash_code(CODE_BOB)}")
-    assert ask_chat(client, access_codes["alice"]).status_code == 200
-    assert usage("alice")["daily"]["chat"] == 0
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 1
-
-
-def test_with_access_codes_disabled_every_request_is_anonymous(client, quotas_on, fake_ask, access_codes, monkeypatch):
-    monkeypatch.setattr(quotas_on, "access_enabled", False)
-    assert ask_chat(client, access_codes["alice"]).status_code == 200
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 1 and usage("alice")["daily"]["chat"] == 0
+# S1-5: forged, replaced-name, revoked and disabled-access cookies are no
+# longer charged to a shared anonymous bucket: they are refused (401 or 503)
+# before any quota is used. See tests/test_access_enforcement.py, which runs
+# without the legacy compatibility shim.
 
 
 def test_logs_never_contain_codes_cookies_ids_or_questions(client, quotas_on, fake_ask, access_codes, monkeypatch, caplog):
@@ -522,7 +496,7 @@ def test_a_session_question_counts_and_releases_both(client, quotas_on, sessions
     token = new_session(client)
     response = ask_chat(client, {"X-Session-ID": token})
     assert response.status_code == 200 and response.json()["session"]["turn_saved"] is True
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 1 and active() == 0
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 1 and active() == 0
     assert session_row(quotas_on, token)["lease_owner"] is None
 
 
@@ -564,7 +538,7 @@ async def test_a_stream_is_admitted_counted_and_released(stream_app, quotas_on):
     [run] = service.started
     await wait_event(run.hooks["worker_exited"])
     wait_until(lambda: active() == 0)
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 1
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 1
 
 
 @pytest.mark.anyio
@@ -588,7 +562,7 @@ async def test_stream_capacity_is_checked_before_quota(stream_app, quotas_on):
     await wait_event(gate.reached)
     result = await stream_request()
     assert result.status == 503 and json.loads(result.body)["detail"] == {"message": streaming.BUSY_MESSAGE}
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 1  # the busy request used no quota
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 1  # the busy request used no quota
     gate.release.set()
     await first
     await wait_event(service.started[0].hooks["worker_exited"])
@@ -635,7 +609,7 @@ async def test_a_failed_stream_start_releases_the_ticket(stream_app, quotas_on, 
     result = await stream_request()
     assert result.status == 503
     assert active() == 0  # released with the slot
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 1  # admitted, so counted
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 1  # admitted, so counted
     assert service.capacity.in_use == 0
 
 
@@ -693,7 +667,7 @@ async def test_a_session_stream_is_counted_and_released(stream_app, quotas_on, s
     [run] = service.started
     await wait_event(run.hooks["worker_exited"])
     wait_until(lambda: active() == 0)
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 1
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -715,7 +689,7 @@ async def test_all_four_routes_share_one_quota(stream_app, quotas_on, sessions_o
     wait_until(lambda: active() == 0)
     for request in (chat_request(), chat_request(token), stream_request(), stream_request(token)):
         harness_refused(await request, 429, "quota_daily_limit")  # every route is now refused
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 4
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 4
 
 
 @pytest.mark.anyio
@@ -766,7 +740,7 @@ async def test_every_ticket_is_released_exactly_once_on_every_route(stream_app, 
     wait_until(lambda: len(release_calls) == 6)
     time.sleep(0.05)
     assert len(release_calls) == 6 and len(set(release_calls)) == 6  # one call per ticket
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 6 and active() == 0
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 6 and active() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -903,7 +877,7 @@ def test_an_existing_engine_is_never_rebuilt_or_reset(client, quotas_on, fake_as
     monkeypatch.setattr(quotas_on, "pinecone_retry_after_max_seconds", None)  # unsafe afterwards
     assert ask_chat(client).status_code == 200  # checked when the engine was created
     assert engine() is first
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 2  # counters kept
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 2  # counters kept
 
 
 def test_with_quotas_off_unsafe_quota_settings_change_nothing(client, fake_ask, monkeypatch, settings):
@@ -1008,7 +982,7 @@ async def test_a_failure_after_admission_releases_ticket_lease_and_capacity(stre
     await _assert_stream_cleaned(service, quotas_on, token)
     assert workflow.calls == 0  # no worker runs without its ticket
     assert len(release_calls) == 1  # the ticket, exactly once (through the slot)
-    assert usage(quota.ANONYMOUS)["daily"]["chat"] == 1
+    assert usage(LEGACY_IDENTITY)["daily"]["chat"] == 1
 
 
 @pytest.mark.anyio
