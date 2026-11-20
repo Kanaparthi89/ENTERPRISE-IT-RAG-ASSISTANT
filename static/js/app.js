@@ -1177,7 +1177,7 @@
       window.BluePeakRecorder &&
         window.isSecureContext === true &&
         window.navigator?.mediaDevices &&
-        typeof window.MediaRecorder === "function" &&
+        window.BluePeakRecorder.canRecord(window) && // AudioWorklet capture (S1-4c-2)
         typeof window.fetch === "function" &&
         el.dictateBtn &&
         el.dictationNote &&
@@ -1187,7 +1187,7 @@
   }
 
   function createDictationController(recorder) {
-    const { STATES, ERROR_MESSAGES } = window.BluePeakRecorder;
+    const { STATES, ERROR_MESSAGES, messageFor } = window.BluePeakRecorder;
     const label = $(".dictate-label", el.dictateBtn);
     // Each session gets a number; an outcome whose number is no longer the
     // current one (cancelled, reset, page left) is ignored.
@@ -1242,7 +1242,7 @@
         insertTranscript(outcome.text);
         return;
       }
-      setStatus(ERROR_MESSAGES[outcome.code] || ERROR_MESSAGES.transcription_failed);
+      setStatus(messageFor(outcome)); // includes the wait after a busy or quota refusal
       // Switched off on the server since the page loaded: stop offering it.
       if (outcome.code === "transcription_disabled") hide();
     }
@@ -1293,15 +1293,13 @@
     let controller = null;
     const recorder = window.BluePeakRecorder.createRecorder({
       // Browser objects are passed in; recorder.js alone uses them.
-      mediaDevices: window.navigator.mediaDevices,
-      MediaRecorder: window.MediaRecorder,
-      isSecureContext: window.isSecureContext === true,
+      ...window.BluePeakRecorder.browserDependencies(window),
       fetchImpl: (url, init) => window.fetch(url, init),
       setTimeout: (fn, ms) => window.setTimeout(fn, ms),
       clearTimeout: (id) => window.clearTimeout(id),
       onStateChange: (state) => controller?.showState(state),
     });
-    if (!recorder.supported || !window.BluePeakRecorder.chooseFormat(window.MediaRecorder)) return;
+    if (!recorder.supported) return;
 
     probeFeatureStatus(DICTATION_STATUS_URL, isDictationStatus).then((offered) => {
       if (!offered) return;

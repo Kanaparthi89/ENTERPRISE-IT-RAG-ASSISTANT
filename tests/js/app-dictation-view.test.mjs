@@ -1,7 +1,7 @@
-// Voice V3b: static/js/app.js dictation, against the real recorder.js,
-// chat-stream.js and voice.js, with a fake microphone, MediaRecorder, fetch,
-// timers and speech engine, and a minimal fake DOM. No browser, network or
-// real microphone is used.
+// Voice V3b; Security S1-4c-2: static/js/app.js dictation, against the real
+// recorder.js, chat-stream.js and voice.js, with a fake microphone,
+// AudioContext/AudioWorkletNode, fetch, timers and speech engine, and a
+// minimal fake DOM. No browser, network or real microphone is used.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -16,7 +16,8 @@ const voiceModule = require("../../static/js/voice.js");
 const APP_SOURCE = readFileSync(new URL("../../static/js/app.js", import.meta.url), "utf-8");
 
 const { CHAT_URL, SESSIONS_URL, SESSION_HEADER } = chat;
-const { ERROR_MESSAGES, MAX_DURATION_MS, TRANSCRIBE_URL, UPLOAD_TIMEOUT_MS } = recorderModule;
+const { DURATION_BACKSTOP_MS, ERROR_MESSAGES, FLUSH_TIMEOUT_MS, MAX_DURATION_MS, TRANSCRIBE_URL, UPLOAD_TIMEOUT_MS } =
+  recorderModule;
 const { VOICE_LOAD_TIMEOUT_MS } = voiceModule;
 
 // Every test is bounded: a regression that leaves a session pending fails fast.
@@ -26,7 +27,6 @@ const STT_URL = "/api/voice/transcription/status";
 const TTS_URL = "/api/voice/status";
 const PROBE_TIMEOUT_MS = 5_000;
 const TRANSCRIPT = "How do I reset my VPN token?";
-const WEBM = "audio/webm;codecs=opus";
 const TEXT = {
   requesting: "Allow microphone access to dictate.",
   recording: "Recording… Select Stop dictation to finish (up to 60 seconds).",
@@ -49,7 +49,7 @@ const answer = (text = DONE.answer) => jsonResponse({ ...DONE, answer: text });
 const LOCAL_EN = { name: "Samantha", lang: "en-US", localService: true, default: true };
 
 // ---------------------------------------------------------------------------
-// Fakes: microphone, MediaRecorder, speech
+// Fakes: microphone, AudioContext + AudioWorkletNode, speech
 // ---------------------------------------------------------------------------
 
 class FakeTrack {
@@ -105,38 +105,85 @@ function fakeDevices({ manual = false, error = null } = {}) {
   return devices;
 }
 
-function fakeMediaRecorder(types = [WEBM]) {
-  return class FakeMediaRecorder {
-    static instances = [];
+/** AudioContext and AudioWorkletNode doubles; a flush is answered with "done". */
+function fakeAudio({ worklet = true } = {}) {
+  const audio = { contexts: [], nodes: [] };
 
-    static isTypeSupported(type) {
-      return types.includes(type);
+  class FakeAudioWorkletNode {
+    constructor(context, name, options) {
+      this.name = name;
+      this.options = options;
+      this.disconnected = 0;
+      const node = this;
+      this.port = {
+        posted: [],
+        onmessage: null,
+        postMessage(message) {
+          node.port.posted.push(message);
+          if (message && message.type === "flush") queueMicrotask(() => node.send({ type: "done" }));
+        },
+        close() {},
+      };
+      audio.nodes.push(this);
     }
 
-    constructor(stream, options) {
-      this.stream = stream;
-      this.mimeType = options.mimeType;
-      this.state = "inactive";
-      this.ondataavailable = null;
-      this.onstop = null;
-      this.onerror = null;
-      FakeMediaRecorder.instances.push(this);
+    connect() {}
+
+    disconnect() {
+      this.disconnected += 1;
     }
 
-    start() {
-      this.state = "recording";
+    send(data) {
+      this.port.onmessage?.({ data });
     }
 
-    stop() {
-      if (this.state === "inactive") return;
-      this.state = "inactive";
-      queueMicrotask(() => this.onstop?.({}));
+    emit(samples) {
+      this.send({ type: "chunk", samples: new Int16Array(samples).fill(500) });
+    }
+  }
+
+  class FakeAudioContext {
+    constructor() {
+      this.state = "suspended";
+      this.closed = 0;
+      this.onstatechange = null;
+      this.destination = {};
+      this._worklet = { addModule: () => Promise.resolve() };
+      audio.contexts.push(this);
     }
 
-    emit(bytes) {
-      this.ondataavailable?.({ data: new Blob([new Uint8Array(bytes)]) });
+    resume() {
+      this.state = "running";
+      return Promise.resolve();
     }
-  };
+
+    close() {
+      this.closed += 1;
+      this.state = "closed";
+      return Promise.resolve();
+    }
+
+    createMediaStreamSource() {
+      return { connect() {}, disconnect() {} };
+    }
+
+    setState(next) {
+      this.state = next;
+      this.onstatechange?.();
+    }
+  }
+  if (worklet) {
+    Object.defineProperty(FakeAudioContext.prototype, "audioWorklet", {
+      get() {
+        return this._worklet;
+      },
+    });
+  }
+  audio.AudioContext = FakeAudioContext;
+  audio.AudioWorkletNode = FakeAudioWorkletNode;
+  audio.node = () => audio.nodes.at(-1);
+  audio.context = () => audio.contexts.at(-1);
+  return audio;
 }
 
 class FakeUtterance {
@@ -208,8 +255,9 @@ function loadApp(
   {
     secure = true,
     devices = fakeDevices(),
-    types = [WEBM],
-    mediaRecorder = true,
+    audio = fakeAudio(),
+    audioContext = true,
+    audioWorkletNode = true,
     recorderLoaded = true,
     mediaDevicesPresent = true,
     speech = false,
@@ -264,9 +312,15 @@ function loadApp(
   const timers = fakeTimers();
   // Fake time for the probe timeout, the recording and upload limits and the
   // voice wait; the page's other timers (frames, retries) run for real.
-  const faked = new Set([PROBE_TIMEOUT_MS, MAX_DURATION_MS, UPLOAD_TIMEOUT_MS, VOICE_LOAD_TIMEOUT_MS]);
+  const faked = new Set([
+    PROBE_TIMEOUT_MS,
+    MAX_DURATION_MS,
+    DURATION_BACKSTOP_MS,
+    FLUSH_TIMEOUT_MS,
+    UPLOAD_TIMEOUT_MS,
+    VOICE_LOAD_TIMEOUT_MS,
+  ]);
   const windowListeners = new Map();
-  const MediaRecorder = fakeMediaRecorder(types);
   const synth = new FakeSynth([LOCAL_EN]);
 
   const window = {
@@ -287,7 +341,8 @@ function loadApp(
     BluePeakChat: chat,
     BluePeakVoice: voiceModule,
   };
-  if (mediaRecorder) window.MediaRecorder = MediaRecorder;
+  if (audioContext) window.AudioContext = audio.AudioContext;
+  if (audioWorkletNode) window.AudioWorkletNode = audio.AudioWorkletNode;
   if (recorderLoaded) window.BluePeakRecorder = recorderModule;
   if (speech) {
     window.speechSynthesis = synth;
@@ -301,7 +356,7 @@ function loadApp(
     fetchImpl,
     timers,
     devices,
-    MediaRecorder,
+    audio,
     synth,
     button,
     note,
@@ -332,7 +387,7 @@ function loadApp(
       await page.settle();
     },
     label: () => button.querySelector(".dictate-label").textContent,
-    media: () => MediaRecorder.instances.at(-1),
+    node: () => audio.node(),
     stream: () => devices.streams.at(-1),
     probes: () => fetchImpl.count(STT_URL),
     uploads: () => fetchImpl.count(TRANSCRIBE_URL),
@@ -351,12 +406,12 @@ async function offered(routes = {}, options = {}) {
   return page;
 }
 
-/** Click, let permission resolve, and record ``bytes``. */
-async function recording(page, bytes = 4096) {
+/** Click, let permission resolve, and record ``samples`` (16 kHz PCM from the worklet). */
+async function recording(page, samples = 4096) {
   page.click();
   await page.settle();
   assert.equal(page.button.dataset.state, "recording");
-  page.media().emit(bytes);
+  page.node().emit(samples);
 }
 
 // ---------------------------------------------------------------------------
@@ -377,8 +432,13 @@ test("an insecure context: nothing is requested or shown", T, async () => {
   assert.ok(page.hiddenBoth());
 });
 
-test("no microphone API, no MediaRecorder or no recordable format: nothing is requested or shown", T, async () => {
-  for (const options of [{ mediaDevicesPresent: false }, { mediaRecorder: false }, { types: ["audio/x-unknown"] }]) {
+test("no microphone API, no AudioContext, no AudioWorkletNode or no audioWorklet: nothing is requested or shown", T, async () => {
+  for (const options of [
+    { mediaDevicesPresent: false },
+    { audioContext: false },
+    { audioWorkletNode: false },
+    { audio: fakeAudio({ worklet: false }) }, // no ScriptProcessor fallback
+  ]) {
     const page = loadApp({ [STT_URL]: STT_ON }, options);
     await page.settle();
     assert.equal(page.probes(), 0, JSON.stringify(options));
@@ -527,7 +587,8 @@ test("selecting the button while permission is pending cancels and releases a la
   const late = page.devices.grant();
   await page.settle();
   assert.ok(late.allStopped()); // the microphone indicator turns off at once
-  assert.equal(page.MediaRecorder.instances.length, 0);
+  assert.equal(page.audio.nodes.length, 0);
+  assert.ok(page.audio.contexts.every((context) => context.closed === 1));
   assert.equal(page.uploads(), 0);
 });
 
@@ -650,12 +711,12 @@ test("dictation switched off on the server (404): the controls are hidden and fo
 test("recording stops by itself at 60 seconds and is transcribed", T, async () => {
   const page = await offered();
   await recording(page);
-  page.timers.fire(MAX_DURATION_MS);
+  page.node().send({ type: "limit", total: 960000 }); // the worklet's 60-second cap
   await page.settle();
   assert.equal(page.question.value, TRANSCRIPT);
 });
 
-test("an upload that takes too long is abandoned after 45 seconds", T, async () => {
+test("an upload that takes too long is abandoned after 75 seconds", T, async () => {
   const held = heldUpload();
   const page = await offered({ [TRANSCRIBE_URL]: held.route });
   await recording(page);
@@ -855,4 +916,85 @@ test("turning read-aloud on while dictating does not speak the confirmation", T,
   await page.settle();
   assert.equal(page.synth.texts().length, 0);
   assert.equal(page.toggle.getAttribute("aria-pressed"), "true"); // still turned on
+});
+
+
+// ---------------------------------------------------------------------------
+// S1-4c-2: WAV capture, interruptions and server refusals
+// ---------------------------------------------------------------------------
+
+test("the upload is a canonical WAV built from the worklet's samples", T, async () => {
+  const page = await offered();
+  await recording(page, 1600);
+  page.click(); // stop
+  await page.settle();
+  const { init } = page.fetchImpl.calls.find((call) => call.url === TRANSCRIBE_URL);
+  const file = init.body.get("audio");
+  assert.equal(file.name, "recording.wav");
+  assert.equal(file.type, "audio/wav");
+  assert.equal(file.size, 44 + 2 * 1600);
+  assert.equal(page.question.value, TRANSCRIPT);
+  assert.ok(page.audio.contexts.every((context) => context.closed === 1));
+  assert.ok(page.stream().allStopped());
+});
+
+test("an interrupted recording is discarded with a message, and nothing is uploaded", T, async () => {
+  const page = await offered();
+  await recording(page);
+  page.audio.context().setState("interrupted"); // a call, Siri or the screen locking
+  await page.settle();
+  assert.equal(page.status.textContent, ERROR_MESSAGES.recording_interrupted);
+  assert.equal(page.button.dataset.state, "idle");
+  assert.equal(page.uploads(), 0);
+  assert.equal(page.question.value, "");
+  assert.ok(page.stream().allStopped());
+});
+
+test("a busy refusal shows the wait from Retry-After, and the next click waits for it", T, async () => {
+  const busy = () =>
+    jsonResponse({ detail: { code: "voice_busy", message: "server text" } }, { status: 503, headers: { "Retry-After": "5" } });
+  const page = await offered({ [TRANSCRIBE_URL]: busy });
+  await recording(page);
+  page.click(); // stop
+  await page.settle();
+  assert.equal(page.status.textContent, `${ERROR_MESSAGES.voice_busy} You can try again in 5 seconds.`);
+  assert.ok(!page.status.textContent.includes("server text"));
+
+  const contexts = page.audio.contexts.length;
+  page.click(); // too soon: refused locally, no microphone or upload
+  await page.settle();
+  assert.equal(page.audio.contexts.length, contexts);
+  assert.equal(page.uploads(), 1);
+  assert.match(page.status.textContent, /^Too many recordings are being sent right now\. Please try again shortly\. You can try again in \d seconds?\.$/);
+});
+
+test("a quota refusal shows a safe message", T, async () => {
+  const quota = () =>
+    jsonResponse({ detail: { code: "quota_daily_limit", message: "server text" } }, { status: 429, headers: { "Retry-After": "7200" } });
+  const page = await offered({ [TRANSCRIBE_URL]: quota });
+  await recording(page);
+  page.click();
+  await page.settle();
+  assert.equal(page.status.textContent, `${ERROR_MESSAGES.quota_daily_limit} You can try again in about 2 hours.`);
+});
+
+test("after a daily-limit refusal, the next click records again (a new access code may be allowed)", T, async () => {
+  let calls = 0;
+  const route = () => {
+    calls += 1;
+    if (calls === 1) {
+      return jsonResponse({ detail: { code: "quota_daily_limit", message: "x" } }, { status: 429, headers: { "Retry-After": "7200" } });
+    }
+    return jsonResponse({ text: TRANSCRIPT });
+  };
+  const page = await offered({ [TRANSCRIBE_URL]: route });
+  await recording(page);
+  page.click();
+  await page.settle();
+  assert.match(page.status.textContent, /about 2 hours\.$/);
+  await recording(page); // not blocked locally: the server decides
+  page.click();
+  await page.settle();
+  assert.equal(page.question.value, TRANSCRIPT);
+  assert.equal(page.uploads(), 2);
 });

@@ -163,3 +163,15 @@ def test_a_second_chunk_counted_as_samples_is_measured_in_full():
     tail = b"data" + struct.pack("<I", 4) + b"\x00" * 4
     data = _resize(BASE, tail)
     assert measure_canonical_wav(data).data_bytes == ONE_SECOND * 2 + len(tail)
+
+
+def test_the_browser_recorders_header_is_accepted_by_the_server():
+    # tests/js/fixtures/canonical-wav-header.hex is checked byte for byte
+    # against recorder.js's wavHeader(16000) in tests/js/recorder.test.mjs.
+    from pathlib import Path
+
+    fixture = Path(__file__).parent / "js" / "fixtures" / "canonical-wav-header.hex"
+    header = bytes.fromhex(fixture.read_text(encoding="ascii").strip())
+    assert header == wav(ONE_SECOND)[:44]  # the same canonical layout the server builds
+    measured = measure_canonical_wav(header + b"\x00\x00" * ONE_SECOND)
+    assert (measured.seconds, measured.reserved_seconds) == (1.0, 1)

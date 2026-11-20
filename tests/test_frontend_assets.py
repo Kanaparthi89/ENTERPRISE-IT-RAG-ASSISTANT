@@ -312,3 +312,39 @@ def test_dictation_stays_disabled_by_default(client, settings):
 def test_the_privacy_note_is_readable():
     match = re.search(r"\.dictation-note\s*\{[^}]*font-size:\s*(\d+)px", _css())
     assert match and 12 <= int(match.group(1)) <= 13
+
+
+# ---------------------------------------------------------------------------
+# Security S1-4c-2: the PCM WAV recorder (behaviour: tests/js/recorder.test.mjs
+# and tests/js/pcm-worklet.test.mjs)
+# ---------------------------------------------------------------------------
+
+def test_the_pcm_worklet_is_served_as_javascript(client):
+    response = client.get("/static/js/pcm-recorder-worklet.js")
+    assert response.status_code == 200
+    assert "javascript" in response.headers["content-type"]
+    assert 'registerProcessor("bluepeak-pcm-recorder"' in response.text
+
+
+def test_the_worklet_is_loaded_by_the_recorder_not_by_the_page(client):
+    html = client.get("/").text
+    assert "pcm-recorder-worklet.js" not in html  # addModule() loads it; never a <script> tag
+    recorder = (STATIC_JS / "recorder.js").read_text(encoding="utf-8")
+    assert 'const WORKLET_URL = "/static/js/pcm-recorder-worklet.js";' in recorder
+
+
+def test_the_worklet_uses_no_network_storage_or_dom():
+    source = (STATIC_JS / "pcm-recorder-worklet.js").read_text(encoding="utf-8")
+    code = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+    code = re.sub(r"//[^\n]*", "", code)
+    for forbidden in ("fetch", "XMLHttpRequest", "WebSocket", "importScripts", "localStorage",
+                      "sessionStorage", "indexedDB", "document", "cookie", "eval"):
+        assert forbidden not in code, forbidden
+
+
+def test_the_recorder_no_longer_uses_media_recorder_and_needs_no_cdn():
+    recorder = (STATIC_JS / "recorder.js").read_text(encoding="utf-8")
+    worklet = (STATIC_JS / "pcm-recorder-worklet.js").read_text(encoding="utf-8")
+    for source in (recorder, worklet):
+        assert "MediaRecorder(" not in source and "ScriptProcessor" not in source
+        assert "http://" not in source and "https://" not in source
