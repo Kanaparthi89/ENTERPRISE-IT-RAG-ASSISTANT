@@ -4,7 +4,7 @@ import functools
 import json
 import logging
 import math
-import secrets
+import re
 import threading
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
@@ -26,6 +26,7 @@ from app.rag.workflow import ask, history_window
 from app.rag.vectorstore import add_documents
 from app.services import access as access_service
 from app.services import access_policy
+from app.services import admin_auth
 from app.services import quota as quota_service
 from app.services import quota_runtime
 from app.services import sessions as session_service
@@ -1423,72 +1424,173 @@ async def access_logout(request: Request):
     return response
 
 
-@router.post("/ingest")
-async def ingest(
-    file: UploadFile = File(...),
-    x_admin_key: str = Header(default=""),
-):
-    """Validate and index an uploaded knowledge-base document."""
-    if not settings.admin_api_key:
+# ---------------------------------------------------------------------------
+# Security S1-5 Phase C: admin ingestion
+#
+# AdminIngestRoute runs before FastAPI reads or parses the multipart body, in
+# order: the admin key is configured and strong enough (503), the failed-
+# attempt throttle (429, the key is not compared), the X-Admin-Key header
+# (401), the content type (415), a declared length within the limit (411 /
+# 413), the single ingest slot (503 busy). The body is then read through a
+# byte cap and a per-chunk idle timeout (413 / 408). Without a valid key,
+# nothing of the body is read, parsed or stored.
+# ---------------------------------------------------------------------------
+
+ADMIN_ERRORS = {
+    "ingest_unavailable": (503, "Document ingestion is not available."),
+    "admin_auth_required": (401, "A valid admin key is required."),
+    "admin_auth_throttled": (429, "Too many failed admin key attempts. Please try again later."),
+    "unsupported_media_type": (415, "Send the document as multipart/form-data."),
+    "length_required": (411, "The upload must declare its length."),
+    "upload_too_large": (413, "File exceeds the 10 MB upload limit."),
+    "upload_timeout": (408, "The upload took too long."),
+    "ingest_busy": (503, "Another document is being indexed. Please try again shortly."),
+}
+INGEST_BUSY_RETRY_AFTER_SECONDS = 30
+# Content-Length: ASCII decimal digits only, at most 20 (bounded before int()).
+# str.isdigit() would also accept Unicode digits such as "²", which int() refuses.
+_CONTENT_LENGTH_PATTERN = re.compile(r"[0-9]{1,20}")
+
+
+def _admin_error(code: str, headers: dict | None = None) -> HTTPException:
+    status_code, message = ADMIN_ERRORS[code]
+    if code == "admin_auth_required":
+        headers = {"WWW-Authenticate": 'AdminKey realm="BluePeak AI Desk"', **(headers or {})}
+    elif code == "ingest_busy":
+        headers = {"Retry-After": str(INGEST_BUSY_RETRY_AFTER_SECONDS), **(headers or {})}
+    return admin_auth.http_error(status_code, code, message, headers)
+
+
+def _ingest_body_limit() -> int:
+    return MAX_UPLOAD_SIZE + admin_auth.MULTIPART_OVERHEAD_BYTES
+
+
+def _authorize_admin_ingest(request: Request) -> None:
+    """The admin key and the throttle; raises 503 / 429 / 401. Reads no body."""
+    status = admin_auth.key_status(settings)
+    if status == admin_auth.MISSING:
         logger.error("Document ingestion is disabled: admin key is not configured.")
-        raise HTTPException(
-            status_code=503,
-            detail="Document ingestion is not configured.",
+        raise _admin_error("ingest_unavailable")
+    if status == admin_auth.TOO_SHORT:
+        logger.error(
+            "Document ingestion refused: ADMIN_API_KEY is shorter than %d characters.",
+            admin_auth.MIN_ADMIN_KEY_LENGTH,
         )
+        raise _admin_error("ingest_unavailable")
 
-    expected_key = settings.admin_api_key
-    if hasattr(expected_key, "get_secret_value"):
-        expected_key = expected_key.get_secret_value()
+    client = admin_auth.client_identity(request, settings)
+    throttle = admin_auth.get_admin_throttle(settings)
+    retry_after, stamp = throttle.attempt(client)
+    if retry_after is not None:
+        logger.warning("Admin key attempts throttled.")
+        raise _admin_error("admin_auth_throttled", {"Retry-After": str(math.ceil(retry_after))})
 
-    if not x_admin_key or not secrets.compare_digest(
-        x_admin_key,
-        str(expected_key),
+    presented = admin_auth.presented_key(request)
+    if presented is None or not admin_auth.keys_match(presented, admin_auth.expected_key(settings)):
+        logger.warning("Admin key rejected (%s).", "missing or malformed" if presented is None else "invalid")
+        raise _admin_error("admin_auth_required")  # the reserved attempt stays counted as a failure
+    throttle.succeeded(client, stamp)
+    request.state.admin_authenticated = True
+
+
+def _check_ingest_framing(request: Request) -> None:
+    """Content type and declared length, before any body is read; raises 415 / 411 / 413."""
+    content_type = request.headers.get("content-type", "")
+    media_type, _, params = content_type.partition(";")
+    if media_type.strip().lower() != "multipart/form-data" or "boundary=" not in params.lower():
+        raise _admin_error("unsupported_media_type")
+    lengths = request.headers.getlist("content-length")
+    if len(lengths) != 1 or _CONTENT_LENGTH_PATTERN.fullmatch(lengths[0]) is None:
+        raise _admin_error("length_required")  # missing, repeated, signed, spaced, non-ASCII or too long
+    if int(lengths[0]) > _ingest_body_limit():
+        raise _admin_error("upload_too_large")
+
+
+class AdminIngestRoute(APIRoute):
+    """POST /api/ingest: admin authorisation and upload limits before the body is parsed."""
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def route_handler(request):
+            _authorize_admin_ingest(request)
+            _check_ingest_framing(request)
+            claim = admin_auth.try_claim_ingest_slot()
+            if claim is None:
+                raise _admin_error("ingest_busy")
+            request.state.ingest_slot = claim
+            bounded = Request(
+                request.scope,
+                admin_auth.bounded_receive(
+                    request.receive,
+                    _ingest_body_limit(),
+                    settings.admin_upload_idle_timeout_seconds,
+                    too_large=lambda: _admin_error("upload_too_large"),
+                    timed_out=lambda: _admin_error("upload_timeout"),
+                ),
+            )
+            try:
+                return await handler(bounded)
+            finally:
+                claim.release_if_unclaimed()  # unless its worker thread owns it now
+
+        return route_handler
+
+
+async def ingest(request: Request, file: UploadFile = File(...)):
+    """Validate and index an uploaded knowledge-base document.
+
+    Reached only through AdminIngestRoute (verified admin key, bounded
+    upload, the single ingest slot). Parsing, embedding and indexing run on
+    a worker thread that keeps the slot until it finishes.
+    """
+    claim = getattr(request.state, "ingest_slot", None)
+    if getattr(request.state, "admin_authenticated", False) is not True or not isinstance(
+        claim, admin_auth.SlotClaim
     ):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid admin key.",
-        )
-
-    if not file.filename:
-        raise HTTPException(
-            status_code=400,
-            detail="A filename is required.",
-        )
-
-    # Treat the supplied filename as untrusted input.
-    filename = Path(file.filename).name
-    suffix = Path(filename).suffix.lower()
-
-    if suffix not in SUPPORTED:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Supported file types: {', '.join(sorted(SUPPORTED))}",
-        )
-
-    upload_dir = Path(settings.upload_dir).resolve()
-    upload_dir.mkdir(parents=True, exist_ok=True)
-
-    # Read at most MAX_UPLOAD_SIZE + 1 bytes to enforce the limit.
-    content = await file.read(MAX_UPLOAD_SIZE + 1)
-
-    if not content:
-        raise HTTPException(
-            status_code=400,
-            detail="The uploaded file is empty.",
-        )
-
-    if len(content) > MAX_UPLOAD_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail="File exceeds the 10 MB upload limit.",
-        )
-
-    # Use a generated storage name to prevent filename collisions and
-    # avoid trusting user-supplied paths.
-    stored_name = f"{uuid4().hex}{suffix}"
-    dest = upload_dir / stored_name
+        raise _admin_error("ingest_unavailable")  # defence in depth: never without the route class
 
     try:
+        if not file.filename:
+            raise HTTPException(
+                status_code=400,
+                detail="A filename is required.",
+            )
+
+        # Treat the supplied filename as untrusted input.
+        filename = Path(file.filename).name
+        suffix = Path(filename).suffix.lower()
+
+        if suffix not in SUPPORTED:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Supported file types: {', '.join(sorted(SUPPORTED))}",
+            )
+
+        # Read at most MAX_UPLOAD_SIZE + 1 bytes to enforce the limit.
+        content = await file.read(MAX_UPLOAD_SIZE + 1)
+
+        if not content:
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded file is empty.",
+            )
+
+        if len(content) > MAX_UPLOAD_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail="File exceeds the 10 MB upload limit.",
+            )
+    finally:
+        await file.close()
+
+    upload_dir = Path(settings.upload_dir).resolve()
+
+    def index_document():
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        # Use a generated storage name to prevent filename collisions and
+        # avoid trusting user-supplied paths.
+        dest = upload_dir / f"{uuid4().hex}{suffix}"
         dest.write_bytes(content)
 
         docs = load_file(dest)
@@ -1506,31 +1608,26 @@ async def ingest(
             )
 
         # Index only after successful validation and chunking.
-        ids = add_documents(chunks)
+        return chunks, add_documents(chunks)
 
-        logger.info(
-            "Document indexed: filename=%s chunks=%s",
-            filename,
-            len(chunks),
-        )
-
-        return {
-            "message": "Document indexed successfully.",
-            "file": filename,
-            "chunks": len(chunks),
-            "ids_created": len(ids),
-        }
-
+    try:
+        chunks, ids = await claim.run_in_thread(index_document)
     except HTTPException:
         raise
-
     except Exception as exc:
-        logger.exception("Document ingestion failed for filename=%s", filename)
-
+        logger.exception("Document ingestion failed for filename=%r", filename)
         raise HTTPException(
             status_code=500,
             detail="Document ingestion failed. Check the application logs.",
         ) from exc
 
-    finally:
-        await file.close()
+    logger.info("Document indexed: filename=%r chunks=%s", filename, len(chunks))
+    return {
+        "message": "Document indexed successfully.",
+        "file": filename,
+        "chunks": len(chunks),
+        "ids_created": len(ids),
+    }
+
+
+router.add_api_route("/ingest", ingest, methods=["POST"], route_class_override=AdminIngestRoute)

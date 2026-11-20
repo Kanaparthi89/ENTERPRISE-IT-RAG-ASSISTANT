@@ -4,9 +4,21 @@ import pytest
 from pydantic import SecretStr
 
 from app.api import routes
-from tests.conftest import ADMIN_KEY, KnownBugStillPresent, require
+from app.services import admin_auth
+from tests.conftest import KnownBugStillPresent, require
 
 MARKDOWN = b"# VPN\n\nInstall the VPN client and sign in with MFA.\n"
+# S1-5 Phase C: ingestion needs an admin key of at least 32 characters (the
+# suite-wide test secret is shorter, so these tests set their own).
+ADMIN_KEY = "ingest-test-admin-key-0123456789abcdef"
+
+
+@pytest.fixture(autouse=True)
+def admin_key(monkeypatch, settings):
+    monkeypatch.setattr(settings, "admin_api_key", SecretStr(ADMIN_KEY))
+    admin_auth.reset_admin_throttle()
+    yield ADMIN_KEY
+    admin_auth.reset_admin_throttle()
 
 
 @pytest.fixture

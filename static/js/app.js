@@ -1442,6 +1442,20 @@
     }
   }
 
+  /**
+   * The message to show for a failed upload. Security S1-5 Phase C errors
+   * are structured ({ detail: { code, message } }); others still send a
+   * plain string detail, which is shown as before.
+   */
+  function uploadErrorMessage(data, status) {
+    const detail = data && data.detail;
+    if (typeof detail === "string" && detail.trim()) return detail.trim();
+    if (detail && typeof detail === "object" && typeof detail.message === "string" && detail.message.trim()) {
+      return detail.message.trim();
+    }
+    return getText(data && data.message, `Upload failed (HTTP ${status}).`);
+  }
+
   function getExtension(filename) {
     const dot = filename.lastIndexOf(".");
     return dot >= 0 ? filename.slice(dot).toLowerCase() : "";
@@ -1509,7 +1523,7 @@
       const formData = new FormData();
       formData.append("file", file, file.name);
 
-      const response = await fetch("/api/ingest", {
+      const response = await window.fetch("/api/ingest", {
         method: "POST",
         headers: {
           "X-Admin-Key": adminKey,
@@ -1521,12 +1535,7 @@
       const data = await response.json().catch(() => ({}));
 
       if (!response.ok) {
-        throw new Error(
-          getText(
-            data.detail || data.message,
-            `Upload failed (HTTP ${response.status}).`
-          )
-        );
+        throw new Error(uploadErrorMessage(data, response.status));
       }
 
       const chunks = Number.isFinite(Number(data.chunks))

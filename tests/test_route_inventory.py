@@ -31,7 +31,7 @@ PAID = {
     ("DELETE", "/api/sessions"): (routes.SessionDeleteRoute, "delete_session"),
     ("POST", "/api/voice/transcribe"): (routes.TranscriptionRoute, "voice_transcribe"),
 }
-ADMIN = {("POST", "/api/ingest"): "ingest"}  # its own admin key (S1-5 Phase C adds a throttle)
+ADMIN = {("POST", "/api/ingest"): "ingest"}  # its own admin key, checked before the body (S1-5 Phase C)
 PUBLIC = {
     ("GET", "/api/health"): "health",
     ("GET", "/api/voice/status"): "voice_status",
@@ -104,6 +104,13 @@ def test_every_paid_route_enforces_access_before_the_body(entry, key):
     assert type(route) is route_class
     assert isinstance(route, routes.AccessEnforcedRoute)
     assert (route_class.feature_flag, route_class.json_body) == EXPECTED_FLAGS[route_class]
+
+
+@pytest.mark.parametrize("entry", list(APPS))
+def test_the_admin_route_authorises_before_the_body(entry):
+    api, *_ = inventory(APPS[entry]())
+    assert type(api[("POST", "/api/ingest")]) is routes.AdminIngestRoute
+    assert not isinstance(api[("POST", "/api/ingest")], routes.AccessEnforcedRoute)  # its own key, not access codes
 
 
 @pytest.mark.parametrize("entry", list(APPS))

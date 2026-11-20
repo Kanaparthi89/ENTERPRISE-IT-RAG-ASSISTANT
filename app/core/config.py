@@ -123,7 +123,17 @@ class Settings(BaseSettings):
     voice_transcription_max_retries: int = Field(default=0, ge=0, le=2)
 
     # Application authentication
+    # ADMIN_API_KEY authorises POST /api/ingest. Security S1-5 Phase C: it must
+    # be at least 32 characters; a shorter key leaves ingestion off (503)
+    # without affecting the rest of the application. Failed attempts are
+    # throttled per client and in total within a sliding window (in memory,
+    # per process), and an upload must keep arriving: each chunk within
+    # ADMIN_UPLOAD_IDLE_TIMEOUT_SECONDS.
     admin_api_key: SecretStr = SecretStr("")
+    admin_max_failed_attempts: int = Field(default=10, ge=1, le=1000)
+    admin_failure_window_seconds: float = Field(default=900.0, ge=60, le=86400)
+    admin_max_global_failed_attempts: int = Field(default=100, ge=1, le=100000)
+    admin_upload_idle_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
 
     # Security S1-3: access codes for live AI features (Architecture C).
     # Disabled by default. Security S1-5: every paid AI route (chat,
