@@ -16,6 +16,7 @@ import pytest
 from app.services import audit
 from app.services.audit import get_recent_audits, init_db, write_audit
 from app.services.sessions import SessionStore
+from tests.conftest import legacy_owner_ref
 from tests.session_support import find_token
 from tests.streaming_support import FakeClock
 
@@ -166,7 +167,7 @@ def test_stateless_write_works_on_a_database_before_migration(settings):
 
 def test_session_write_records_the_internal_session_id(settings, session_store):
     init_db()
-    created = session_store.create()
+    created = session_store.create(owner_ref=legacy_owner_ref())
 
     write_audit(question="What about on a Mac?", source_used="private_kb",
                 request_id="req-2", session_id=created.session_id)
@@ -180,7 +181,7 @@ def test_session_write_records_the_internal_session_id(settings, session_store):
 
 def test_all_statuses_can_be_linked_to_a_session(settings, session_store):
     init_db()
-    session_id = session_store.create().session_id
+    session_id = session_store.create(owner_ref=legacy_owner_ref()).session_id
     for status, error_type in (("success", None), ("insufficient_evidence", None),
                                ("failed", "TimeoutError"), ("cancelled", "ClientDisconnected")):
         write_audit(question="q", source_used="kb", status=status, error_type=error_type,
@@ -210,7 +211,7 @@ def test_all_statuses_can_be_linked_to_a_session(settings, session_store):
 )
 def test_anything_but_an_internal_session_id_is_refused(settings, session_store, bad, caplog):
     init_db()
-    created = session_store.create()
+    created = session_store.create(owner_ref=legacy_owner_ref())
     value = created.token if bad == "TOKEN_PLACEHOLDER" else bad
 
     with caplog.at_level(logging.DEBUG), pytest.raises(ValueError) as refused:
@@ -226,13 +227,13 @@ def test_anything_but_an_internal_session_id_is_refused(settings, session_store,
 def test_token_never_reaches_audit_rows_files_or_logs(settings, session_store, caplog):
     init_db()
     with caplog.at_level(logging.DEBUG):
-        created = session_store.create()
+        created = session_store.create(owner_ref=legacy_owner_ref())
         for status in ("success", "failed", "cancelled"):
             write_audit(question="Follow-up question", source_used="kb", status=status,
                         error_type=None if status == "success" else "X", session_id=created.session_id)
         with pytest.raises(ValueError):
             write_audit(question="q", source_used="kb", session_id=created.token)
-        session_store.delete(created.token)
+        session_store.delete(created.token, owner_ref=legacy_owner_ref())
 
     assert not find_token(created.token, records=caplog.records,
                           db_paths=[settings.audit_db_path, session_store.path])
@@ -246,21 +247,21 @@ def test_token_never_reaches_audit_rows_files_or_logs(settings, session_store, c
 
 def test_deleting_a_session_keeps_its_audit_records(settings, session_store):
     init_db()
-    created = session_store.create()
+    created = session_store.create(owner_ref=legacy_owner_ref())
     for number in range(3):
         write_audit(question=f"turn {number}", source_used="kb", request_id=f"r{number}",
                     session_id=created.session_id)
     before = raw_rows(settings)
 
-    session_store.delete(created.token)
+    session_store.delete(created.token, owner_ref=legacy_owner_ref())
 
-    assert session_store.lookup(created.token) is None  # session memory is gone
+    assert session_store.lookup(created.token, owner_ref=legacy_owner_ref()) is None  # session memory is gone
     assert raw_rows(settings) == before  # audit history untouched, including session_id
 
 
 def test_session_expiry_and_cleanup_keep_audit_records(settings, session_store):
     init_db()
-    created = session_store.create()
+    created = session_store.create(owner_ref=legacy_owner_ref())
     write_audit(question="q", source_used="kb", session_id=created.session_id)
     before = raw_rows(settings)
 
@@ -285,7 +286,7 @@ def test_audit_module_has_no_deletion_path():
 
 def test_session_write_failure_raises_and_writes_nothing(settings, session_store, monkeypatch):
     init_db()
-    session_id = session_store.create().session_id
+    session_id = session_store.create(owner_ref=legacy_owner_ref()).session_id
     opened = []
     real_connect = audit._connect
 
@@ -317,7 +318,7 @@ def test_session_write_against_an_unmigrated_database_fails_loudly(settings, ses
     connection.close()
 
     with pytest.raises(sqlite3.OperationalError, match="session_id"):
-        write_audit(question="q", source_used="kb", session_id=session_store.create().session_id)
+        write_audit(question="q", source_used="kb", session_id=session_store.create(owner_ref=legacy_owner_ref()).session_id)
     assert raw_rows(settings) == []
 
 
@@ -333,7 +334,7 @@ def test_invalid_session_id_is_rejected_before_any_database_access(settings, mon
 
 def test_concurrent_session_writes_are_all_persisted(settings, session_store):
     init_db()
-    session_ids = [session_store.create().session_id for _ in range(4)]
+    session_ids = [session_store.create(owner_ref=legacy_owner_ref()).session_id for _ in range(4)]
 
     def write_batch(index):
         return [

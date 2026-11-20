@@ -15,6 +15,9 @@ import sys
 
 MIN_SQLITE = (3, 35, 0)
 
+# Security S1-5 Phase B: the owner the catalogue's statements use (64 lowercase hex).
+CATALOGUE_OWNER = "0123456789abcdef" * 4
+
 SCHEMA = (
     """
     CREATE TABLE sessions (
@@ -24,7 +27,8 @@ SCHEMA = (
         turn_count INTEGER NOT NULL DEFAULT 0,
         lease_epoch INTEGER NOT NULL DEFAULT 0,
         lease_owner TEXT, lease_instance TEXT, lease_keeper_gen INTEGER,
-        lease_started_at REAL, lease_expires_at REAL
+        lease_started_at REAL, lease_expires_at REAL,
+        access_owner_ref TEXT
     )
     """,
     """
@@ -34,6 +38,13 @@ SCHEMA = (
         question TEXT, answer TEXT, source_used TEXT, created_at REAL,
         PRIMARY KEY (session_id, seq)
     )
+    """,
+    """
+    CREATE TRIGGER sessions_owner_immutable
+    BEFORE UPDATE OF access_owner_ref ON sessions
+    BEGIN
+        SELECT RAISE(ABORT, 'session owner is immutable');
+    END
     """,
 )
 
@@ -52,12 +63,14 @@ STATEMENTS = {
                last_activity_at = t.now
           FROM t
          WHERE sessions.id = :sid
+           AND sessions.access_owner_ref = :owner
            AND sessions.idle_expires_at > t.now
            AND sessions.absolute_expires_at > t.now
            AND (sessions.lease_owner IS NULL OR sessions.lease_expires_at <= t.now)
         RETURNING lease_epoch, lease_expires_at, lease_started_at
         """,
-        {"rid": "r2", "inst": "i1", "gen": 1, "ttl": 30.0, "turn_max": 180.0, "sid": "S1"},
+        {"rid": "r2", "inst": "i1", "gen": 1, "ttl": 30.0, "turn_max": 180.0, "sid": "S1",
+         "owner": CATALOGUE_OWNER},
         True,
     ),
     "renew": (
@@ -129,11 +142,11 @@ STATEMENTS = {
         """
         WITH t(now) AS MATERIALIZED (SELECT app_now())
         INSERT INTO sessions (id, token_hash, created_at, last_activity_at,
-                              idle_expires_at, absolute_expires_at)
-        SELECT :id, :token_hash, t.now, t.now, t.now + :idle, t.now + :absolute
+                              idle_expires_at, absolute_expires_at, access_owner_ref)
+        SELECT :id, :token_hash, t.now, t.now, t.now + :idle, t.now + :absolute, :owner
           FROM t
         """,
-        {"id": "S9", "token_hash": "h9", "idle": 1800.0, "absolute": 28800.0},
+        {"id": "S9", "token_hash": "h9", "idle": 1800.0, "absolute": 28800.0, "owner": CATALOGUE_OWNER},
         True,
     ),
     "cap_check": (
@@ -148,6 +161,19 @@ STATEMENTS = {
         {},
         True,
     ),
+    "owner_cap_check": (
+        """
+        WITH t(now) AS MATERIALIZED (SELECT app_now())
+        SELECT count(*)
+          FROM sessions AS s, t
+         WHERE s.access_owner_ref = :owner
+           AND s.absolute_expires_at > t.now
+           AND (s.idle_expires_at > t.now
+                OR (s.lease_owner IS NOT NULL AND s.lease_expires_at > t.now))
+        """,
+        {"owner": CATALOGUE_OWNER},
+        True,
+    ),
     "lookup": (
         """
         WITH t(now) AS MATERIALIZED (SELECT app_now())
@@ -159,8 +185,9 @@ STATEMENTS = {
                s.lease_expires_at - t.now AS lease_remaining
           FROM sessions AS s, t
          WHERE s.token_hash = :token_hash
+           AND s.access_owner_ref = :owner
         """,
-        {"token_hash": "h1"},
+        {"token_hash": "h1", "owner": CATALOGUE_OWNER},
         True,
     ),
     "keeper_generation_move": (
@@ -194,8 +221,8 @@ STATEMENTS = {
         True,
     ),
     "delete_session": (
-        "DELETE FROM sessions WHERE token_hash = :token_hash",
-        {"token_hash": "h1"},
+        "DELETE FROM sessions WHERE token_hash = :token_hash AND access_owner_ref = :owner",
+        {"token_hash": "h1", "owner": CATALOGUE_OWNER},
         False,
     ),
     "bulk_release": (

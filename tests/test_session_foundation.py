@@ -64,16 +64,17 @@ def seeded(clock):
     connection = open_schema()
     register_app_now(connection, clock)
     now = clock.peek()
+    owner = session_sql.CATALOGUE_OWNER  # Phase B: the owner the catalogue statements use
     rows = [
-        ("S1", "h1", now, now, now + IDLE, now + ABSOLUTE, 1, "r1", "i1", 1, now, now + TTL),
-        ("S2", "h2", now, now, now + IDLE, now + ABSOLUTE, 0, None, None, None, None, None),
-        ("S3", "h3", now - 9000, now - 9000, now - 10, now + ABSOLUTE, 0, None, None, None, None, None),
+        ("S1", "h1", now, now, now + IDLE, now + ABSOLUTE, 1, "r1", "i1", 1, now, now + TTL, owner),
+        ("S2", "h2", now, now, now + IDLE, now + ABSOLUTE, 0, None, None, None, None, None, owner),
+        ("S3", "h3", now - 9000, now - 9000, now - 10, now + ABSOLUTE, 0, None, None, None, None, None, owner),
     ]
     connection.executemany(
         """INSERT INTO sessions (id, token_hash, created_at, last_activity_at, idle_expires_at,
                absolute_expires_at, lease_epoch, lease_owner, lease_instance, lease_keeper_gen,
-               lease_started_at, lease_expires_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+               lease_started_at, lease_expires_at, access_owner_ref)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         rows,
     )
     clock.reset_count()

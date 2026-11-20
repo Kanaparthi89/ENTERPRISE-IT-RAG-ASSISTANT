@@ -22,7 +22,7 @@ from app.api import routes, streaming
 from app.rag import cancellation
 from app.services import access, quota, quota_runtime
 from app.services import sessions as session_service
-from tests.conftest import LEGACY_IDENTITY, IsolatedSettings, legacy_access_request
+from tests.conftest import LEGACY_IDENTITY, IsolatedSettings, legacy_access_request, legacy_owner_ref
 from tests.streaming_support import ASGIHarness, body_contains
 from tests.test_chat_api import workflow_result
 from tests.test_stream_run import Gate, ScriptedWorkflow, final_state
@@ -482,7 +482,7 @@ def test_logs_never_contain_codes_cookies_ids_or_questions(client, quotas_on, fa
 def test_session_conflicts_and_expired_sessions_use_no_quota(client, quotas_on, sessions_on, fake_ask):
     token = new_session(client)
     runtime = session_service.get_session_runtime(quotas_on)
-    lease = runtime.manager.acquire(token, "holder")
+    lease = runtime.manager.acquire(token, "holder", owner_ref=legacy_owner_ref())
     try:
         assert ask_chat(client, {"X-Session-ID": token}).status_code == 409
     finally:
@@ -649,7 +649,7 @@ async def test_a_session_stream_conflict_uses_no_quota(stream_app, quotas_on, se
     service = stream_app(CountingWorkflow(answer_steps()))
     token = await create_token()
     runtime = session_service.get_session_runtime(quotas_on)
-    lease = await asyncio.to_thread(runtime.manager.acquire, token, "holder")
+    lease = await asyncio.to_thread(runtime.manager.acquire, token, "holder", owner_ref=legacy_owner_ref())
     try:
         result = await stream_request(token)
         assert result.status == 409

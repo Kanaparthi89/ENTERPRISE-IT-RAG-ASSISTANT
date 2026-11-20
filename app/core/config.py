@@ -86,6 +86,9 @@ class Settings(BaseSettings):
     session_idle_timeout_seconds: float = Field(default=1800.0, ge=60, le=86400)
     session_absolute_timeout_seconds: float = Field(default=28800.0, ge=60, le=604800)
     max_active_sessions: int = Field(default=5000, ge=1, le=100000)
+    # Security S1-5 Phase B: active sessions one access code may hold at once
+    # (the global cap above still applies to everyone together).
+    session_max_active_per_owner: int = Field(default=20, ge=1, le=100000)
     session_db_busy_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
     session_cleanup_batch: int = Field(default=500, ge=1, le=10000)
     session_cleanup_interval_seconds: float = Field(default=300.0, ge=10, le=3600)

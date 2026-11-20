@@ -1,5 +1,6 @@
 
 import asyncio
+import functools
 import json
 import logging
 import math
@@ -168,7 +169,10 @@ SESSION_ERRORS = {
     "origin_not_allowed": (403, "Request origin not allowed."),
     "unsupported_media_type": (415, "Use application/json."),
     "invalid_session_id": (400, "Invalid session ID header."),
+    # S1-5 Phase B: this access code already holds its maximum of open conversations.
+    "session_limit": (429, "You have too many open conversations. Please try again later."),
 }
+SESSION_LIMIT_RETRY_AFTER_SECONDS = 60
 
 
 def _session_error(code: str, headers: dict[str, str] | None = None) -> HTTPException:
@@ -269,13 +273,17 @@ def _iso_utc(timestamp: float) -> str:
     )
 
 
-def _acquire_session_lease(token: str, request_id: str):
-    """Take the session's lease, or raise the matching 410 / 409 / 503."""
+def _acquire_session_lease(token: str, request_id: str, owner_ref: str):
+    """Take the owner's session lease, or raise the matching 410 / 409 / 503.
+
+    ``owner_ref`` comes from the verified access decision (``_session_owner``);
+    a session owned by someone else is the same as an unknown one (410).
+    """
     if not settings.sessions_enabled or not session_service.is_well_formed_token(token):
         raise _session_error("session_expired")
     runtime = session_service.get_session_runtime(settings)
     try:
-        return runtime, runtime.manager.acquire(token, request_id)
+        return runtime, runtime.manager.acquire(token, request_id, owner_ref=owner_ref)
     except session_service.SessionExpired as exc:
         raise _session_error("session_expired") from exc
     except session_service.SessionBusy as exc:
@@ -384,6 +392,22 @@ def _quota_identity(request: Request | None) -> tuple[str, str | None]:
     return identity, decision.code_ref
 
 
+def _session_owner(request: Request | None) -> str:
+    """The session owner (S1-5 Phase B) from the request's verified access decision.
+
+    Read only from ``request.state.access``; nothing the client sends is
+    used. Requires a valid paid identity too. A missing, refused or
+    malformed decision, or a missing or malformed owner, fails closed (503).
+    Never returned to the client or logged.
+    """
+    _quota_identity(request)  # the same identity rules (no ANONYMOUS, a valid code id)
+    owner_ref = getattr(request.state.access, "owner_ref", None)
+    if not access_policy.is_valid_owner_ref(owner_ref):
+        logger.error("Session request without a valid owner identity: refused.")
+        raise _paid_access_error("access_unavailable")
+    return owner_ref
+
+
 def _require_paid_configuration() -> None:
     """Defence in depth while quotas are off: paid work needs the full configuration (503)."""
     problem = access_policy.configuration_problem(settings)
@@ -463,7 +487,8 @@ def _chat_with_session(question: str, request_id: str, token: str, request: Requ
     scope: on every path the lease is released (without saving unless the
     turn was saved) and the quota ticket, if any, is released once.
     """
-    runtime, lease = _acquire_session_lease(token, request_id)
+    owner_ref = _session_owner(request)  # S1-5 Phase B: before any session SQL
+    runtime, lease = _acquire_session_lease(token, request_id, owner_ref)
     ticket = None
     finished = False
     try:
@@ -755,6 +780,7 @@ async def _chat_stream_with_session(question: str, request_id: str, token: str, 
     capacity slot released exactly once), then the run starts. All of these
     errors are returned before any SSE bytes. SQLite runs in worker threads.
     """
+    owner_ref = _session_owner(request)  # S1-5 Phase B: before capacity or any session SQL
     service = streaming.get_stream_service()
     reservation = service.reserve()
     if reservation is None:
@@ -770,7 +796,7 @@ async def _chat_stream_with_session(question: str, request_id: str, token: str, 
         # must not be cancelled before handing it to the run (or releasing it).
         with anyio.CancelScope(shield=True):
             runtime, lease = await anyio.to_thread.run_sync(
-                _acquire_session_lease, token, request_id
+                _acquire_session_lease, token, request_id, owner_ref
             )
         # S1-4b: after the stream capacity and the session checks, before the
         # worker starts. Released with the stream's slot, only once both the
@@ -891,12 +917,17 @@ async def create_session(request: Request, response: Response):
     if not settings.sessions_enabled:  # also checked first by the route class
         raise HTTPException(status_code=404, detail="Not Found")
     _recheck_paid_request(request)  # S1-5: before the body is read or a session created
+    owner_ref = _session_owner(request)  # S1-5 Phase B: the new session's owner
     await _check_session_creation_request(request)
 
     runtime = session_service.get_session_runtime(settings)
     try:
-        created = await anyio.to_thread.run_sync(runtime.store.create)
-    except session_service.SessionStoreUnavailable as exc:
+        created = await anyio.to_thread.run_sync(functools.partial(runtime.store.create, owner_ref=owner_ref))
+    except session_service.SessionOwnerCapacityReached as exc:
+        raise _session_error(
+            "session_limit", headers={"Retry-After": str(SESSION_LIMIT_RETRY_AFTER_SECONDS)}
+        ) from exc
+    except session_service.SessionStoreUnavailable as exc:  # incl. the global cap and SessionSchemaError
         raise _session_error("session_unavailable") from exc
 
     response.headers["Cache-Control"] = "no-store"
@@ -916,11 +947,12 @@ def delete_session(session_token: str | None = Depends(_session_token), request:
     deletion can't be confirmed. Audit records are not affected.
     """
     _recheck_paid_request(request)  # S1-5: before anything is deleted
+    owner_ref = _session_owner(request)  # S1-5 Phase B: only the owner's session is deleted
     if session_token is None or not session_service.is_well_formed_token(session_token):
         raise _session_error("invalid_session_id")
     runtime = session_service.get_session_runtime(settings)
     try:
-        runtime.store.delete(session_token)
+        runtime.store.delete(session_token, owner_ref=owner_ref)
     except session_service.SessionStoreUnavailable as exc:
         raise _session_error("session_unavailable") from exc
     return Response(status_code=204)

@@ -24,6 +24,11 @@ from pathlib import Path
 
 GUARD = 5.0
 
+# Security S1-5 Phase B: the store requires an explicit owner on every
+# token operation (no default). Tests that don't test ownership use this one.
+TEST_OWNER = "a1" * 32
+OTHER_OWNER = "b2" * 32
+
 
 # -------------------------------------------------------------------
 # Clock
@@ -342,7 +347,7 @@ def acquire_race_worker(db_path, tokens, instance, barrier, results) -> None:
         try:
             store.acquire(
                 token, f"{instance}-{index}", instance=instance, keeper_gen=1,
-                ttl=300.0, turn_max=600.0, history_turns=0,
+                ttl=300.0, turn_max=600.0, history_turns=0, owner_ref=TEST_OWNER,
             )
             wins.append(index)
         except SessionBusy:

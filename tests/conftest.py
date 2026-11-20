@@ -529,9 +529,11 @@ def access_throttle_cleared():
 # replaces three functions of app/services/access_policy.py, in tests only:
 #
 # * ``configuration_problem``: None (paid routes run with access or quotas off);
-# * ``evaluate``: a verified cookie still grants its own code, exactly as in
-#   production; any other request is granted the reserved test identity
-#   ``LEGACY_IDENTITY`` (where S1-4 used the anonymous bucket);
+# * ``evaluate``: a verified cookie still grants its own code, with the
+#   session owner derived exactly as in production; any other request is
+#   granted the reserved test identity ``LEGACY_IDENTITY`` (where S1-4 used
+#   the anonymous bucket), whose session owner is the fixed, explicit
+#   ``LEGACY_OWNER_REF`` (S1-5 Phase B: never ANONYMOUS, never implicit);
 # * ``origin_allowed``: a request with neither Origin nor Sec-Fetch-Site is
 #   allowed (a non-browser test client); one that sends either is checked
 #   for real, against PUBLIC_ORIGINS = LEGACY_PUBLIC_ORIGIN.
@@ -560,7 +562,17 @@ LEGACY_ACCESS_MODULES = frozenset({
     "tests.test_workflow_history",
 })
 LEGACY_IDENTITY = "legacy-compat"
+# S1-5 Phase B: the session owner of LEGACY_IDENTITY, derived like any other
+# (code id + a fixed 22-character fingerprint), so it is a valid owner_ref.
+LEGACY_FINGERPRINT = "legacy-compat-fp-00000"
 LEGACY_PUBLIC_ORIGIN = "http://testserver"  # TestClient's default Host
+
+
+def legacy_owner_ref() -> str:
+    """The fixed session owner of the shim's legacy identity (64 lowercase hex)."""
+    from app.services import access_policy
+
+    return access_policy.derive_owner_ref(LEGACY_IDENTITY, LEGACY_FINGERPRINT)
 
 
 def legacy_access_decision():
@@ -572,6 +584,7 @@ def legacy_access_decision():
         "legacy-compat",
         grant=access.AccessGrant(code_id=LEGACY_IDENTITY, expires_at=2**31 - 1),
         code_ref="legacy",
+        owner_ref=legacy_owner_ref(),
     )
 
 
@@ -602,10 +615,13 @@ def legacy_access_compat(request, monkeypatch):
                 grant = access.verify_cookie(
                     config, http_request.cookies.get(config.cookie_name), access.wall_clock()
                 )
-                if grant is not None:
+                code = None if grant is None else next(
+                    (item for item in config.codes if item.code_id == grant.code_id), None)
+                if code is not None:
                     return access_policy.AccessDecision(
                         access_policy.GRANTED, access_policy.VERIFIED, grant=grant,
                         code_ref=access.code_reference(config, grant.code_id),
+                        owner_ref=access_policy.derive_owner_ref(grant.code_id, access.code_fingerprint(code)),
                     )
         return legacy_access_decision()
 

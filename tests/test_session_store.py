@@ -25,7 +25,7 @@ from app.services.sessions import (
 )
 from tests import session_sql
 from tests.conftest import TEST_SETTINGS
-from tests.session_support import AdvancingClock, ConnectionSpy, count_session_rows, find_token
+from tests.session_support import TEST_OWNER, AdvancingClock, ConnectionSpy, count_session_rows, find_token
 from tests.streaming_support import FakeClock
 
 IDLE, ABSOLUTE = 1800.0, 28800.0
@@ -74,6 +74,7 @@ def normalized(sql: str) -> str:
     [
         (sessions.SQL_CREATE_SESSION, "create_session"),
         (sessions.SQL_CAP_CHECK, "cap_check"),
+        (sessions.SQL_OWNER_CAP_CHECK, "owner_cap_check"),
         (sessions.SQL_LOOKUP, "lookup"),
         (sessions.SQL_CLEANUP, "cleanup"),
         (sessions.SQL_DELETE_SESSION, "delete_session"),
@@ -115,7 +116,7 @@ def test_old_sqlite_disables_every_operation(make_store, caplog):
     store = make_store(sqlite_version="3.34.1")
 
     with caplog.at_level(logging.ERROR, logger="app.services.sessions"):
-        for operation in (store.create, lambda: store.lookup("t"), lambda: store.delete("t"), store.cleanup):
+        for operation in (lambda: store.create(owner_ref=TEST_OWNER), lambda: store.lookup("t", owner_ref=TEST_OWNER), lambda: store.delete("t", owner_ref=TEST_OWNER), store.cleanup):
             with pytest.raises(SessionStoreUnavailable):
                 operation()
 
@@ -136,13 +137,13 @@ def test_version_parsing():
 def test_nothing_is_created_until_a_session_is(make_store):
     store = make_store()
 
-    assert store.lookup("unknown") is None
-    store.delete("unknown")
+    assert store.lookup("unknown", owner_ref=TEST_OWNER) is None
+    store.delete("unknown", owner_ref=TEST_OWNER)
     assert store.cleanup().deleted == 0
     assert store.startup_cleanup() is True
     assert not store.path.exists()
 
-    store.create()
+    store.create(owner_ref=TEST_OWNER)
     assert store.path.exists()
 
 
@@ -150,9 +151,9 @@ def test_every_operation_opens_its_own_connection_with_the_lock_timeout(make_sto
     spy = ConnectionSpy()
     store = make_store(connect=spy, busy_timeout_seconds=0.75)
 
-    created = store.create()
-    store.lookup(created.token)
-    store.delete(created.token)
+    created = store.create(owner_ref=TEST_OWNER)
+    store.lookup(created.token, owner_ref=TEST_OWNER)
+    store.delete(created.token, owner_ref=TEST_OWNER)
 
     assert len(spy.connects) >= 4  # schema, create, cleanup-on-create, lookup, delete
     assert set(spy.timeouts()) == {0.75}
@@ -161,7 +162,7 @@ def test_every_operation_opens_its_own_connection_with_the_lock_timeout(make_sto
 def test_connection_pragmas(make_store):
     spy = ConnectionSpy()
     store = make_store(connect=spy)
-    store.create()
+    store.create(owner_ref=TEST_OWNER)
 
     pragmas = [r.sql for r in spy.executes if r.sql.startswith("PRAGMA")]
     for expected in ("journal_mode = WAL", "synchronous = NORMAL", "foreign_keys = ON", "secure_delete = ON"):
@@ -175,10 +176,10 @@ async def test_store_refuses_the_event_loop_thread_but_works_in_a_worker(make_st
     store = make_store()
 
     with pytest.raises(RuntimeError, match="event-loop thread"):
-        store.create()
+        store.create(owner_ref=TEST_OWNER)
 
-    created = await asyncio.to_thread(store.create)
-    info = await asyncio.to_thread(store.lookup, created.token)
+    created = await asyncio.to_thread(store.create, owner_ref=TEST_OWNER)
+    info = await asyncio.to_thread(store.lookup, created.token, owner_ref=TEST_OWNER)
     assert info.session_id == created.session_id
 
 
@@ -188,7 +189,7 @@ def test_operations_run_from_many_threads(make_store):
 
     def worker():
         try:
-            tokens.append(store.create().token)
+            tokens.append(store.create(owner_ref=TEST_OWNER).token)
         except Exception as exc:  # noqa: BLE001 - recorded for the assertion
             errors.append(exc)
 
@@ -200,7 +201,7 @@ def test_operations_run_from_many_threads(make_store):
 
     assert errors == []
     assert count_session_rows(store.path) == 20
-    assert all(store.lookup(token) for token in tokens)
+    assert all(store.lookup(token, owner_ref=TEST_OWNER) for token in tokens)
 
 
 # -------------------------------------------------------------------
@@ -210,7 +211,7 @@ def test_operations_run_from_many_threads(make_store):
 def test_create_stores_only_the_token_hash(make_store):
     store = make_store()
 
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
 
     assert re.fullmatch(r"[A-Za-z0-9_-]{43}", created.token)  # 256 bits, URL-safe
     with raw(store) as connection:
@@ -224,7 +225,7 @@ def test_create_uses_one_time_value(make_store):
     clock = AdvancingClock(start=5_000.0)
     store = make_store(clock=clock)
 
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
 
     with raw(store) as connection:
         row = dict(connection.execute("SELECT * FROM sessions").fetchone())
@@ -242,16 +243,16 @@ def test_each_statement_reads_the_clock_at_most_once(make_store):
     """
     clock = AdvancingClock()
     store = make_store(clock=clock)
-    known = store.create()  # schema in place
+    known = store.create(owner_ref=TEST_OWNER)  # schema in place
     spy = ConnectionSpy()
     store._connect_fn = spy
     counts = {}
 
     for name, call in (
-        ("lookup (known)", lambda: store.lookup(known.token)),
-        ("lookup (unknown)", lambda: store.lookup("never-issued")),
+        ("lookup (known)", lambda: store.lookup(known.token, owner_ref=TEST_OWNER)),
+        ("lookup (unknown)", lambda: store.lookup("never-issued", owner_ref=TEST_OWNER)),
         ("cleanup", store.cleanup),
-        ("create", store.create),
+        ("create", lambda: store.create(owner_ref=TEST_OWNER)),
     ):
         clock.reset_count()
         before = len(spy.executes)
@@ -261,34 +262,35 @@ def test_each_statement_reads_the_clock_at_most_once(make_store):
 
     assert counts["lookup (known)"] == (1, 1)
     assert counts["lookup (unknown)"] == (0, 1)
-    assert counts["create"] == (3, 3)  # cleanup, cap check, insert: one read each
+    # cleanup, global cap check, per-owner cap check (Phase B), insert: one read each
+    assert counts["create"] == (4, 4)
     assert all(calls <= statements for calls, statements in counts.values()), counts
 
 
 def test_cap_counts_only_active_sessions(make_store):
     clock = FakeClock()
     store = make_store(clock=clock, max_active_sessions=2)
-    first = store.create()
-    store.create()
+    first = store.create(owner_ref=TEST_OWNER)
+    store.create(owner_ref=TEST_OWNER)
 
     with pytest.raises(SessionCapacityReached):
-        store.create()
+        store.create(owner_ref=TEST_OWNER)
     assert count_session_rows(store.path) == 2
 
     clock.advance(IDLE)  # both idle-expired: no longer active, and cleaned up on create
-    store.create()
-    assert store.lookup(first.token) is None
+    store.create(owner_ref=TEST_OWNER)
+    assert store.lookup(first.token, owner_ref=TEST_OWNER) is None
 
 
 def test_session_with_a_live_lease_counts_towards_the_cap(make_store):
     clock = FakeClock()
     store = make_store(clock=clock, max_active_sessions=1)
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     set_lease(store, created.session_id, expires_at=clock() + IDLE + 60)
     clock.advance(IDLE)  # idle-expired, but leased
 
     with pytest.raises(SessionCapacityReached):
-        store.create()
+        store.create(owner_ref=TEST_OWNER)
 
 
 # -------------------------------------------------------------------
@@ -298,38 +300,38 @@ def test_session_with_a_live_lease_counts_towards_the_cap(make_store):
 def test_lookup_reports_unknown_valid_and_expired(make_store):
     clock = FakeClock()
     store = make_store(clock=clock)
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
 
-    assert store.lookup("never-issued") is None
-    info = store.lookup(created.token)
+    assert store.lookup("never-issued", owner_ref=TEST_OWNER) is None
+    info = store.lookup(created.token, owner_ref=TEST_OWNER)
     assert (info.session_id, info.expired, info.live_lease, info.lease_remaining) == (
         created.session_id, False, False, None)
 
     clock.advance(IDLE - 0.001)
-    assert store.lookup(created.token).expired is False
+    assert store.lookup(created.token, owner_ref=TEST_OWNER).expired is False
     clock.advance(0.001)  # exactly at idle_expires_at: expired (strict)
-    assert store.lookup(created.token).expired is True
+    assert store.lookup(created.token, owner_ref=TEST_OWNER).expired is True
 
 
 def test_live_lease_keeps_an_idle_session_valid_but_not_past_the_absolute_limit(make_store):
     clock = FakeClock()
     store = make_store(clock=clock)
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     set_lease(store, created.session_id, expires_at=clock() + IDLE + 30)
 
     clock.advance(IDLE + 10)
-    info = store.lookup(created.token)
+    info = store.lookup(created.token, owner_ref=TEST_OWNER)
     assert (info.expired, info.live_lease) == (False, True)
     assert info.lease_remaining == pytest.approx(20)
 
     clock.advance(20)  # lease expired at exactly this instant
-    assert store.lookup(created.token).live_lease is False
-    assert store.lookup(created.token).expired is True
+    assert store.lookup(created.token, owner_ref=TEST_OWNER).live_lease is False
+    assert store.lookup(created.token, owner_ref=TEST_OWNER).expired is True
 
-    other = store.create()
+    other = store.create(owner_ref=TEST_OWNER)
     set_lease(store, other.session_id, expires_at=clock() + ABSOLUTE + 100)
     clock.advance(ABSOLUTE)
-    assert store.lookup(other.token).expired is True  # absolute limit ignores leases
+    assert store.lookup(other.token, owner_ref=TEST_OWNER).expired is True  # absolute limit ignores leases
 
 
 # -------------------------------------------------------------------
@@ -338,8 +340,8 @@ def test_live_lease_keeps_an_idle_session_valid_but_not_past_the_absolute_limit(
 
 def test_delete_removes_the_session_and_its_turns(make_store):
     store = make_store()
-    created = store.create()
-    keep = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
+    keep = store.create(owner_ref=TEST_OWNER)
     with raw(store) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.executemany(
@@ -347,9 +349,9 @@ def test_delete_removes_the_session_and_its_turns(make_store):
             [(created.session_id, 1), (created.session_id, 2), (keep.session_id, 1)],
         )
 
-    store.delete(created.token)
+    store.delete(created.token, owner_ref=TEST_OWNER)
 
-    assert store.lookup(created.token) is None
+    assert store.lookup(created.token, owner_ref=TEST_OWNER) is None
     with raw(store) as connection:
         assert [tuple(r) for r in connection.execute("SELECT session_id FROM turns")] == [(keep.session_id,)]
 
@@ -357,44 +359,44 @@ def test_delete_removes_the_session_and_its_turns(make_store):
 def test_delete_is_idempotent_and_reveals_nothing(make_store):
     clock = FakeClock()
     store = make_store(clock=clock)
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
 
-    store.delete(created.token)
-    store.delete(created.token)  # already deleted
-    store.delete("never-issued")  # unknown
-    expired = store.create()
+    store.delete(created.token, owner_ref=TEST_OWNER)
+    store.delete(created.token, owner_ref=TEST_OWNER)  # already deleted
+    store.delete("never-issued", owner_ref=TEST_OWNER)  # unknown
+    expired = store.create(owner_ref=TEST_OWNER)
     clock.advance(ABSOLUTE)
-    store.delete(expired.token)  # expired
+    store.delete(expired.token, owner_ref=TEST_OWNER)  # expired
 
     assert count_session_rows(store.path) == 0
 
 
 def test_delete_during_an_active_lease_still_deletes(make_store):
     store = make_store()
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     set_lease(store, created.session_id, expires_at=1e12)
 
-    store.delete(created.token)
+    store.delete(created.token, owner_ref=TEST_OWNER)
 
-    assert store.lookup(created.token) is None
+    assert store.lookup(created.token, owner_ref=TEST_OWNER) is None
 
 
 def test_delete_reports_unavailable_when_the_lock_cannot_be_taken(make_store, caplog):
     store = make_store(busy_timeout_seconds=0.2)
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     blocker = sqlite3.connect(store.path, isolation_level=None)
     blocker.execute("BEGIN EXCLUSIVE")
     try:
         started = time.monotonic()
         with caplog.at_level(logging.ERROR, logger="app.services.sessions"):
             with pytest.raises(SessionStoreUnavailable):
-                store.delete(created.token)
+                store.delete(created.token, owner_ref=TEST_OWNER)
         assert time.monotonic() - started < 2.0  # bounded by the lock timeout
     finally:
         blocker.execute("ROLLBACK")
         blocker.close()
 
-    assert store.lookup(created.token) is not None  # still there: deletion not confirmed
+    assert store.lookup(created.token, owner_ref=TEST_OWNER) is not None  # still there: deletion not confirmed
     assert not find_token(created.token, records=caplog.records)
 
 
@@ -405,7 +407,7 @@ def test_delete_reports_unavailable_when_the_database_cannot_be_opened(tmp_path)
                          max_active_sessions=10, busy_timeout_seconds=0.2)
 
     with pytest.raises(SessionStoreUnavailable):
-        store.delete("anything")
+        store.delete("anything", owner_ref=TEST_OWNER)
 
 
 def test_token_shape_check():
@@ -422,20 +424,20 @@ def test_token_shape_check():
 def test_cleanup_removes_expired_sessions_but_never_a_live_lease(make_store):
     clock = FakeClock()
     store = make_store(clock=clock)
-    idle_expired = store.create()
-    leased = store.create()
+    idle_expired = store.create(owner_ref=TEST_OWNER)
+    leased = store.create(owner_ref=TEST_OWNER)
     set_lease(store, leased.session_id, expires_at=clock() + IDLE + ABSOLUTE + 100)
     clock.advance(IDLE)
-    fresh = store.create()  # create runs a cleanup batch first
+    fresh = store.create(owner_ref=TEST_OWNER)  # create runs a cleanup batch first
 
-    assert store.lookup(idle_expired.token) is None
-    assert store.lookup(leased.token) is not None
-    assert store.lookup(fresh.token) is not None
+    assert store.lookup(idle_expired.token, owner_ref=TEST_OWNER) is None
+    assert store.lookup(leased.token, owner_ref=TEST_OWNER) is not None
+    assert store.lookup(fresh.token, owner_ref=TEST_OWNER) is not None
 
     clock.advance(ABSOLUTE)  # leased is absolute-expired, but its lease is still live
     assert store.cleanup().deleted == 1  # fresh (idle-expired) only
-    assert store.lookup(fresh.token) is None
-    assert store.lookup(leased.token) is not None
+    assert store.lookup(fresh.token, owner_ref=TEST_OWNER) is None
+    assert store.lookup(leased.token, owner_ref=TEST_OWNER) is not None
 
     set_lease(store, leased.session_id, expires_at=clock())  # lease ends now (strict)
     assert store.cleanup().deleted == 1  # now leased goes too
@@ -447,7 +449,7 @@ def test_cleanup_is_batched(make_store):
     store = make_store(clock=clock, cleanup_batch=2)
     for _ in range(5):
         store._token_factory  # noqa: B018 - distinct tokens come from the default factory
-        store.create()
+        store.create(owner_ref=TEST_OWNER)
     clock.advance(IDLE)
 
     assert [store.cleanup().deleted for _ in range(4)] == [2, 2, 1, 0]
@@ -457,7 +459,7 @@ def test_cleanup_cascades_to_turns_and_checkpoints_the_wal(make_store):
     clock = FakeClock()
     spy = ConnectionSpy()
     store = make_store(clock=clock, connect=spy)
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     with raw(store) as connection:
         connection.execute(
             "INSERT INTO turns (session_id, seq, question, answer) VALUES (?, 1, 'secret question', 'a')",
@@ -481,7 +483,7 @@ def test_deleted_content_is_not_left_in_the_database_files(make_store):
     """
     clock = FakeClock()
     store = make_store(clock=clock)
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     marker = "UNIQUE-SECRET-QUESTION-TEXT-7f3a"
     with raw(store) as connection:
         connection.execute(
@@ -502,7 +504,7 @@ def test_deleted_content_is_not_left_in_the_database_files(make_store):
 def test_cleanup_reports_a_busy_checkpoint_without_failing(make_store):
     clock = FakeClock()
     store = make_store(clock=clock)
-    store.create()
+    store.create(owner_ref=TEST_OWNER)
     clock.advance(IDLE)
     reader = sqlite3.connect(store.path, isolation_level=None)
     reader.execute("BEGIN")
@@ -524,13 +526,13 @@ def test_cleanup_reports_a_busy_checkpoint_without_failing(make_store):
 def test_startup_cleanup_expires_leftover_memory_even_when_disabled(make_store):
     clock = FakeClock()
     store = make_store(clock=clock)
-    old = store.create()
+    old = store.create(owner_ref=TEST_OWNER)
     clock.advance(ABSOLUTE)
 
     restarted = make_store(clock=clock)  # a new process; sessions may be disabled
     assert restarted.startup_cleanup(wait_seconds=2.0) is True
 
-    assert restarted.lookup(old.token) is None
+    assert restarted.lookup(old.token, owner_ref=TEST_OWNER) is None
 
 
 def test_startup_cleanup_does_not_create_the_database(make_store):
@@ -543,7 +545,7 @@ def test_startup_cleanup_does_not_create_the_database(make_store):
 def test_startup_cleanup_never_blocks_startup_beyond_its_wait(make_store):
     clock = FakeClock()
     store = make_store(clock=clock)
-    store.create()
+    store.create(owner_ref=TEST_OWNER)
     clock.advance(IDLE)
     spy = ConnectionSpy()
     spy.stall(matching=lambda sql: "DELETE FROM sessions" in sql)
@@ -575,11 +577,11 @@ def test_store_never_logs_the_token(make_store, caplog):
     clock = FakeClock()
     store = make_store(clock=clock, max_active_sessions=1)
     with caplog.at_level(logging.DEBUG):
-        created = store.create()
-        store.lookup(created.token)
+        created = store.create(owner_ref=TEST_OWNER)
+        store.lookup(created.token, owner_ref=TEST_OWNER)
         with pytest.raises(SessionCapacityReached):
-            store.create()
-        store.delete(created.token)
+            store.create(owner_ref=TEST_OWNER)
+        store.delete(created.token, owner_ref=TEST_OWNER)
         clock.advance(IDLE)
         store.cleanup()
 

@@ -33,6 +33,7 @@ from tests.session_support import (
     Checkpoints,
     ConnectionSpy,
     ManualTrigger,
+    TEST_OWNER,
     acquire_race_worker,
 )
 from tests.streaming_support import FakeClock
@@ -63,6 +64,7 @@ def make_store(path, clock=None, **overrides):
         idle_timeout_seconds=IDLE,
         absolute_timeout_seconds=ABSOLUTE,
         max_active_sessions=10**6,
+        max_active_sessions_per_owner=10**6,  # caps are irrelevant here, as above (Phase B)
         busy_timeout_seconds=0.5,
         clock=clock or FakeClock(),
     )
@@ -72,7 +74,7 @@ def make_store(path, clock=None, **overrides):
 
 def acquire(store, token, rid="r1", *, gen=1, inst="i1", history_turns=4):
     return store.acquire(token, rid, instance=inst, keeper_gen=gen, ttl=TTL,
-                         turn_max=TURN_MAX, history_turns=history_turns)
+                         turn_max=TURN_MAX, history_turns=history_turns, owner_ref=TEST_OWNER)
 
 
 def save(store, lease, answer="answer", question="question", **overrides):
@@ -152,7 +154,7 @@ def test_lease_settings_defaults_and_validation():
 # ===================================================================
 
 def test_acquire_takes_the_lease(store):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
 
     lease = acquire(store, created.token)
 
@@ -164,7 +166,7 @@ def test_acquire_takes_the_lease(store):
 
 
 def test_acquire_returns_recent_history_oldest_first(store):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     for number in range(1, 6):
         lease = acquire(store, created.token, rid=f"r{number}")
         assert save(store, lease, question=f"q{number}", answer=f"a{number}")
@@ -173,11 +175,11 @@ def test_acquire_returns_recent_history_oldest_first(store):
 
     assert [(t.seq, t.question, t.answer) for t in lease.history] == [
         (3, "q3", "a3"), (4, "q4", "a4"), (5, "q5", "a5")]
-    assert acquire(store, store.create().token, rid="x", history_turns=0).history == ()
+    assert acquire(store, store.create(owner_ref=TEST_OWNER).token, rid="x", history_turns=0).history == ()
 
 
 def test_second_request_gets_busy_with_retry_after(store):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     acquire(store, created.token, rid="r1")
     store._clock.advance(12)
 
@@ -189,12 +191,12 @@ def test_second_request_gets_busy_with_retry_after(store):
 
 @pytest.mark.parametrize("case", ["unknown", "deleted", "idle_expired", "absolute_expired"])
 def test_acquire_refuses_missing_or_expired_sessions(store, case):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     token = created.token
     if case == "unknown":
         token = "never-issued"
     elif case == "deleted":
-        store.delete(token)
+        store.delete(token, owner_ref=TEST_OWNER)
     elif case == "idle_expired":
         store._clock.advance(IDLE)
     else:
@@ -214,7 +216,7 @@ def test_acquire_without_a_database_creates_nothing(tmp_path):
 
 def test_expired_lease_can_be_taken_at_exactly_its_expiry(store):
     """No gap at the boundary: at t == lease_expires_at the old owner is invalid."""
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     first = acquire(store, created.token, rid="r1")
     store._clock.advance(TTL - 0.001)
     with pytest.raises(SessionBusy):
@@ -235,7 +237,7 @@ def renew(store, lease, gen=1):
 
 
 def test_renewal_extends_and_keeps_the_session_from_idling(store):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     lease = acquire(store, created.token)
     store._clock.advance(10)
 
@@ -249,7 +251,7 @@ def test_renewal_extends_and_keeps_the_session_from_idling(store):
 
 
 def test_renewal_is_capped_at_turn_max(store):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     lease = acquire(store, created.token)
     for _ in range(int((TURN_MAX - 1) // 20)):
         store._clock.advance(20)
@@ -265,7 +267,7 @@ def test_renewal_is_capped_at_turn_max(store):
 
 
 def test_an_expired_owner_cannot_revive_its_lease(store):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     lease = acquire(store, created.token)
     store._clock.advance(TTL)  # expired, nobody else took it
     before = row(store, created.session_id)
@@ -276,7 +278,7 @@ def test_an_expired_owner_cannot_revive_its_lease(store):
 
 @pytest.mark.parametrize("field", ["gen", "instance", "owner", "epoch"])
 def test_renewal_is_fenced(store, field):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     lease = acquire(store, created.token)
     store._clock.advance(5)
     wrong = {
@@ -297,7 +299,7 @@ def test_renewal_is_fenced(store, field):
 # ===================================================================
 
 def test_save_writes_the_turn_and_releases(store):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     lease = acquire(store, created.token)
     store._clock.advance(3)
 
@@ -312,7 +314,7 @@ def test_save_writes_the_turn_and_releases(store):
 
 
 def test_save_keeps_only_the_newest_turns(store):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     for number in range(1, 8):
         lease = acquire(store, created.token, rid=f"r{number}")
         assert save(store, lease, question=f"q{number}", max_turns=3)
@@ -321,7 +323,7 @@ def test_save_keeps_only_the_newest_turns(store):
 
 
 def test_save_boundaries_at_turn_max(store):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     lease = acquire(store, created.token)
     for _ in range(8):
         store._clock.advance(20)
@@ -331,7 +333,7 @@ def test_save_boundaries_at_turn_max(store):
 
     assert save(store, lease) is True  # TURN_MAX - ε
 
-    other = store.create()
+    other = store.create(owner_ref=TEST_OWNER)
     lease = acquire(store, other.token, rid="r2")
     for _ in range(8):
         store._clock.advance(20)
@@ -344,7 +346,7 @@ def test_save_boundaries_at_turn_max(store):
 
 @pytest.mark.parametrize("case", ["expired", "taken_over", "deleted", "released"])
 def test_save_refused_when_ownership_is_gone(store, case):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     lease = acquire(store, created.token)
     if case == "expired":
         store._clock.advance(TTL)
@@ -352,7 +354,7 @@ def test_save_refused_when_ownership_is_gone(store, case):
         store._clock.advance(TTL)
         acquire(store, created.token, rid="r2")
     elif case == "deleted":
-        store.delete(created.token)
+        store.delete(created.token, owner_ref=TEST_OWNER)
     else:
         store.release(lease)
 
@@ -362,7 +364,7 @@ def test_save_refused_when_ownership_is_gone(store, case):
 
 
 def test_release_is_fenced_on_epoch_and_owner(store):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     old = acquire(store, created.token, rid="r1")
     store._clock.advance(TTL)
     new = acquire(store, created.token, rid="r2")
@@ -374,7 +376,7 @@ def test_release_is_fenced_on_epoch_and_owner(store):
 
 
 def test_keeper_move_is_fenced_and_refuses_expired_leases(store):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     lease = acquire(store, created.token)
 
     assert store.move_generation(lease, new_gen=7) == lease.expires_at
@@ -387,19 +389,19 @@ def test_keeper_move_is_fenced_and_refuses_expired_leases(store):
 
 
 def test_lost_reason_classification(store):
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     lease = acquire(store, created.token)
     assert store.lost_reason(lease, keeper_gen=2, turn_max=TURN_MAX) == "generation"
     store._clock.advance(TTL)
     assert store.lost_reason(lease, keeper_gen=1, turn_max=TURN_MAX) == "expired"
     acquire(store, created.token, rid="r2")
     assert store.lost_reason(lease, keeper_gen=1, turn_max=TURN_MAX) == "taken_over"
-    store.delete(created.token)
+    store.delete(created.token, owner_ref=TEST_OWNER)
     assert store.lost_reason(lease, keeper_gen=1, turn_max=TURN_MAX) == "deleted"
 
 
 def test_bulk_release_fences_each_row_and_chunks(store):
-    tokens = [store.create() for _ in range(650)]
+    tokens = [store.create(owner_ref=TEST_OWNER) for _ in range(650)]
     leases = [acquire(store, created.token, rid=f"r{index}") for index, created in enumerate(tokens)]
     keys = [(lease.session_id, lease.epoch, lease.request_id) for lease in leases]
     keys[0] = (keys[0][0], 99, keys[0][2])  # stale epoch: must not match
@@ -413,7 +415,7 @@ def test_bulk_release_fences_each_row_and_chunks(store):
 
 
 def test_bulk_release_rolls_back_entirely_when_the_deadline_passes(store):
-    leases = [acquire(store, store.create().token, rid=f"r{i}") for i in range(400)]
+    leases = [acquire(store, store.create(owner_ref=TEST_OWNER).token, rid=f"r{i}") for i in range(400)]
     keys = [(lease.session_id, lease.epoch, lease.request_id) for lease in leases]
     checks = iter([True, False])  # first chunk runs, then the deadline has passed
 
@@ -427,7 +429,7 @@ def test_lease_statements_read_the_clock_at_most_once(tmp_path):
     clock = AdvancingClock()
     spy = ConnectionSpy()
     store = make_store(tmp_path / "s.db", clock=clock, connect=spy)
-    created = store.create()
+    created = store.create(owner_ref=TEST_OWNER)
     counts = {}
 
     def measure(name, call):
@@ -455,7 +457,7 @@ def test_lease_statements_read_the_clock_at_most_once(tmp_path):
 
 def test_two_threads_never_both_win_1000_times(tmp_path):
     store = make_store(tmp_path / "s.db", clock=time.time, busy_timeout_seconds=10.0)
-    tokens = [store.create().token for _ in range(1000)]
+    tokens = [store.create(owner_ref=TEST_OWNER).token for _ in range(1000)]
     wins = {"a": [], "b": []}
     barrier = threading.Barrier(2)
 
@@ -479,7 +481,7 @@ def test_two_threads_never_both_win_1000_times(tmp_path):
 
 def test_two_processes_never_both_win_1000_times(tmp_path):
     store = make_store(tmp_path / "s.db", clock=time.time)
-    tokens = [store.create().token for _ in range(1000)]
+    tokens = [store.create(owner_ref=TEST_OWNER).token for _ in range(1000)]
     context = multiprocessing.get_context("spawn")
     barrier = context.Barrier(2)
     results = context.Queue()
@@ -560,8 +562,8 @@ def harness(tmp_path):
 
 def test_keeper_renews_registered_leases(harness):
     h = harness()
-    created = h.store.create()
-    lease = h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    lease = h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     h.clock.advance(10)
 
     h.cycle()
@@ -572,23 +574,23 @@ def test_keeper_renews_registered_leases(harness):
 
 def test_long_turn_keeps_its_lease_and_session(harness):
     h = harness()
-    created = h.store.create()
-    h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     for _ in range(12):  # 120 s, four TTLs
         h.clock.advance(10)
         h.cycle()
 
     with pytest.raises(SessionBusy):
-        h.manager.acquire(created.token, "r2")
-    assert h.store.lookup(created.token).expired is False
+        h.manager.acquire(created.token, "r2", owner_ref=TEST_OWNER)
+    assert h.store.lookup(created.token, owner_ref=TEST_OWNER).expired is False
     assert h.manager.state_of("r1") == LEASE_OK
 
 
 def test_turn_max_ends_renewal_and_the_turn_is_not_saved(harness):
     spy = ConnectionSpy()
     h = harness(connect=spy)
-    created = h.store.create()
-    lease = h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    lease = h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     for _ in range(int(TURN_MAX // 10)):
         h.clock.advance(10)
         h.cycle()
@@ -604,8 +606,8 @@ def test_turn_max_ends_renewal_and_the_turn_is_not_saved(harness):
 def test_temporary_lock_errors_are_retried_within_the_window(harness):
     spy = ConnectionSpy()
     h = harness(connect=spy)
-    created = h.store.create()
-    lease = h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    lease = h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     h.clock.advance(10)
     spy.fail_next(3, matching=lambda sql: RENEW_MARKER in sql)
 
@@ -619,8 +621,8 @@ def test_temporary_lock_errors_are_retried_within_the_window(harness):
 def test_errors_until_the_window_ends_lose_the_lease_and_skip_the_save(harness, caplog):
     spy = ConnectionSpy()
     h = harness(connect=spy)
-    created = h.store.create()
-    lease = h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    lease = h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     h.clock.advance(10)
     spy.fail_next(10**6, matching=lambda sql: RENEW_MARKER in sql)
 
@@ -642,8 +644,8 @@ def test_real_lock_contention_shorter_and_longer_than_the_window(tmp_path, hold,
     """Real clock: TTL 3 s, margin 0.2 s, so the window is about 2.8 s."""
     h = Harness(tmp_path, clock=time.time, ttl=3.0, margin=0.2, turn_max=600.0)
     try:
-        created = h.store.create()
-        h.manager.acquire(created.token, "r1")
+        created = h.store.create(owner_ref=TEST_OWNER)
+        h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
         # check_same_thread=False: the timer thread must be able to end the lock.
         blocker = sqlite3.connect(h.store.path, isolation_level=None, check_same_thread=False)
         blocker.execute("BEGIN EXCLUSIVE")
@@ -666,7 +668,7 @@ def test_real_lock_contention_shorter_and_longer_than_the_window(tmp_path, hold,
 
 def test_an_error_in_one_lease_does_not_stop_the_others(harness, monkeypatch):
     h = harness()
-    leases = [h.manager.acquire(h.store.create().token, f"r{i}") for i in range(3)]
+    leases = [h.manager.acquire(h.store.create(owner_ref=TEST_OWNER).token, f"r{i}", owner_ref=TEST_OWNER) for i in range(3)]
     h.clock.advance(10)
     real = h.store.renew_once
 
@@ -689,8 +691,8 @@ def test_an_error_in_one_lease_does_not_stop_the_others(harness, monkeypatch):
 
 def test_stuck_keeper_is_restarted_and_its_late_renewal_is_fenced(harness):
     h = harness()
-    created = h.store.create()
-    lease = h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    lease = h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     old_keeper = h.manager.keeper_thread()
     h.points.pause("keeper:before_lease")
     h.trigger.fire()
@@ -698,7 +700,7 @@ def test_stuck_keeper_is_restarted_and_its_late_renewal_is_fenced(harness):
     h.clock.advance(10)
     h.monotonic.advance(3 * h.manager.interval)  # no cycle for longer than 2 x interval
 
-    h.manager.acquire(h.store.create().token, "r2")  # the restart check runs here
+    h.manager.acquire(h.store.create(owner_ref=TEST_OWNER).token, "r2", owner_ref=TEST_OWNER)  # the restart check runs here
 
     assert h.manager.restarts == 1 and h.manager.generation == 2
     assert row(h.store, created.session_id)["lease_keeper_gen"] == 2
@@ -719,12 +721,12 @@ def test_stuck_keeper_is_restarted_and_its_late_renewal_is_fenced(harness):
 
 def test_dead_keeper_is_restarted(harness):
     h = harness()
-    h.manager.acquire(h.store.create().token, "r1")
+    h.manager.acquire(h.store.create(owner_ref=TEST_OWNER).token, "r1", owner_ref=TEST_OWNER)
     keeper = h.manager.keeper_thread()
     h.manager._stop.set()  # simulate the thread ending
     keeper.join(5)
 
-    h.manager.acquire(h.store.create().token, "r2")
+    h.manager.acquire(h.store.create(owner_ref=TEST_OWNER).token, "r2", owner_ref=TEST_OWNER)
 
     assert h.manager.restarts == 1
     assert h.manager.keeper_thread() is not keeper and h.manager.keeper_thread().is_alive()
@@ -732,8 +734,8 @@ def test_dead_keeper_is_restarted(harness):
 
 def test_finish_without_a_turn_releases(harness):
     h = harness()
-    created = h.store.create()
-    lease = h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    lease = h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
 
     assert h.manager.finish(lease) is None
     assert row(h.store, created.session_id)["lease_owner"] is None
@@ -742,20 +744,20 @@ def test_finish_without_a_turn_releases(harness):
 
 def test_finish_saves_when_owned_and_reports_false_after_delete(harness):
     h = harness()
-    created = h.store.create()
-    lease = h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    lease = h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     assert h.manager.finish(lease, ("q1", "a1", "private_kb")) is True
     assert [t[3] for t in turns(h.store, created.session_id)] == ["q1"]
 
-    lease = h.manager.acquire(created.token, "r2")
-    h.store.delete(created.token)  # DELETE mid-turn
+    lease = h.manager.acquire(created.token, "r2", owner_ref=TEST_OWNER)
+    h.store.delete(created.token, owner_ref=TEST_OWNER)  # DELETE mid-turn
     assert h.manager.finish(lease, ("q2", "a2", None)) is False
 
 
 def test_finish_reports_false_when_the_save_fails(harness, monkeypatch):
     h = harness()
-    created = h.store.create()
-    lease = h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    lease = h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
 
     def broken(*args, **kwargs):
         raise SessionStoreUnavailable("down")
@@ -811,15 +813,15 @@ def leased_count(h):
 
 def test_shutdown_refuses_new_leases_stops_cycles_and_releases(tmp_path):
     h = real_harness(tmp_path)
-    created = h.store.create()
-    h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     h.cycle()
     cycles = h.manager.cycles
 
     report = h.manager.shutdown()
 
     with pytest.raises(SessionStoreUnavailable):
-        h.manager.acquire(h.store.create().token, "r2")
+        h.manager.acquire(h.store.create(owner_ref=TEST_OWNER).token, "r2", owner_ref=TEST_OWNER)
     h.trigger.fire()
     time.sleep(0.1)
     assert h.manager.cycles == cycles  # no cycle after the fence
@@ -830,7 +832,7 @@ def test_shutdown_refuses_new_leases_stops_cycles_and_releases(tmp_path):
 
 def test_shutdown_grace_ends_early_when_turns_finish(tmp_path):
     h = real_harness(tmp_path, shutdown_grace=2.0)
-    lease = h.manager.acquire(h.store.create().token, "r1")
+    lease = h.manager.acquire(h.store.create(owner_ref=TEST_OWNER).token, "r1", owner_ref=TEST_OWNER)
     threading.Timer(0.2, lambda: h.manager.finish(lease, ("q", "a", None))).start()
 
     report = h.manager.shutdown()
@@ -846,7 +848,7 @@ def test_renewal_and_bulk_release_race_never_revives(tmp_path, order):
     clock = FakeClock()
     store = make_store(tmp_path / "race.db", clock=clock, hooks=points, busy_timeout_seconds=5.0)
     for run in range(500):
-        created = store.create()
+        created = store.create(owner_ref=TEST_OWNER)
         lease = acquire(store, created.token, rid=f"r{run}")
         key = [(lease.session_id, lease.epoch, lease.request_id)]
         result = {}
@@ -870,8 +872,8 @@ def test_renewal_and_bulk_release_race_never_revives(tmp_path, order):
 
 def test_stale_keeper_result_is_discarded_after_the_fence(tmp_path):
     h = real_harness(tmp_path)
-    created = h.store.create()
-    h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     h.points.pause("keeper:before_lease")
     h.trigger.fire()
     h.points.wait_reached("keeper:before_lease")
@@ -892,7 +894,7 @@ def test_stale_keeper_result_is_discarded_after_the_fence(tmp_path):
 @pytest.mark.parametrize("count", [1000, 5000])
 def test_shutdown_with_many_leases_stays_within_its_bound(tmp_path, count):
     h = real_harness(tmp_path, shutdown_grace=0.2, keeper_join=0.3, release_budget=2.0)
-    h.manager.acquire(h.store.create().token, "starter")  # starts the keeper
+    h.manager.acquire(h.store.create(owner_ref=TEST_OWNER).token, "starter", owner_ref=TEST_OWNER)  # starts the keeper
     register_many(h, count)
 
     report = h.manager.shutdown()
@@ -904,7 +906,7 @@ def test_shutdown_with_many_leases_stays_within_its_bound(tmp_path, count):
 
 def test_default_budgets_bound_shutdown_at_seven_seconds(tmp_path):
     h = real_harness(tmp_path, shutdown_grace=3.0, keeper_join=2.0, release_budget=2.0)
-    h.manager.acquire(h.store.create().token, "starter")
+    h.manager.acquire(h.store.create(owner_ref=TEST_OWNER).token, "starter", owner_ref=TEST_OWNER)
     register_many(h, 1000)
 
     report = h.manager.shutdown()
@@ -915,8 +917,8 @@ def test_default_budgets_bound_shutdown_at_seven_seconds(tmp_path):
 
 def test_locked_database_rolls_back_and_leases_expire(tmp_path):
     h = real_harness(tmp_path, shutdown_grace=0.2, keeper_join=0.3, release_budget=0.5)
-    created = h.store.create()
-    h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     blocker = sqlite3.connect(h.store.path, isolation_level=None)
     blocker.execute("BEGIN EXCLUSIVE")
     try:
@@ -929,13 +931,13 @@ def test_locked_database_rolls_back_and_leases_expire(tmp_path):
     assert report.release_status == "rolled_back" and report.left_to_expire == 1
     assert row(h.store, created.session_id)["lease_owner"] == "r1"  # untouched
     h.clock.advance(TTL)
-    assert h.store.lookup(created.token).live_lease is False  # recovered by TTL expiry
+    assert h.store.lookup(created.token, owner_ref=TEST_OWNER).live_lease is False  # recovered by TTL expiry
 
 
 def test_stuck_keeper_join_times_out_within_the_bound(tmp_path):
     h = real_harness(tmp_path, shutdown_grace=0.2, keeper_join=0.3, release_budget=0.5)
-    created = h.store.create()
-    h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     h.points.pause("keeper:before_lease")
     h.trigger.fire()
     h.points.wait_reached("keeper:before_lease")
@@ -953,7 +955,7 @@ def test_stuck_keeper_join_times_out_within_the_bound(tmp_path):
 def test_stalled_sqlite_call_does_not_hold_the_hook(tmp_path, caplog):
     spy = ConnectionSpy()
     h = real_harness(tmp_path, connect=spy, shutdown_grace=0.2, keeper_join=0.3, release_budget=0.5)
-    leases = [h.manager.acquire(h.store.create().token, f"r{i}") for i in range(5)]
+    leases = [h.manager.acquire(h.store.create(owner_ref=TEST_OWNER).token, f"r{i}", owner_ref=TEST_OWNER) for i in range(5)]
     spy.stall(matching=lambda sql: "IN (VALUES" in sql)
 
     with caplog.at_level(logging.ERROR, logger="app.services.sessions"):
@@ -976,8 +978,8 @@ def test_stalled_sqlite_call_does_not_hold_the_hook(tmp_path, caplog):
 def test_late_renewal_after_a_failed_release_extends_at_most_once(tmp_path):
     points = Checkpoints()
     h = real_harness(tmp_path, store_hooks=points, shutdown_grace=0.2, keeper_join=0.3, release_budget=0.5)
-    created = h.store.create()
-    h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     h.clock.advance(10)
     points.pause("renew:before_update")
     h.trigger.fire()
@@ -998,13 +1000,13 @@ def test_late_renewal_after_a_failed_release_extends_at_most_once(tmp_path):
     assert not h.manager.keeper_thread().is_alive()
     assert row(h.store, created.session_id)["lease_expires_at"] == expires  # no further renewal
     h.clock.advance(TTL)
-    assert h.store.lookup(created.token).live_lease is False
+    assert h.store.lookup(created.token, owner_ref=TEST_OWNER).live_lease is False
 
 
 def test_a_request_still_running_after_shutdown_cannot_save(tmp_path):
     h = real_harness(tmp_path)
-    created = h.store.create()
-    lease = h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    lease = h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
 
     h.manager.shutdown()
 
@@ -1046,8 +1048,8 @@ def run_in_thread(target):
 def test_finish_after_a_rolled_back_release_is_refused(tmp_path):
     """The database still shows the lease, but the fence refuses the save."""
     h = real_harness(tmp_path, shutdown_grace=0.2, keeper_join=0.3, release_budget=0.5)
-    created = h.store.create()
-    lease = h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    lease = h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     blocker = sqlite3.connect(h.store.path, isolation_level=None)
     blocker.execute("BEGIN EXCLUSIVE")
     try:
@@ -1068,8 +1070,8 @@ def test_a_save_holding_the_gate_first_completes_atomically(tmp_path):
     store_points = Checkpoints()
     h = real_harness(tmp_path, store_hooks=store_points,
                      shutdown_grace=0.2, keeper_join=0.3, release_budget=0.5)
-    created = h.store.create()
-    lease = h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    lease = h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     store_points.pause("save:before_commit")
 
     saver, saved = run_in_thread(lambda: h.manager.finish(lease, ("q", "a", None)))
@@ -1090,8 +1092,8 @@ def test_a_save_holding_the_gate_first_completes_atomically(tmp_path):
 
 def test_a_save_after_the_fence_took_the_gate_is_refused(tmp_path):
     h = real_harness(tmp_path, shutdown_grace=0.2, keeper_join=0.3, release_budget=0.5)
-    created = h.store.create()
-    lease = h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    lease = h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     h.points.pause("shutdown:fenced")
 
     stopper, report = run_in_thread(h.manager.shutdown)
@@ -1122,8 +1124,8 @@ def test_a_save_waiting_for_the_gate_at_the_fence_is_refused(tmp_path, caplog):
     """
     h = real_harness(tmp_path, shutdown_grace=0.2, keeper_join=0.3, release_budget=0.5)
     h.store.busy_timeout_seconds = 3.0
-    created = h.store.create()
-    lease = h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    lease = h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
     h.manager._save_gate.acquire()  # another save in progress
     try:
         saver, saved = run_in_thread(lambda: h.manager.finish(lease, ("q", "a", None)))
@@ -1159,8 +1161,8 @@ def gated(tmp_path):
     store_points = Checkpoints()
     h = real_harness(tmp_path, store_hooks=store_points, shutdown_grace=0.2,
                      keeper_join=0.3, release_budget=0.5)
-    first, second = h.store.create(), h.store.create()
-    leases = h.manager.acquire(first.token, "r1"), h.manager.acquire(second.token, "r2")
+    first, second = h.store.create(owner_ref=TEST_OWNER), h.store.create(owner_ref=TEST_OWNER)
+    leases = h.manager.acquire(first.token, "r1", owner_ref=TEST_OWNER), h.manager.acquire(second.token, "r2", owner_ref=TEST_OWNER)
     yield h, store_points, (first, second), leases
     for name in list(store_points._paused):
         store_points.release(name)
@@ -1210,7 +1212,7 @@ def test_a_gate_timeout_while_the_holder_has_the_write_lock_leaves_the_lease_to_
     saver_1.join(JOIN)
     assert saved_1 == {"value": True}
     h.clock.advance(TTL)
-    assert h.store.lookup(second.token).live_lease is False  # recovered by TTL expiry
+    assert h.store.lookup(second.token, owner_ref=TEST_OWNER).live_lease is False  # recovered by TTL expiry
 
 
 def test_bulk_release_winning_the_write_lock_makes_an_admitted_save_fail(gated, caplog):
@@ -1265,8 +1267,8 @@ def test_save_winning_the_write_lock_commits_after_the_bounded_fallback(gated):
 
 def test_a_turn_finishing_within_the_grace_is_still_saved(tmp_path):
     h = real_harness(tmp_path, shutdown_grace=1.0, keeper_join=0.3, release_budget=0.5)
-    created = h.store.create()
-    lease = h.manager.acquire(created.token, "r1")
+    created = h.store.create(owner_ref=TEST_OWNER)
+    lease = h.manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
 
     stopper, report = run_in_thread(h.manager.shutdown)
     time.sleep(0.05)  # shutdown is waiting for in-flight turns
@@ -1286,14 +1288,14 @@ def test_default_keeper_loop_renews_on_its_own(tmp_path):
         answer_chars=2000, shutdown_grace=0.1, keeper_join=0.5, release_budget=0.5,
     )
     try:
-        created = store.create()
-        lease = manager.acquire(created.token, "r1")
+        created = store.create(owner_ref=TEST_OWNER)
+        lease = manager.acquire(created.token, "r1", owner_ref=TEST_OWNER)
         time.sleep(1.5)  # 2.5 TTLs: without renewal the lease would have expired
 
         assert manager.cycles >= 4
         assert manager.state_of("r1") == LEASE_OK
         assert manager.confirmed_until("r1") > lease.expires_at
-        assert store.lookup(created.token).live_lease is True
+        assert store.lookup(created.token, owner_ref=TEST_OWNER).live_lease is True
         assert manager.finish(lease, ("q", "a", None)) is True
     finally:
         report = manager.shutdown()

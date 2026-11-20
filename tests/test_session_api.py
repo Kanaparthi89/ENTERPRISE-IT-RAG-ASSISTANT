@@ -24,7 +24,7 @@ from app.rag.state import EvidenceGrade, RouteDecision
 from app.services import audit
 from app.services import sessions as session_service
 from app.services.audit import get_recent_audits
-from tests.conftest import FakeLLM, FakeRetriever, kb_doc
+from tests.conftest import FakeLLM, FakeRetriever, kb_doc, legacy_owner_ref
 from tests.session_support import count_session_rows, find_token
 from tests.stateless_scenarios import SCENARIO_NAMES, load_golden, run_scenario
 
@@ -332,7 +332,7 @@ def test_create_reports_storage_failures_and_the_cap(client, enabled, monkeypatc
     at_cap = client.post("/api/sessions", headers=JSON, json={})
     assert at_cap.status_code == 503 and detail(at_cap)["code"] == "session_unavailable"
 
-    def broken():
+    def broken(*, owner_ref):  # the store's real signature: an owner is required (Phase B)
         raise session_service.SessionStoreUnavailable("down")
 
     monkeypatch.setattr(runtime().store, "create", broken)
@@ -448,7 +448,7 @@ def test_follow_up_uses_stored_history_end_to_end(client, enabled, fake_rag):
 
 def test_busy_session_gets_409_without_running(client, enabled, fake_ask):
     token = new_session(client)
-    lease = runtime().manager.acquire(token, "someone-else")
+    lease = runtime().manager.acquire(token, "someone-else", owner_ref=legacy_owner_ref())
 
     response = ask_in_session(client, token)
 
@@ -516,7 +516,7 @@ def test_storage_failure_when_taking_the_lease_gets_503(client, enabled, fake_as
 
 def test_turn_saved_is_false_when_the_session_is_deleted_mid_answer(client, enabled, fake_ask):
     token = new_session(client)
-    fake_ask.during = lambda: runtime().store.delete(token)
+    fake_ask.during = lambda: runtime().store.delete(token, owner_ref=legacy_owner_ref())
 
     response = ask_in_session(client, token)
 
@@ -644,7 +644,7 @@ def test_token_never_appears_in_logs_audit_errors_or_other_responses(client, ena
     with caplog.at_level(logging.DEBUG):
         token = new_session(client)  # the only response allowed to contain it
         bodies.append(ask_in_session(client, token).content)
-        lease = runtime().manager.acquire(token, "holder")
+        lease = runtime().manager.acquire(token, "holder", owner_ref=legacy_owner_ref())
         bodies.append(ask_in_session(client, token).content)  # 409
         runtime().manager.finish(lease)
         fake_ask.error = RuntimeError("boom")
@@ -694,7 +694,7 @@ def test_tests_never_touch_the_real_sessions_database(enabled):
 @pytest.mark.parametrize("entry", ["app.main", "app.api.main"])
 def test_lifespan_runs_startup_cleanup_on_both_entry_points(enabled, entry, monkeypatch):
     store = session_service.SessionStore.from_settings(enabled)
-    old = store.create()
+    old = store.create(owner_ref=legacy_owner_ref())
     connection = sqlite3.connect(enabled.session_db_path)
     connection.execute("UPDATE sessions SET idle_expires_at = 0, absolute_expires_at = 0")
     connection.commit()
@@ -706,7 +706,7 @@ def test_lifespan_runs_startup_cleanup_on_both_entry_points(enabled, entry, monk
         pass
 
     assert count_session_rows(enabled.session_db_path) == 0
-    assert store.lookup(old.token) is None
+    assert store.lookup(old.token, owner_ref=legacy_owner_ref()) is None
 
 
 def test_lifespan_without_sessions_creates_nothing(settings):
@@ -721,7 +721,7 @@ def test_lifespan_shutdown_is_bounded_and_releases_leases(enabled, fake_ask):
     budget = 0.2 + 0.3 + 0.5
     with TestClient(app.main.app) as client:
         token = new_session(client)
-        held = runtime().manager.acquire(token, "still-running")  # never finished
+        held = runtime().manager.acquire(token, "still-running", owner_ref=legacy_owner_ref())  # never finished
         started = time.monotonic()
     elapsed = time.monotonic() - started
 
@@ -783,7 +783,7 @@ def test_a_failing_stream_close_still_shuts_sessions_down_and_clears_it(enabled,
     with TestClient(app.main.app) as client:
         token = new_session(client)
         record_manager_shutdown(calls)
-        runtime().manager.acquire(token, "still-running")  # never finished
+        runtime().manager.acquire(token, "still-running", owner_ref=legacy_owner_ref())  # never finished
 
     assert [call[0] for call in calls] == ["stream.close", "manager.shutdown"]
     assert streaming.peek_stream_service() is None

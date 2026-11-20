@@ -17,12 +17,24 @@ Rules every operation follows:
   operations in a worker thread.
 * SQLite older than 3.35.0 (needed for ``MATERIALIZED`` and ``RETURNING``)
   disables the store: every operation raises ``SessionStoreUnavailable``.
+* Ownership (Security S1-5 Phase B): every session records the verified
+  access identity that created it (``access_owner_ref``). Create, look-up,
+  lease acquisition and deletion require an explicit ``owner_ref`` (64
+  lowercase hex characters, validated before any SQL) and match it in SQL,
+  in the same transaction. A session owned by someone else is
+  indistinguishable from an unknown one. Rows without an owner (created
+  before Phase B) never match anyone and simply expire. The owner can never
+  be changed (a trigger refuses it).
+* The schema is versioned (``PRAGMA user_version``): version 0 databases are
+  migrated in one ``BEGIN IMMEDIATE`` transaction; a database from a newer
+  version, or one whose ownership schema doesn't verify, is refused.
 """
 
 import asyncio
 import hashlib
 import logging
 import random
+import re
 import secrets
 import sqlite3
 import threading
@@ -37,7 +49,29 @@ logger = logging.getLogger(__name__)
 MIN_SQLITE_VERSION = (3, 35, 0)
 MAX_TOKEN_LENGTH = 128
 
-SCHEMA = (
+# Security S1-5 Phase B: session ownership.
+SCHEMA_VERSION = 1  # PRAGMA user_version; 0 = before Phase B (no owner column)
+OWNER_COLUMN = "access_owner_ref"
+OWNER_TRIGGER = "sessions_owner_immutable"
+OWNER_REF_PATTERN = re.compile(r"[0-9a-f]{64}")
+DEFAULT_MAX_ACTIVE_SESSIONS_PER_OWNER = 20
+
+# WAL initialisation (B3-R1). Switching a rollback-journal database to WAL can
+# fail with SQLITE_BUSY/SQLITE_LOCKED immediately (without the busy handler)
+# while other processes hold locks. Retried only for those codes, with a
+# small jittered exponential backoff, until the store's busy timeout (a
+# monotonic deadline) or WAL_INIT_MAX_ATTEMPTS, whichever comes first.
+SQLITE_BUSY = 5
+SQLITE_LOCKED = 6
+WAL_INIT_MAX_ATTEMPTS = 50
+WAL_INIT_FIRST_DELAY_SECONDS = 0.005
+WAL_INIT_MAX_DELAY_SECONDS = 0.1
+_monotonic = time.monotonic  # module attributes so tests can drive the clock
+_sleep = time.sleep
+
+# The owner column is last, so a migrated table (ALTER TABLE ... ADD COLUMN
+# appends) has the same columns, in the same order, as a new one.
+SCHEMA_TABLES = (
     """
     CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
@@ -46,7 +80,8 @@ SCHEMA = (
         turn_count INTEGER NOT NULL DEFAULT 0,
         lease_epoch INTEGER NOT NULL DEFAULT 0,
         lease_owner TEXT, lease_instance TEXT, lease_keeper_gen INTEGER,
-        lease_started_at REAL, lease_expires_at REAL
+        lease_started_at REAL, lease_expires_at REAL,
+        access_owner_ref TEXT
     )
     """,
     """
@@ -58,6 +93,14 @@ SCHEMA = (
     )
     """,
 )
+SCHEMA_OWNER_TRIGGER = """
+    CREATE TRIGGER IF NOT EXISTS sessions_owner_immutable
+    BEFORE UPDATE OF access_owner_ref ON sessions
+    BEGIN
+        SELECT RAISE(ABORT, 'session owner is immutable');
+    END
+    """
+SCHEMA = SCHEMA_TABLES + (SCHEMA_OWNER_TRIGGER,)
 
 # Statements from design revision 8, §6.1 (verified in A2-0 on SQLite
 # 3.45.3, 3.46.1 and 3.51.0). tests/test_session_store.py checks they stay
@@ -65,8 +108,8 @@ SCHEMA = (
 SQL_CREATE_SESSION = """
         WITH t(now) AS MATERIALIZED (SELECT app_now())
         INSERT INTO sessions (id, token_hash, created_at, last_activity_at,
-                              idle_expires_at, absolute_expires_at)
-        SELECT :id, :token_hash, t.now, t.now, t.now + :idle, t.now + :absolute
+                              idle_expires_at, absolute_expires_at, access_owner_ref)
+        SELECT :id, :token_hash, t.now, t.now, t.now + :idle, t.now + :absolute, :owner
           FROM t
         """
 
@@ -75,6 +118,17 @@ SQL_CAP_CHECK = """
         SELECT count(*)
           FROM sessions AS s, t
          WHERE s.absolute_expires_at > t.now
+           AND (s.idle_expires_at > t.now
+                OR (s.lease_owner IS NOT NULL AND s.lease_expires_at > t.now))
+        """
+
+# Phase B: the same "active" rule as SQL_CAP_CHECK, for one owner.
+SQL_OWNER_CAP_CHECK = """
+        WITH t(now) AS MATERIALIZED (SELECT app_now())
+        SELECT count(*)
+          FROM sessions AS s, t
+         WHERE s.access_owner_ref = :owner
+           AND s.absolute_expires_at > t.now
            AND (s.idle_expires_at > t.now
                 OR (s.lease_owner IS NOT NULL AND s.lease_expires_at > t.now))
         """
@@ -89,6 +143,7 @@ SQL_LOOKUP = """
                s.lease_expires_at - t.now AS lease_remaining
           FROM sessions AS s, t
          WHERE s.token_hash = :token_hash
+           AND s.access_owner_ref = :owner
         """
 
 SQL_CLEANUP = """
@@ -102,7 +157,7 @@ SQL_CLEANUP = """
                 LIMIT :batch)
         """
 
-SQL_DELETE_SESSION = "DELETE FROM sessions WHERE token_hash = :token_hash"
+SQL_DELETE_SESSION = "DELETE FROM sessions WHERE token_hash = :token_hash AND access_owner_ref = :owner"
 
 # Lease statements, design revision 8 §6 / §6.1 (A2-2).
 SQL_ACQUIRE = """
@@ -117,6 +172,7 @@ SQL_ACQUIRE = """
                last_activity_at = t.now
           FROM t
          WHERE sessions.id = :sid
+           AND sessions.access_owner_ref = :owner
            AND sessions.idle_expires_at > t.now
            AND sessions.absolute_expires_at > t.now
            AND (sessions.lease_owner IS NULL OR sessions.lease_expires_at <= t.now)
@@ -215,6 +271,125 @@ class SessionStoreUnavailable(Exception):
 
 class SessionCapacityReached(SessionStoreUnavailable):
     """The active-session cap has been reached; no session was created."""
+
+
+class SessionOwnerCapacityReached(SessionCapacityReached):
+    """This owner's active-session cap has been reached; no session was created (Phase B)."""
+
+
+class SessionSchemaError(SessionStoreUnavailable):
+    """The database's schema is from a newer version or doesn't verify; it is not used (Phase B)."""
+
+
+class SessionOwnerError(ValueError):
+    """A store operation was called without a valid ``owner_ref`` (a programming error).
+
+    Raised before any SQL runs. The message never contains the value.
+    """
+
+
+def _require_owner(owner_ref) -> str:
+    if not isinstance(owner_ref, str) or OWNER_REF_PATTERN.fullmatch(owner_ref) is None:
+        raise SessionOwnerError("A valid session owner is required.")
+    return owner_ref
+
+
+def _normalized_sql(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql).strip()
+
+
+_EXPECTED_TRIGGER_SQL = _normalized_sql(SCHEMA_OWNER_TRIGGER.replace("IF NOT EXISTS ", ""))
+
+
+def _is_lock_contention(exc: BaseException) -> bool:
+    """True only for SQLite's BUSY or LOCKED result codes (extended codes included).
+
+    Decided by the error code, never the message: corruption, I/O,
+    permission, read-only and every other error are not retried.
+    """
+    code = getattr(exc, "sqlite_errorcode", None)
+    return (
+        isinstance(exc, sqlite3.OperationalError)
+        and isinstance(code, int)
+        and (code & 0xFF) in (SQLITE_BUSY, SQLITE_LOCKED)
+    )
+
+
+def _enable_wal(connection: sqlite3.Connection, busy_timeout_seconds: float) -> int:
+    """Put the database in WAL mode; returns the number of attempts.
+
+    Bounded by a monotonic deadline of ``busy_timeout_seconds`` (each attempt's
+    own busy wait is limited to what remains) and by WAL_INIT_MAX_ATTEMPTS.
+    Raises the last lock error when either bound is reached, any other error
+    at once, and ``SessionStoreUnavailable`` if SQLite reports a journal mode
+    other than WAL. Restores the connection's busy timeout before returning.
+    """
+    deadline = _monotonic() + busy_timeout_seconds
+    original_ms = max(0, int(busy_timeout_seconds * 1000))
+    delay = WAL_INIT_FIRST_DELAY_SECONDS
+    attempts = 0
+    try:
+        while True:
+            attempts += 1
+            remaining = deadline - _monotonic()
+            connection.execute(f"PRAGMA busy_timeout = {max(0, int(remaining * 1000))}")
+            try:
+                (mode,) = connection.execute("PRAGMA journal_mode = WAL").fetchone()
+            except sqlite3.OperationalError as exc:
+                if not _is_lock_contention(exc):
+                    raise
+                remaining = deadline - _monotonic()
+                if attempts >= WAL_INIT_MAX_ATTEMPTS or remaining <= 0:
+                    logger.error("Session store: WAL initialisation still locked after %d attempts.", attempts)
+                    raise
+                _sleep(min(remaining, delay * random.uniform(0.5, 1.0)))  # never a busy spin
+                delay = min(delay * 2, WAL_INIT_MAX_DELAY_SECONDS)
+                continue
+            if not isinstance(mode, str) or mode.lower() != "wal":
+                logger.error("Session store refused: WAL journal mode could not be enabled.")
+                raise SessionStoreUnavailable("Session storage is unavailable.")
+            return attempts
+    finally:
+        try:
+            connection.execute(f"PRAGMA busy_timeout = {original_ms}")
+        except sqlite3.Error:  # never hide the original error; this connection is closed next anyway
+            pass
+
+
+def _verify_schema(connection: sqlite3.Connection) -> None:
+    """Refuse (SessionSchemaError) unless the ownership schema is exactly as designed."""
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if not {"sessions", "turns"} <= tables:
+        raise SessionSchemaError("Session storage is unavailable.")
+    columns = {row[1]: row for row in connection.execute("PRAGMA table_info(sessions)")}
+    owner = columns.get(OWNER_COLUMN)
+    # (cid, name, type, notnull, dflt_value, pk): a plain nullable TEXT column.
+    if owner is None or (owner[2].upper(), owner[3], owner[4], owner[5]) != ("TEXT", 0, None, 0):
+        raise SessionSchemaError("Session storage is unavailable.")
+    triggers = connection.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'sessions'"
+    ).fetchall()
+    if [(name, _normalized_sql(sql or "")) for name, sql in triggers] != [(OWNER_TRIGGER, _EXPECTED_TRIGGER_SQL)]:
+        raise SessionSchemaError("Session storage is unavailable.")
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """Bring the schema to SCHEMA_VERSION inside the caller's BEGIN IMMEDIATE transaction."""
+    (version,) = connection.execute("PRAGMA user_version").fetchone()
+    if version == SCHEMA_VERSION:
+        _verify_schema(connection)  # verified, never repaired: a version-1 file must already be complete
+        return
+    if version != 0:
+        raise SessionSchemaError("Session storage is unavailable.")  # newer (or unknown) version
+    for ddl in SCHEMA_TABLES:
+        connection.execute(ddl)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)")}
+    if OWNER_COLUMN not in columns:
+        # Existing rows keep a NULL owner: never adopted, they expire normally.
+        connection.execute(f"ALTER TABLE sessions ADD COLUMN {OWNER_COLUMN} TEXT")
+    connection.execute(SCHEMA_OWNER_TRIGGER)
+    _verify_schema(connection)
+    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 @dataclass(frozen=True)
@@ -322,6 +497,7 @@ class SessionStore:
         idle_timeout_seconds: float,
         absolute_timeout_seconds: float,
         max_active_sessions: int,
+        max_active_sessions_per_owner: int = DEFAULT_MAX_ACTIVE_SESSIONS_PER_OWNER,
         busy_timeout_seconds: float = 2.0,
         cleanup_batch: int = 500,
         clock: Callable[[], float] = time.time,
@@ -335,6 +511,9 @@ class SessionStore:
         self.idle_timeout_seconds = idle_timeout_seconds
         self.absolute_timeout_seconds = absolute_timeout_seconds
         self.max_active_sessions = max_active_sessions
+        if not isinstance(max_active_sessions_per_owner, int) or max_active_sessions_per_owner < 1:
+            raise ValueError("max_active_sessions_per_owner must be a positive integer.")
+        self.max_active_sessions_per_owner = max_active_sessions_per_owner
         self.busy_timeout_seconds = busy_timeout_seconds
         self.cleanup_batch = cleanup_batch
         self._clock = clock
@@ -354,6 +533,7 @@ class SessionStore:
             idle_timeout_seconds=settings.session_idle_timeout_seconds,
             absolute_timeout_seconds=settings.session_absolute_timeout_seconds,
             max_active_sessions=settings.max_active_sessions,
+            max_active_sessions_per_owner=settings.session_max_active_per_owner,
             busy_timeout_seconds=settings.session_db_busy_timeout_seconds,
             cleanup_batch=settings.session_cleanup_batch,
         )
@@ -404,12 +584,18 @@ class SessionStore:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             connection = self._open()
             try:
-                connection.execute("PRAGMA journal_mode = WAL")  # persistent: once per file
+                # Persistent (once per file); retried on lock contention (B3-R1).
+                _enable_wal(connection, self.busy_timeout_seconds)
                 connection.execute("BEGIN IMMEDIATE")
-                for ddl in SCHEMA:
-                    connection.execute(ddl)
+                try:
+                    _migrate(connection)
+                except SessionSchemaError:
+                    logger.error("Session store refused: the database schema is unsupported or invalid.")
+                    raise
                 connection.execute("COMMIT")
             finally:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
                 connection.close()
             self._schema_ready = True
 
@@ -433,8 +619,14 @@ class SessionStore:
 
     # -- operations --------------------------------------------------------
 
-    def create(self) -> CreatedSession:
-        """Create a session. Runs one cleanup batch first, then enforces the cap."""
+    def create(self, *, owner_ref: str) -> CreatedSession:
+        """Create a session owned by ``owner_ref``. One cleanup batch first, then both caps.
+
+        The global cap and this owner's cap are checked, and the row inserted,
+        in one BEGIN IMMEDIATE transaction (``SessionCapacityReached`` /
+        ``SessionOwnerCapacityReached``).
+        """
+        _require_owner(owner_ref)
         try:
             self.cleanup()
         except SessionStoreUnavailable:
@@ -449,6 +641,11 @@ class SessionStore:
                 connection.execute("ROLLBACK")
                 logger.warning("Session cap reached: %d active sessions.", active)
                 raise SessionCapacityReached("Session storage is unavailable.")
+            (owned,) = connection.execute(SQL_OWNER_CAP_CHECK, {"owner": owner_ref}).fetchone()
+            if owned >= self.max_active_sessions_per_owner:
+                connection.execute("ROLLBACK")
+                logger.warning("Per-owner session cap reached.")  # never logs the owner
+                raise SessionOwnerCapacityReached("Session storage is unavailable.")
             connection.execute(
                 SQL_CREATE_SESSION,
                 {
@@ -456,6 +653,7 @@ class SessionStore:
                     "token_hash": hash_token(token),
                     "idle": self.idle_timeout_seconds,
                     "absolute": self.absolute_timeout_seconds,
+                    "owner": owner_ref,
                 },
             )
             created_at, absolute = connection.execute(
@@ -475,14 +673,20 @@ class SessionStore:
             idle_timeout_seconds=self.idle_timeout_seconds,
         )
 
-    def lookup(self, token: str) -> SessionInfo | None:
-        """The session for ``token``, or None if unknown. Expiry is reported, not enforced."""
+    def lookup(self, token: str, *, owner_ref: str) -> SessionInfo | None:
+        """The session for ``token`` owned by ``owner_ref``, or None if unknown or not theirs.
+
+        Expiry is reported, not enforced.
+        """
+        _require_owner(owner_ref)
         self._check_supported()
         if not self.path.exists():
             return None  # nothing stored yet; never create the file to answer a look-up
 
         def work(connection):
-            return connection.execute(SQL_LOOKUP, {"token_hash": hash_token(token)}).fetchone()
+            return connection.execute(
+                SQL_LOOKUP, {"token_hash": hash_token(token), "owner": owner_ref}
+            ).fetchone()
 
         row = self._run("lookup", work)
         if row is None:
@@ -495,18 +699,23 @@ class SessionStore:
             lease_remaining=lease_remaining if live_lease else None,
         )
 
-    def delete(self, token: str) -> None:
-        """Delete the session and its turns. Idempotent: unknown tokens are not an error.
+    def delete(self, token: str, *, owner_ref: str) -> None:
+        """Delete the session and its turns if ``owner_ref`` owns it. Idempotent.
 
-        Raises ``SessionStoreUnavailable`` if deletion can't be confirmed.
+        Unknown tokens, and sessions owned by someone else, are not an error
+        and delete nothing. Raises ``SessionStoreUnavailable`` if deletion
+        can't be confirmed.
         """
+        _require_owner(owner_ref)
         self._check_supported()
         if not self.path.exists():
             return  # nothing to delete; never create the file
 
         def work(connection):
             connection.execute("BEGIN IMMEDIATE")
-            deleted = _run_change(connection, SQL_DELETE_SESSION, {"token_hash": hash_token(token)})
+            deleted = _run_change(
+                connection, SQL_DELETE_SESSION, {"token_hash": hash_token(token), "owner": owner_ref}
+            )
             connection.execute("COMMIT")
             return deleted
 
@@ -584,6 +793,7 @@ class SessionStore:
         token: str,
         request_id: str,
         *,
+        owner_ref: str,
         instance: str,
         keeper_gen: int,
         ttl: float,
@@ -592,16 +802,19 @@ class SessionStore:
     ) -> Lease:
         """Take the session's turn lease and read its history in one transaction.
 
-        Raises ``SessionExpired`` (unknown, deleted or expired), ``SessionBusy``
-        (live lease held by another request) or ``SessionStoreUnavailable``.
+        Only for the session's owner: owned by someone else is the same as
+        unknown. Raises ``SessionExpired`` (unknown, not this owner's, deleted
+        or expired), ``SessionBusy`` (live lease held by another request) or
+        ``SessionStoreUnavailable``.
         """
+        _require_owner(owner_ref)
         self._check_supported()
         if not self.path.exists():
             raise SessionExpired()
         token_hash = hash_token(token)
 
         def classify(connection):
-            row = connection.execute(SQL_LOOKUP, {"token_hash": token_hash}).fetchone()
+            row = connection.execute(SQL_LOOKUP, {"token_hash": token_hash, "owner": owner_ref}).fetchone()
             if row is None or row[2]:
                 raise SessionExpired()
             if row[1]:
@@ -615,7 +828,7 @@ class SessionStore:
                 SQL_ACQUIRE,
                 {
                     "rid": request_id, "inst": instance, "gen": keeper_gen,
-                    "ttl": ttl, "turn_max": turn_max, "sid": session_id,
+                    "ttl": ttl, "turn_max": turn_max, "sid": session_id, "owner": owner_ref,
                 },
             ).fetchall()
             if not rows:  # time moved on between the two statements
@@ -1014,8 +1227,9 @@ class SessionLeaseManager:
 
     # -- requests ------------------------------------------------------------
 
-    def acquire(self, token: str, request_id: str) -> Lease:
-        """Take the session's lease for this request and register it with the keeper."""
+    def acquire(self, token: str, request_id: str, *, owner_ref: str) -> Lease:
+        """Take the owner's session lease for this request and register it with the keeper."""
+        _require_owner(owner_ref)
         with self._admission:
             with self._lock:
                 if not self._accepting:
@@ -1024,6 +1238,7 @@ class SessionLeaseManager:
                 generation = self._generation
             lease = self.store.acquire(
                 token, request_id,
+                owner_ref=owner_ref,
                 instance=self.instance, keeper_gen=generation,
                 ttl=self.ttl, turn_max=self.turn_max, history_turns=self.history_turns,
             )

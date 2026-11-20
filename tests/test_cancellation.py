@@ -6,7 +6,7 @@ import threading
 import pytest
 
 from app.rag import cancellation, vectorstore, workflow
-from tests.conftest import FakeLLM, FakeRetriever, FakeWebSearch, kb_doc, legacy_access_request
+from tests.conftest import FakeLLM, FakeRetriever, FakeWebSearch, kb_doc, legacy_access_request, legacy_owner_ref
 
 
 # ---------------------------------------------------------------------------
@@ -991,7 +991,7 @@ def mark_lease_lost(manager, request_id=None):
 def test_the_manager_reports_turn_expiry_and_lease_loss(sessions_enabled, settings, client):
     token = new_session(client)
     runtime = session_service.get_session_runtime(settings)
-    lease = runtime.manager.acquire(token, "req-lost")
+    lease = runtime.manager.acquire(token, "req-lost", owner_ref=legacy_owner_ref())
     try:
         assert runtime.manager.turn_stop_reason(lease) is None
         mark_lease_lost(runtime.manager, "req-lost")
@@ -1034,8 +1034,8 @@ def test_session_chat_lost_before_its_first_call_makes_none(client, sessions_ena
     runtime = session_service.get_session_runtime(settings)
     real_acquire = runtime.manager.acquire
 
-    def acquire_then_lose(token, request_id):
-        lease = real_acquire(token, request_id)
+    def acquire_then_lose(token, request_id, *, owner_ref):
+        lease = real_acquire(token, request_id, owner_ref=owner_ref)
         mark_lease_lost(runtime.manager, request_id)
         return lease
 

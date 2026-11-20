@@ -20,7 +20,7 @@ from app.api import streaming
 from app.rag.state import EvidenceGrade, RouteDecision
 from app.services import sessions as session_service
 from app.services.audit import get_recent_audits, init_db, write_audit
-from tests.conftest import FakeLLM, FakeRetriever, kb_doc
+from tests.conftest import FakeLLM, FakeRetriever, kb_doc, legacy_owner_ref
 from tests.session_support import find_token
 from tests.stateless_scenarios import SCENARIO_NAMES, load_golden, run_scenario
 from tests.streaming_support import (
@@ -128,7 +128,7 @@ def pre_sse(result, status, code):
 
 async def runtime_acquire(token, request_id):
     rt = session_service.get_session_runtime(app.main.settings)
-    return rt, await asyncio.to_thread(rt.manager.acquire, token, request_id)
+    return rt, await asyncio.to_thread(rt.manager.acquire, token, request_id, owner_ref=legacy_owner_ref())
 
 
 # ===================================================================
@@ -496,7 +496,9 @@ async def test_session_deleted_mid_stream_reports_turn_saved_false(stream_app, s
 
     pending = asyncio.ensure_future(stream(token))
     await wait_event(gate.reached)
-    await asyncio.to_thread(session_service.get_session_runtime(sessions_on).store.delete, token)
+    await asyncio.to_thread(
+        session_service.get_session_runtime(sessions_on).store.delete, token, owner_ref=legacy_owner_ref()
+    )
     gate.release.set()
     result = await pending
     await wait_event(service.started[0].hooks["worker_exited"])
