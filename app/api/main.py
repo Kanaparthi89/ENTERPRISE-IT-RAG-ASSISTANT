@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.api.routes import router
-from app.core.config import get_settings, BASE_DIR
+from app.core.config import get_settings, BASE_DIR, api_docs_options
 from app.core.logging import configure_logging
 from app.services.audit import init_db
 
@@ -46,6 +46,7 @@ app = FastAPI(
     title=settings.app_name,
     version="1.0.0",
     lifespan=lifespan,
+    **api_docs_options(settings),  # Phase D1: off unless API_DOCS_ENABLED=true
 )
 
 

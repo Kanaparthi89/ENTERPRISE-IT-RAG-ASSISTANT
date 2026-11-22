@@ -236,6 +236,28 @@ def origin_allowed(request, origins) -> bool:
     return True
 
 
+def access_route_origin_allowed(request, origins) -> bool:
+    """The cross-site check for POST /api/access and /api/access/logout (Phase D1).
+
+    A request with neither Origin nor Sec-Fetch-Site is a non-browser client
+    (curl, scripts): allowed, since it can't carry a victim's cookie, and every
+    current browser sends at least one of them on a POST. Any browser
+    evidence is checked exactly as for paid routes: each header at most once,
+    Sec-Fetch-Site ``same-origin``, Origin one of ``origins``; and with no
+    configured origins, browser evidence is refused. Host, forwarded headers
+    and Referer are never consulted.
+    """
+    ok_site, fetch_site = _single_header(request, "sec-fetch-site")
+    ok_origin, origin = _single_header(request, "origin")
+    if not (ok_site and ok_origin):
+        return False  # duplicated: ambiguous
+    if fetch_site is None and origin is None:
+        return True  # no browser evidence: a non-browser client
+    if not origins:
+        return False  # browser evidence, but nothing configured to compare it with
+    return origin_allowed(request, origins)
+
+
 def is_json_content_type(request) -> bool:
     """Exactly one ``Content-Type: application/json``, optionally ``; charset=utf-8``."""
     ok, value = _single_header(request, "content-type")

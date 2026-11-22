@@ -42,7 +42,8 @@ PUBLIC = {
     ("GET", "/"): "home",
 }
 APP_MAIN_ONLY = {("GET", "/health"): "health_check"}
-# FastAPI's documentation routes: public on both apps until Phase D disables them in production.
+# FastAPI's documentation routes: absent on both apps unless API_DOCS_ENABLED=true (Phase D1;
+# the opt-in is tested in tests/test_access_origin_security.py).
 DOCS = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
 
 EXPECTED_FLAGS = {
@@ -90,7 +91,7 @@ def test_every_route_is_classified(entry):
     if entry == "app.main":
         expected.update(APP_MAIN_ONLY)
     assert {key: route.endpoint.__name__ for key, route in api.items()} == expected
-    assert docs == DOCS
+    assert docs == set()  # Phase D1: no docs or OpenAPI routes by default
     assert mounts == {"/static"}
     assert other == []  # no websockets, no unclassified routes
 

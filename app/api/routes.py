@@ -10,7 +10,6 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
-from urllib.parse import urlsplit
 from uuid import uuid4
 
 import anyio
@@ -191,33 +190,6 @@ def _session_token(
 ) -> str | None:
     """The raw X-Session-ID value: None when absent, possibly empty when present."""
     return request.headers.get("x-session-id")
-
-
-def _host_and_port(netloc: str, default_port: int) -> tuple[str, int] | None:
-    try:
-        parts = urlsplit(f"//{netloc}")
-        if not parts.hostname:
-            return None
-        return parts.hostname.lower(), parts.port or default_port
-    except ValueError:
-        return None
-
-
-def _origin_matches_host(origin: str, host: str) -> bool:
-    """Same host and port; the scheme is not compared (a TLS proxy may change it)."""
-    origin = origin.strip()
-    if not origin or origin.lower() == "null":
-        return False
-    try:
-        parts = urlsplit(origin)
-    except ValueError:
-        return False
-    if parts.scheme not in ("http", "https"):
-        return False
-    default_port = 443 if parts.scheme == "https" else 80
-    origin_host = _host_and_port(parts.netloc, default_port)
-    request_host = _host_and_port(host.strip(), default_port)
-    return origin_host is not None and origin_host == request_host
 
 
 # An empty body or ``{}`` is all session creation accepts; a longer body is
@@ -1298,12 +1270,18 @@ def _access_config() -> access_service.AccessConfig:
 
 
 def _check_access_origin(request: Request) -> None:
-    """Refuse cross-site browser requests; a form can POST without a preflight."""
-    fetch_site = request.headers.get("sec-fetch-site")
-    if fetch_site is not None and fetch_site.strip().lower() != "same-origin":
-        raise _access_error("origin_not_allowed")
-    origin = request.headers.get("origin")
-    if origin is not None and not _origin_matches_host(origin, request.headers.get("host", "")):
+    """Refuse cross-site browser requests; a form can POST without a preflight (Phase D1).
+
+    The origin authority is PUBLIC_ORIGINS only, never the request's Host,
+    forwarded headers or Referer. Headerless non-browser clients are allowed.
+    A malformed PUBLIC_ORIGINS (only possible if changed at runtime) is
+    treated as empty: browser evidence is then refused.
+    """
+    try:
+        origins = access_policy.public_origins(settings)
+    except access_policy.PublicOriginsError:
+        origins = frozenset()
+    if not access_policy.access_route_origin_allowed(request, origins):
         raise _access_error("origin_not_allowed")
 
 

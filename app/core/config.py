@@ -167,6 +167,12 @@ class Settings(BaseSettings):
     # paid AI routes answer 503. A malformed value refuses to start.
     public_origins: str = ""
 
+    # Security S1-5 Phase D1: FastAPI's interactive docs (/docs, /redoc,
+    # /docs/oauth2-redirect) and the OpenAPI schema (/openapi.json) are off
+    # unless explicitly enabled (local development). Read when the app is
+    # constructed. Strict: only true or false.
+    api_docs_enabled: bool = False
+
     # Security S1-4b: chat quotas (app/services/quota.py). Disabled by default.
     # When enabled, every chat route (stateless and session /api/chat and
     # /api/chat/stream) shares one in-memory quota pool per process: per access
@@ -230,6 +236,7 @@ class Settings(BaseSettings):
         "access_cookie_secure",
         "access_trust_socket_peer",
         "quota_enabled",
+        "api_docs_enabled",
         mode="before",
     )
     @classmethod
@@ -329,6 +336,17 @@ class Settings(BaseSettings):
         self.audit_db_path.parent.mkdir(parents=True, exist_ok=True)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.sample_kb_dir.mkdir(parents=True, exist_ok=True)
+
+
+def api_docs_options(settings) -> dict:
+    """FastAPI constructor options for the docs and OpenAPI routes (Phase D1).
+
+    None disables a route entirely (FastAPI then never registers it, and the
+    OAuth2 redirect page goes with the Swagger UI).
+    """
+    if settings.api_docs_enabled is True:
+        return {"docs_url": "/docs", "redoc_url": "/redoc", "openapi_url": "/openapi.json"}
+    return {"docs_url": None, "redoc_url": None, "openapi_url": None}
 
 
 @lru_cache(maxsize=1)

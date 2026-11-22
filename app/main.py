@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from app.api.routes import router
-from app.core.config import BASE_DIR, get_settings
+from app.core.config import BASE_DIR, api_docs_options, get_settings
 from app.core.logging import configure_logging
 from app.services.audit import init_db
 
@@ -28,6 +28,7 @@ app = FastAPI(
     description="AI-powered internal IT support assistant.",
     version="1.0.0",
     lifespan=lifespan,
+    **api_docs_options(settings),  # Phase D1: off unless API_DOCS_ENABLED=true
 )
 
 @app.get("/health", tags=["Health"])
