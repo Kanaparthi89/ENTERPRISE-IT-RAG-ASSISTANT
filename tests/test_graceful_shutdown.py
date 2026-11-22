@@ -324,11 +324,15 @@ def compose_stop_grace_seconds() -> float:
 def test_dockerfile_sets_the_uvicorn_graceful_shutdown_timeout():
     arguments = dockerfile_command()
 
-    assert arguments[:2] == ["exec", "uvicorn"]
+    # E2B: the runtime environment guard runs first; uvicorn starts only if it succeeds.
+    assert arguments[:4] == ["python", "-I", "scripts/check_runtime_env.py", "&&"]
+    # E2B-R1: uvicorn runs isolated too (python -I; -u -B keep the image's unbuffered/no-bytecode behaviour).
+    assert arguments[4:11] == ["exec", "python", "-I", "-u", "-B", "-m", "uvicorn"]
     assert option(arguments, "--timeout-graceful-shutdown") == str(UVICORN_GRACEFUL_TIMEOUT)
     # The other arguments are unchanged.
     assert [a for a in arguments if a not in ("--timeout-graceful-shutdown", "8")] == [
-        "exec", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${PORT:-8080}", "--no-proxy-headers", "--workers", "1",
+        "python", "-I", "scripts/check_runtime_env.py", "&&",
+        "exec", "python", "-I", "-u", "-B", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${PORT:-8080}", "--no-proxy-headers", "--workers", "1",
         "--lifespan", "on",
     ]
 
