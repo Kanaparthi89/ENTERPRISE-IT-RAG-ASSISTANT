@@ -328,7 +328,7 @@ def test_dockerfile_sets_the_uvicorn_graceful_shutdown_timeout():
     assert option(arguments, "--timeout-graceful-shutdown") == str(UVICORN_GRACEFUL_TIMEOUT)
     # The other arguments are unchanged.
     assert [a for a in arguments if a not in ("--timeout-graceful-shutdown", "8")] == [
-        "exec", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${PORT:-8080}",
+        "exec", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${PORT:-8080}", "--no-proxy-headers",
     ]
 
 
