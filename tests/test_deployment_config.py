@@ -1,4 +1,13 @@
-"""Security S1-5 Phase D2: the container's uvicorn command trusts no forwarded headers.
+"""Security S1-5 Phases D2 and E2A: the container's uvicorn command.
+
+D2: it trusts no forwarded headers. E2A: it runs exactly one worker process,
+which no environment variable (UVICORN_WORKERS, WEB_CONCURRENCY) can change,
+because the in-memory throttles, quotas and the ingest slot are per process.
+E2A-R1: the ASGI lifespan is forced on (UVICORN_LIFESPAN cannot turn it off),
+so the app's startup and shutdown hooks always run: init_db() and the
+sessions lifespan (startup cleanup, lease keeper, graceful session shutdown).
+One worker per container does not mean one DigitalOcean instance: the
+instance count must be checked on the platform.
 
 The Dockerfile's CMD is parsed exactly as uvicorn's own command line parses
 it, turned into the effective ``uvicorn.Config`` and loaded (offline, no
@@ -10,9 +19,16 @@ verified ACCESS_CLIENT_IP_HEADER (app/services/access.py).
 """
 
 import asyncio
+import http.client
 import json
+import os
 import re
 import shlex
+import signal
+import socket
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -21,6 +37,18 @@ from uvicorn.main import main as uvicorn_cli
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 ROOT = Path(__file__).resolve().parents[1]
+# Variables that can change uvicorn's effective configuration from the environment.
+AMBIENT = ("WEB_CONCURRENCY", "FORWARDED_ALLOW_IPS")
+
+
+@pytest.fixture(autouse=True)
+def isolated_uvicorn_environment(monkeypatch):
+    """No ambient UVICORN_*, WEB_CONCURRENCY or FORWARDED_ALLOW_IPS: tests set them explicitly."""
+    for name in list(os.environ):
+        if name.startswith("UVICORN_") or name in AMBIENT:
+            monkeypatch.delenv(name, raising=False)
+
+
 SPOOF = [(b"x-forwarded-for", b"6.6.6.6, 203.0.113.50"), (b"x-forwarded-proto", b"https"),
          (b"x-forwarded-host", b"evil.example"), (b"forwarded", b"for=7.7.7.7;proto=https;host=evil.example")]
 
@@ -118,9 +146,10 @@ def test_the_command_runs_the_production_app_unchanged_except_proxy_headers():
     assert (params["host"], params["port"]) == ("0.0.0.0", 8080)
     assert params["proxy_headers"] is False
     assert params["forwarded_allow_ips"] is None
-    assert params["workers"] is None  # one process, as before (in-memory limits assume it)
+    assert params["workers"] == 1  # E2A: pinned (in-memory limits assume one process)
     assert params["timeout_graceful_shutdown"] == 8
     assert params["reload"] is False
+    assert params["lifespan"] == "on"  # E2A-R1
 
 
 def test_the_port_still_comes_from_the_environment():
@@ -132,7 +161,21 @@ def test_no_flag_reenables_or_widens_proxy_trust():
     assert "--no-proxy-headers" in argv
     assert "--proxy-headers" not in argv
     assert not any(arg.startswith("--forwarded-allow-ips") for arg in argv)
-    assert not any(arg.startswith(("--workers", "--reload", "--root-path")) for arg in argv)
+    assert not any(arg.startswith(("--reload", "--root-path")) for arg in argv)
+
+
+def test_exactly_one_workers_flag_set_to_one():
+    argv = uvicorn_argv()
+    workers = [index for index, arg in enumerate(argv) if arg == "--workers" or arg.startswith("--workers=")]
+    assert len(workers) == 1, "exactly one --workers flag (a duplicate or conflicting one is refused)"
+    assert argv[workers[0]] == "--workers" and argv[workers[0] + 1] == "1"
+
+
+def test_exactly_one_lifespan_flag_set_to_on():
+    argv = uvicorn_argv()
+    lifespan = [index for index, arg in enumerate(argv) if arg == "--lifespan" or arg.startswith("--lifespan=")]
+    assert len(lifespan) == 1, "exactly one --lifespan flag (a duplicate or conflicting one is refused)"
+    assert argv[lifespan[0]] == "--lifespan" and argv[lifespan[0] + 1] == "on"
 
 
 def test_the_rest_of_the_dockerfile_is_unchanged():
@@ -210,3 +253,324 @@ def test_the_throttle_identity_is_the_socket_peer(monkeypatch, settings, env):
     config.load()
     seen_by(config.loaded_app, "127.0.0.1")
     assert captured == {"access": "127.0.0.1", "admin": "127.0.0.1"}
+
+
+# ===========================================================================
+# E2A: one worker, whatever the environment says
+# ===========================================================================
+
+OVERRIDES = {
+    "UVICORN_WORKERS=4": {"UVICORN_WORKERS": "4"},
+    "WEB_CONCURRENCY=4": {"WEB_CONCURRENCY": "4"},
+    "both": {"UVICORN_WORKERS": "4", "WEB_CONCURRENCY": "3"},
+}
+
+
+def resolved_workers(monkeypatch, env, argv=None):
+    """(parsed --workers, effective Config.workers) for the command under ``env``."""
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    params = uvicorn_cli.make_context("uvicorn", list(argv) if argv is not None else uvicorn_argv()).params
+    config = uvicorn.Config("tests.test_deployment_config:echo_app", workers=params["workers"], log_config=None)
+    return params["workers"], config.workers
+
+
+def test_without_overrides_the_effective_worker_count_is_one(monkeypatch):
+    assert resolved_workers(monkeypatch, {}) == (1, 1)
+
+
+@pytest.mark.parametrize("case", list(OVERRIDES))
+def test_the_environment_cannot_raise_the_worker_count(monkeypatch, case):
+    assert resolved_workers(monkeypatch, OVERRIDES[case]) == (1, 1)  # single server.run(): no supervisor
+
+
+@pytest.mark.parametrize("case", list(OVERRIDES))
+def test_control_without_the_flag_the_overrides_take_effect(monkeypatch, case):
+    argv = uvicorn_argv()
+    index = argv.index("--workers")
+    unpinned = argv[:index] + argv[index + 2:]
+    expected = 4 if "UVICORN_WORKERS" in OVERRIDES[case] else int(OVERRIDES[case]["WEB_CONCURRENCY"])
+    parsed, effective = resolved_workers(monkeypatch, OVERRIDES[case], argv=unpinned)
+    assert effective == expected > 1  # what the pin prevents
+    if "UVICORN_WORKERS" not in OVERRIDES[case]:
+        assert parsed is None  # WEB_CONCURRENCY is invisible to the CLI: only Config shows it
+
+
+# ---------------------------------------------------------------------------
+# A real uvicorn process, started with the Dockerfile's exact command
+# ---------------------------------------------------------------------------
+
+async def lifespan_echo_app(scope, receive, send):
+    """A minimal app that also speaks the lifespan protocol, so shutdown is observable."""
+    if scope["type"] == "lifespan":
+        while True:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                await send({"type": "lifespan.startup.complete"})
+            elif message["type"] == "lifespan.shutdown":
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+    await echo_app(scope, receive, send)
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def run_real_server(env_extra, *, script=None, timeout=30.0):
+    """Start ``sh -c <CMD>`` (app target swapped for lifespan_echo_app), make one request, SIGTERM it.
+
+    Returns (status of GET /, the process's log lines, its exit code).
+    """
+    shell, flag, cmd_script = dockerfile_cmd()
+    assert (shell, flag) == ("sh", "-c")
+    port = _free_port()
+    script = (script or cmd_script).replace("app.main:app", "tests.test_deployment_config:lifespan_echo_app")
+    env = {
+        "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
+        "PORT": str(port),
+        "PYTHONPATH": str(ROOT),
+        "HOME": str(ROOT / "data"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        **env_extra,
+    }
+    process = subprocess.Popen([shell, flag, script], cwd=ROOT, env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    status = None
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and process.poll() is None:
+            try:
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+                connection.request("GET", "/")
+                status = connection.getresponse().status
+                connection.close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        time.sleep(0.3)  # let any further worker processes start and log
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+        try:
+            output, _ = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            output, _ = process.communicate()
+    return status, [line.strip() for line in output.splitlines() if line.strip()], process.returncode
+
+
+GRACEFUL = ("Shutting down", "Waiting for application shutdown.", "Application shutdown complete.", "Finished server process")
+
+
+def test_a_real_process_runs_one_server_under_both_overrides_and_shuts_down_gracefully():
+    status, log, returncode = run_real_server({"UVICORN_WORKERS": "4", "WEB_CONCURRENCY": "4", "FORWARDED_ALLOW_IPS": "*"})
+    assert status == 200, log
+    # uvicorn re-raises the captured SIGTERM after a complete graceful shutdown
+    # (Server.capture_signals): exit by that signal, not a crash or a SIGKILL.
+    assert returncode == -signal.SIGTERM, (returncode, log)
+    assert sum("Started server process" in line for line in log) == 1, log
+    assert not any("Started parent process" in line for line in log), log
+    for marker in GRACEFUL:
+        assert any(marker in line for line in log), (marker, log)
+
+
+def test_control_a_real_process_without_the_flag_becomes_multi_process():
+    _, _, script = dockerfile_cmd()
+    unpinned = script.replace(" --workers 1", "")
+    assert unpinned != script
+    status, log, _ = run_real_server({"WEB_CONCURRENCY": "2"}, script=unpinned)
+    assert status == 200, log
+    assert any("Started parent process" in line for line in log), log  # what the pin prevents
+
+
+# ===========================================================================
+# E2A: .env.example is an accurate, read-only development template
+# ===========================================================================
+
+ENV_EXAMPLE = ROOT / ".env.example"
+ASSIGNMENT = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
+DOCUMENTED = re.compile(r"\b([A-Z][A-Z0-9_]{2,})=")
+
+
+def template_settings_class():
+    """Settings that read ONLY .env.example: no real .env, no environment variables, no secret files."""
+    from pydantic_settings import SettingsConfigDict
+
+    from app.core import config
+
+    class TemplateSettings(config.Settings):
+        model_config = SettingsConfigDict(**{**config.Settings.model_config, "env_file": str(ENV_EXAMPLE)})
+
+        @classmethod
+        def settings_customise_sources(cls, settings_cls, init_settings, env_settings, dotenv_settings,
+                                       file_secret_settings):
+            return (init_settings, dotenv_settings)
+
+    return TemplateSettings
+
+
+def uncommented_assignments() -> dict:
+    found = {}
+    for line in ENV_EXAMPLE.read_text().splitlines():
+        match = ASSIGNMENT.match(line)
+        if match:
+            assert match.group(1) not in found, f"{match.group(1)} assigned twice"
+            found[match.group(1)] = match.group(2)
+    return found
+
+
+def test_the_template_parses_with_the_real_settings_and_ignores_the_environment(monkeypatch):
+    # Hostile environment: proves only the file is read.
+    for name, value in (("ACCESS_ENABLED", "true"), ("QUOTA_ENABLED", "true"), ("APP_ENV", "production"),
+                        ("OPENAI_API_KEY", "sk-from-the-environment")):
+        monkeypatch.setenv(name, value)
+    template = template_settings_class()()
+    assert template.access_enabled is False and template.quota_enabled is False
+    assert template.app_env == "development"
+    assert template.openai_api_key.get_secret_value() == ""
+
+
+def test_every_name_in_the_template_is_a_real_setting():
+    from app.core.config import Settings
+
+    fields = {name.upper() for name in Settings.model_fields}
+    uncommented = set(uncommented_assignments())
+    documented = set(DOCUMENTED.findall(ENV_EXAMPLE.read_text()))
+    assert uncommented <= fields, uncommented - fields
+    assert documented <= fields, documented - fields  # commented examples are accurate too
+
+
+def test_every_uncommented_value_is_a_line_of_its_own():
+    # No inline comments after values: a value like "false  # note" would be read differently by tools.
+    for name, value in uncommented_assignments().items():
+        assert "#" not in value, name
+
+
+def test_the_template_keeps_every_paid_or_risky_feature_off():
+    from app.services import access_policy, admin_auth
+
+    template = template_settings_class()()
+    for flag in ("access_enabled", "quota_enabled", "sessions_enabled", "stream_enabled", "voice_enabled",
+                 "voice_transcription_enabled", "api_docs_enabled"):
+        assert getattr(template, flag) is False, flag
+    assert template.public_origins == ""
+    assert access_policy.configuration_problem(template) is not None  # read-only: paid routes answer 503
+    assert admin_auth.key_status(template) == admin_auth.MISSING  # ingestion off
+
+
+# Provider key prefixes, a hex digest, or a long token mixing letters and digits (as generated secrets do).
+SECRET_LIKE = re.compile(
+    r"sk-[A-Za-z0-9_-]{8,}|pcsk_|tvly-|\b[0-9a-f]{64}\b"
+    r"|(?=[A-Za-z0-9_-]*[0-9])(?=[A-Za-z0-9_-]*[a-z])(?=[A-Za-z0-9_-]*[A-Z])[A-Za-z0-9_-]{32,}"
+)
+
+
+def test_the_secret_scan_would_catch_a_planted_secret():
+    for planted in ("Zq8Wm3Kx7Pv2Ty9Lr4Nb6Hc1Jd5Fg0SeQ", "sk-proj-abcdef0123456789", "a" * 32 + "0" * 32,
+                    "D1-origin-secret-Zq8Wm3Kx7Pv2Ty9Lr4Nb6Hc1Jd5Fg0Se", "pcsk_example", "tvly-example"):
+        assert SECRET_LIKE.search(f"ADMIN_API_KEY={planted}"), planted
+    assert not SECRET_LIKE.search("# " + "-" * 75 + "\nQUOTA_ENABLED=false\n")
+
+
+def test_no_secret_has_a_value_in_the_template():
+    from pydantic import SecretStr
+
+    from app.core.config import Settings
+
+    template = template_settings_class()()
+    secrets_fields = [name for name, field in Settings.model_fields.items() if field.annotation is SecretStr]
+    assert set(secrets_fields) >= {"openai_api_key", "pinecone_api_key", "tavily_api_key", "admin_api_key",
+                                   "access_cookie_secret", "access_cookie_previous_secrets"}
+    for name in secrets_fields:
+        assert getattr(template, name).get_secret_value() == "", name
+    assert template.access_code_hashes == ""
+    text = ENV_EXAMPLE.read_text()
+    assert not SECRET_LIKE.search(text)
+
+
+def test_the_documented_quota_deadlines_actually_satisfy_the_quota_checks():
+    from app.services import quota_runtime
+
+    text = ENV_EXAMPLE.read_text()
+    documented = {name: value for name, value in re.findall(r"\b([A-Z][A-Z0-9_]+)=(\d+)\b", text)}
+    required = ("CHAT_DEADLINE_SECONDS", "STREAM_TIMEOUT_SECONDS", "OPENAI_TIMEOUT_SECONDS", "OPENAI_MAX_RETRIES",
+                "SESSION_TURN_MAX_SECONDS", "PINECONE_RETRY_AFTER_MAX_SECONDS")
+    assert set(required) <= set(documented), set(required) - set(documented)
+    template = template_settings_class()(quota_enabled=True, **{name.lower(): int(documented[name]) for name in required})
+    quota_runtime.check_settings(template)  # raises if the documented values were wrong
+
+
+def test_the_template_documents_the_deployment_requirements():
+    text = ENV_EXAMPLE.read_text()
+    lowered = text.lower()
+    assert "development" in lowered and "not production-safe" in lowered
+    assert "one worker" in lowered and "one instance" in lowered
+    assert "ACCESS_TRUST_SOCKET_PEER" in text and "never true behind" in lowered
+    assert "no authentication or rate limit" not in lowered  # the stale transcription warning is gone
+    assert "do-connecting-ip" in text and "verif" in lowered
+    # E2A-R1: every uvicorn environment variable is warned against, and the reset on restart is explained.
+    assert "NO UVICORN_* and NO WEB_CONCURRENCY" in text
+    assert "worker variables" not in lowered  # the narrower, earlier wording
+    assert "reset" in lowered and "restart" in lowered and "redeploy" in lowered
+    # Session caps are SQLite row counts (app/services/sessions.py), not in-memory counters.
+    in_memory = text[text.index("are kept in\n# memory, PER PROCESS") - 80:text.index("are kept in\n# memory, PER PROCESS")]
+    assert "session" not in in_memory.lower()
+    assert "Sessions and their caps live in a local SQLite file" in text
+
+
+# ===========================================================================
+# E2A-R1: the lifespan is always on, whatever the environment says
+# ===========================================================================
+
+def resolved_lifespan(monkeypatch, env, argv=None):
+    """(parsed --lifespan, effective Config.lifespan) for the command under ``env``."""
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    params = uvicorn_cli.make_context("uvicorn", list(argv) if argv is not None else uvicorn_argv()).params
+    config = uvicorn.Config("tests.test_deployment_config:echo_app", lifespan=params["lifespan"], log_config=None)
+    return params["lifespan"], config.lifespan
+
+
+def test_the_effective_configuration_enables_the_lifespan(monkeypatch):
+    assert resolved_lifespan(monkeypatch, {}) == ("on", "on")
+
+
+@pytest.mark.parametrize("value", ["off", "auto"])
+def test_uvicorn_lifespan_cannot_override_the_flag(monkeypatch, value):
+    assert resolved_lifespan(monkeypatch, {"UVICORN_LIFESPAN": value}) == ("on", "on")
+
+
+def test_control_without_the_flag_uvicorn_lifespan_off_takes_effect(monkeypatch):
+    argv = uvicorn_argv()
+    index = argv.index("--lifespan")
+    unpinned = argv[:index] + argv[index + 2:]
+    assert resolved_lifespan(monkeypatch, {"UVICORN_LIFESPAN": "off"}, argv=unpinned) == ("off", "off")
+
+
+LIFESPAN_STARTUP = ("Waiting for application startup.", "Application startup complete.")
+HOSTILE = {"UVICORN_WORKERS": "4", "WEB_CONCURRENCY": "4", "UVICORN_LIFESPAN": "off", "FORWARDED_ALLOW_IPS": "*"}
+
+
+def test_a_real_process_runs_the_lifespan_hooks_under_a_hostile_environment():
+    status, log, returncode = run_real_server(HOSTILE)
+    assert status == 200, log
+    assert returncode == -signal.SIGTERM, (returncode, log)
+    assert sum("Started server process" in line for line in log) == 1, log
+    for marker in LIFESPAN_STARTUP + GRACEFUL:
+        assert any(marker in line for line in log), (marker, log)
+    # Order: startup completes before the request, shutdown completes after "Shutting down".
+    index = {marker: next(i for i, line in enumerate(log) if marker in line) for marker in LIFESPAN_STARTUP + GRACEFUL}
+    assert index["Application startup complete."] < index["Shutting down"] < index["Application shutdown complete."]
+
+
+def test_control_a_real_process_without_the_flag_skips_the_lifespan():
+    _, _, script = dockerfile_cmd()
+    unpinned = script.replace(" --lifespan on", "")
+    assert unpinned != script
+    status, log, _ = run_real_server({"UVICORN_LIFESPAN": "off"}, script=unpinned)
+    assert status == 200, log
+    for marker in LIFESPAN_STARTUP + ("Waiting for application shutdown.", "Application shutdown complete."):
+        assert not any(marker in line for line in log), (marker, log)  # what the pin prevents
