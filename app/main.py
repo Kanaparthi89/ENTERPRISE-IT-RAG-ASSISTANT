@@ -10,6 +10,7 @@ from fastapi.templating import Jinja2Templates
 from app.api.routes import router
 from app.core.config import BASE_DIR, api_docs_options, get_settings
 from app.core.logging import configure_logging
+from app.core.security_headers import install_security_headers
 from app.services.audit import init_db
 
 
@@ -30,6 +31,7 @@ app = FastAPI(
     lifespan=lifespan,
     **api_docs_options(settings),  # Phase D1: off unless API_DOCS_ENABLED=true
 )
+install_security_headers(app, settings)  # Security S2b: on every response, 500s included
 
 @app.get("/health", tags=["Health"])
 def health_check():

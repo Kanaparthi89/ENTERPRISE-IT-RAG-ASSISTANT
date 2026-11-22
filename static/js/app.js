@@ -151,6 +151,92 @@
     }
   }
 
+  // Security S2 (LOW-1): answers can contain web-search content, so the Markdown
+  // HTML is sanitized with an explicit allowlist, not DOMPurify's default profile
+  // (which keeps forms, inputs, buttons, <style>, SVG, MathML, images, style/id/
+  // name/class attributes). Only the formatting marked produces is kept; links
+  // must be http(s) or mailto. Anything outside the list is removed (its text is
+  // kept). If either library is missing, unsupported or fails, the answer is
+  // shown as plain text: unsanitized HTML is never inserted.
+  const MARKDOWN_SANITIZE_CONFIG = Object.freeze({
+    ALLOWED_TAGS: Object.freeze([
+      "p", "br", "hr", "h1", "h2", "h3", "h4", "h5", "h6", "strong", "em", "del",
+      "code", "pre", "blockquote", "ul", "ol", "li", "a",
+      "table", "thead", "tbody", "tr", "th", "td",
+    ]),
+    ALLOWED_ATTR: Object.freeze(["href", "title", "start", "align"]),
+    ALLOWED_URI_REGEXP: /^(?:https?:|mailto:)/i,
+    // DOMPurify checks every attribute not on its built-in URI-safe list against
+    // ALLOWED_URI_REGEXP, which would drop align="left" and start="3" (B1). They
+    // are not URLs; their values are checked by enforceSafeAttributeValues().
+    ADD_URI_SAFE_ATTR: Object.freeze(["align", "start"]),
+    ALLOW_DATA_ATTR: false,
+    ALLOW_ARIA_ATTR: false,
+    ALLOW_UNKNOWN_PROTOCOLS: false,
+    SANITIZE_DOM: true,
+    SANITIZE_NAMED_PROPS: true,
+    WHOLE_DOCUMENT: false,
+    RETURN_DOM: false,
+    RETURN_DOM_FRAGMENT: false,
+  });
+
+  // Allowed values for the two non-URL attributes, and the only tags they may sit on.
+  // Anything else is removed after sanitizing (a DOM pass, not a global DOMPurify hook).
+  const SAFE_ATTRIBUTE_VALUES = Object.freeze({
+    align: Object.freeze({ tags: Object.freeze(["th", "td"]), pattern: /^(?:left|center|right)$/ }),
+    start: Object.freeze({ tags: Object.freeze(["ol"]), pattern: /^[0-9]{1,9}$/ }),
+  });
+
+  function enforceSafeAttributeValues(root) {
+    // Walks every element under root (not only the allowed tags), without selectors.
+    const pending = [...(root.children || [])];
+    while (pending.length) {
+      const node = pending.pop();
+      if (!node || typeof node.tagName !== "string") continue; // text nodes
+      pending.push(...(node.children || []));
+      const tag = node.tagName.toLowerCase();
+      for (const [name, rule] of Object.entries(SAFE_ATTRIBUTE_VALUES)) {
+        if (!node.hasAttribute(name)) continue;
+        if (!rule.tags.includes(tag) || !rule.pattern.test(node.getAttribute(name))) {
+          node.removeAttribute(name);
+        }
+      }
+    }
+  }
+
+  function renderAnswerMarkdown(target, text) {
+    const markdown = window.marked;
+    const purify = window.DOMPurify;
+    const usable =
+      markdown && typeof markdown.parse === "function" &&
+      purify && purify.isSupported !== false && typeof purify.sanitize === "function";
+    if (usable) {
+      try {
+        const parsed = markdown.parse(text);
+        const html = typeof parsed === "string" ? purify.sanitize(parsed, MARKDOWN_SANITIZE_CONFIG) : null;
+        if (typeof html === "string") {
+          target.innerHTML = html;
+          enforceSafeAttributeValues(target);
+          for (const link of target.querySelectorAll("a")) {
+            link.rel = "noopener noreferrer nofollow";
+          }
+          return "markdown";
+        }
+      } catch (error) {
+        // Fall through to plain text.
+      }
+    }
+    target.textContent = text;
+    return "text";
+  }
+
+  window.BluePeakMarkdown = Object.freeze({
+    sanitizeConfig: MARKDOWN_SANITIZE_CONFIG,
+    safeAttributeValues: SAFE_ATTRIBUTE_VALUES,
+    enforceSafeAttributeValues,
+    render: renderAnswerMarkdown,
+  });
+
   function addAssistantAnswer(answer, citations) {
     const message = document.createElement("article");
     message.className = "message assistant";
@@ -172,13 +258,7 @@
       "$1"
     );
 
-    if (window.marked && window.DOMPurify) {
-      answerText.innerHTML = window.DOMPurify.sanitize(
-        window.marked.parse(normalizedAnswer)
-      );
-    } else {
-      answerText.textContent = normalizedAnswer;
-    }
+    renderAnswerMarkdown(answerText, normalizedAnswer);
 
     bubble.appendChild(answerText);
     const validCitations = Array.isArray(citations) ? citations : [];

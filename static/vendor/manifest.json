@@ -1,0 +1,62 @@
+{
+  "description": "Third-party browser libraries served from this origin (Security S2a). Files are byte-identical copies from the official npm registry tarballs, verified against each tarball's dist.integrity before extraction. Update procedure: download the new tarball from registry.npmjs.org, verify its SHA-512 against dist.integrity, copy the files unchanged into a new version-named folder, update templates/index.html and this manifest, and run tests/test_vendor_assets.py and tests/js/vendor-globals.test.mjs.",
+  "packages": [
+    {
+      "package": "marked",
+      "version": "18.2.1",
+      "license": "MIT",
+      "tarball": "https://registry.npmjs.org/marked/-/marked-18.2.1.tgz",
+      "npm_integrity": "sha512-ii4bxCTCqqwpT86XZWgJNs+ZnAIZksmLGYMViWA7PDIXYIeNo1x6cDdX3JOip9NM/cI6p8z57FxliACboTruMA==",
+      "files": [
+        {
+          "role": "script",
+          "source_path": "package/lib/marked.umd.js",
+          "vendored_path": "static/vendor/marked-18.2.1/marked.umd.js",
+          "served_at": "/static/vendor/marked-18.2.1/marked.umd.js",
+          "browser_global": "marked",
+          "bytes": 52941,
+          "sha384": "sha384-eGsnYqMR1DwKM8Hap0jzlzZulA9iLneQ1yxDuryiYhQd2xn7qVXF+6yXoP7plj95"
+        },
+        {
+          "role": "license",
+          "source_path": "package/LICENSE",
+          "vendored_path": "static/vendor/marked-18.2.1/LICENSE",
+          "bytes": 2942,
+          "sha384": "sha384-61EZB/aHzoKVT71zYfgKtxFiu+RWPSi9UH34kVJPMyzaTcFdbvH0liFiUwpiBNqY"
+        }
+      ]
+    },
+    {
+      "package": "dompurify",
+      "version": "3.4.18",
+      "license": "(MPL-2.0 OR Apache-2.0)",
+      "tarball": "https://registry.npmjs.org/dompurify/-/dompurify-3.4.18.tgz",
+      "npm_integrity": "sha512-ofe3wI/uNm68HInABYFJYqQxRw1EaKAjNdrFVKqjUY+UZurvNd2L/HuQe097s/4RivWiZyP6tT7aoT8atjfhwg==",
+      "files": [
+        {
+          "role": "script",
+          "source_path": "package/dist/purify.min.js",
+          "vendored_path": "static/vendor/dompurify-3.4.18/purify.min.js",
+          "served_at": "/static/vendor/dompurify-3.4.18/purify.min.js",
+          "browser_global": "DOMPurify",
+          "bytes": 29298,
+          "sha384": "sha384-lkArbWjiZKuE+bzKbj1vOEF7DKYBDNvgwZMCt5OH8bdRB92zpzyNska9Q/XKPHQD"
+        },
+        {
+          "role": "license",
+          "source_path": "package/LICENSE",
+          "vendored_path": "static/vendor/dompurify-3.4.18/LICENSE",
+          "bytes": 11358,
+          "sha384": "sha384-II9e1ieUDl5AxyiVq3/FflTua1Sr0kMJ25e6imG7rXg7SiAsA2VemsvEqVsLqM7/"
+        },
+        {
+          "role": "license",
+          "source_path": "package/LICENSE-MPL",
+          "vendored_path": "static/vendor/dompurify-3.4.18/LICENSE-MPL",
+          "bytes": 16726,
+          "sha384": "sha384-m9HqVkzbVdcSnUlv/HEUIkMOdpyVFRFBRcAv/ucPmo4Th4y5ATdTfxBvFFZ+k4xe"
+        }
+      ]
+    }
+  ]
+}
