@@ -221,19 +221,54 @@
             </div>
           </div>
 
-          <button
-            class="text-button"
-            type="button"
-            id="clearChat"
-            title="Start a fresh conversation"
-          >
-            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-              <path d="M4 7h16M10 11v6m4-6v6M6 7l1 13h10l1-13M9 7V4h6v3"
-                stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-            New chat
-          </button>
+          <div class="conversation-actions">
+            <!-- Voice V1: shown only when GET /api/voice/status reports {"tts": true}. -->
+            <button
+              class="text-button voice-toggle"
+              type="button"
+              id="voiceToggle"
+              aria-pressed="false"
+              aria-describedby="voiceHint"
+              hidden
+            >
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M4 10v4h4l5 4V6L8 10H4Zm12.5-1.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"
+                  stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              Read answers aloud
+            </button>
+
+            <button
+              class="text-button voice-stop"
+              type="button"
+              id="voiceStop"
+              hidden
+            >
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <rect x="7" y="7" width="10" height="10" rx="1.5" stroke="currentColor" stroke-width="1.6"/>
+              </svg>
+              Stop speaking
+            </button>
+
+            <button
+              class="text-button"
+              type="button"
+              id="clearChat"
+              title="Start a fresh conversation"
+            >
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M4 7h16M10 11v6m4-6v6M6 7l1 13h10l1-13M9 7V4h6v3"
+                  stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              New chat
+            </button>
+          </div>
         </div>
+
+        <span id="voiceHint" class="sr-only">
+          Reads completed answers aloud with this device's voices. Turn off if you use a screen reader.
+        </span>
+        <p id="voiceStatus" class="voice-status" role="status" aria-live="polite"></p>
 
         <section id="chat" class="chat-area" aria-live="polite" aria-label="Chat messages">
           <div class="welcome-state">
@@ -335,6 +370,21 @@
               </div>
 
               <div class="composer-actions">
+                <!-- Voice V3b: shown, with #dictationNote, only when dictation is confirmed available. -->
+                <button
+                  class="dictate-btn"
+                  type="button"
+                  id="dictateBtn"
+                  data-state="idle"
+                  aria-describedby="dictationNote"
+                  hidden
+                >
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Zm-6 9a6 6 0 0 0 12 0M12 18v3"
+                      stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  <span class="dictate-label">Dictate</span>
+                </button>
                 <span class="character-count" id="characterCount">0 / 3000</span>
                 <button type="submit" class="send-btn" id="sendBtn">
                   <span>Ask agent</span>
@@ -346,6 +396,13 @@
               </div>
             </div>
           </form>
+
+          <!-- Voice V3b: the privacy note is shown together with #dictateBtn, before any recording. -->
+          <p id="dictationNote" class="dictation-note" hidden>
+            Dictation sends your recording to OpenAI for transcription. This app doesn't store the audio.
+            The text is added to your question for you to review; it isn't sent automatically.
+          </p>
+          <p id="dictationStatus" class="dictation-status" role="status" aria-live="polite"></p>
 
           <p class="disclaimer">
             AI-generated responses may need verification. Follow your organization's security policies.
@@ -521,8 +578,11 @@
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+  <script src="/static/vendor/marked-18.2.1/marked.umd.js"></script>
+  <script src="/static/vendor/dompurify-3.4.18/purify.min.js"></script>
+  <script src="/static/js/chat-stream.js"></script>
+  <script src="/static/js/voice.js"></script>
+  <script src="/static/js/recorder.js"></script>
   <script src="/static/js/app.js"></script>
 </body>
 </html>

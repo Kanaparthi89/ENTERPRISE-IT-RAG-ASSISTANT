@@ -95,6 +95,12 @@ class AgentState(TypedDict):
     retry_count: int
     trace: list[str]
 
+    # Conversation sessions (A2). Present only for follow-up questions:
+    # earlier saved turns (untrusted context) and the self-contained
+    # question derived from them.
+    history: NotRequired[list[dict[str, str]]]
+    standalone_question: NotRequired[str]
+
 
 class AgentStateUpdate(TypedDict):
     """Optional partial state updates returned by individual nodes."""
@@ -110,3 +116,4 @@ class AgentStateUpdate(TypedDict):
     citations: NotRequired[list[dict[str, Any]]]
     retry_count: NotRequired[int]
     trace: NotRequired[list[str]]
+    standalone_question: NotRequired[str]

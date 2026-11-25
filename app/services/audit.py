@@ -4,6 +4,9 @@
 import json
 import logging
 import sqlite3
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -27,7 +30,7 @@ CREATE TABLE IF NOT EXISTS query_audit (
 )
 """
 
-_ALLOWED_STATUSES = {"success", "failed", "insufficient_evidence"}
+_ALLOWED_STATUSES = {"success", "failed", "insufficient_evidence", "cancelled"}
 
 
 def _database_path() -> Path:
@@ -48,9 +51,25 @@ def _connect() -> sqlite3.Connection:
     return connection
 
 
+@contextmanager
+def _transaction() -> Iterator[sqlite3.Connection]:
+    """Run one transaction on a fresh connection and always close it.
+
+    The connection's own context manager commits on success and rolls back
+    on error, but it does not close the connection. Closing explicitly keeps
+    file handles from accumulating until garbage collection.
+    """
+    connection = _connect()
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
 def init_db() -> None:
     """Create the audit table and add supported columns to older databases."""
-    with _connect() as connection:
+    with _transaction() as connection:
         connection.execute(_SCHEMA)
 
         existing_columns = {
@@ -65,6 +84,9 @@ def init_db() -> None:
             "citation_json": "TEXT NOT NULL DEFAULT '[]'",
             "status": "TEXT NOT NULL DEFAULT 'success'",
             "error_type": "TEXT",
+            # A2: the internal session UUID (never the bearer token); NULL for
+            # stateless requests. Deleting a session never touches audit rows.
+            "session_id": "TEXT",
         }
 
         for column, definition in migrations.items():
@@ -87,6 +109,29 @@ def init_db() -> None:
             """
         )
 
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_query_audit_session_id
+            ON query_audit(session_id)
+            """
+        )
+
+
+def _check_session_id(session_id: str | None) -> None:
+    """Accept only an internal session ID: a canonical lowercase UUID.
+
+    This keeps a raw bearer token from ever being stored by mistake. The
+    error message never includes the rejected value.
+    """
+    if session_id is None:
+        return
+    try:
+        canonical = str(uuid.UUID(session_id)) if isinstance(session_id, str) else None
+    except ValueError:
+        canonical = None
+    if canonical is None or canonical != session_id:
+        raise ValueError("Audit session_id must be an internal session ID.")
+
 
 def write_audit(
     question: str,
@@ -97,12 +142,19 @@ def write_audit(
     citations: list[dict[str, Any]] | None = None,
     status: str = "success",
     error_type: str | None = None,
+    session_id: str | None = None,
 ) -> int:
     """Persist an audit event and return its database row ID.
 
     Avoid passing secrets, authentication tokens, or sensitive personal
     information in questions, traces, citations, or error messages.
+
+    ``session_id`` is the internal session UUID for session requests (never
+    the bearer token); omit it for stateless requests, which are written
+    exactly as before.
     """
+    _check_session_id(session_id)
+
     if not isinstance(question, str) or not question.strip():
         raise ValueError("Audit question must not be empty.")
 
@@ -125,7 +177,30 @@ def write_audit(
     except (TypeError, ValueError) as exc:
         raise ValueError("Trace and citations must be JSON serializable.") from exc
 
-    with _connect() as connection:
+    if session_id is not None:
+        with _transaction() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO query_audit (
+                    request_id, created_at, question, source_used, trace_json,
+                    citation_json, status, error_type, session_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id, created_at, question.strip(), source_used.strip(),
+                    trace_json, citation_json, status, error_type, session_id,
+                ),
+            )
+            audit_id = cursor.lastrowid
+        logger.info(
+            "Audit event recorded: id=%s source=%s status=%s session=%s",
+            audit_id, source_used, status, session_id,
+        )
+        return audit_id
+
+    # Stateless requests: the original statement, unchanged.
+    with _transaction() as connection:
         cursor = connection.execute(
             """
             INSERT INTO query_audit (
@@ -168,11 +243,11 @@ def get_recent_audits(limit: int = 20) -> list[dict[str, Any]]:
     if not 1 <= limit <= 500:
         raise ValueError("limit must be between 1 and 500.")
 
-    with _connect() as connection:
+    with _transaction() as connection:
         rows = connection.execute(
             """
             SELECT id, request_id, created_at, question, source_used,
-                   trace_json, citation_json, status, error_type
+                   trace_json, citation_json, status, error_type, session_id
             FROM query_audit
             ORDER BY id DESC
             LIMIT ?

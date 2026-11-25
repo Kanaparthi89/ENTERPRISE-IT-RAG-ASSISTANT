@@ -1,4 +1,7 @@
 {
+  "scripts": {
+    "test:js": "node --test \"tests/js/*.test.mjs\""
+  },
   "dependencies": {
     "dompurify": "^3.4.16",
     "marked": "^18.1.0"

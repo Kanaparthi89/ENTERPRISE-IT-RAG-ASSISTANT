@@ -673,6 +673,43 @@ textarea:focus-visible,
   height: 14px;
 }
 
+/* Voice V1: "Read answers aloud", "Stop speaking" and their status line */
+
+.conversation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* .text-button sets display, which would override the hidden attribute. */
+.voice-toggle[hidden],
+.voice-stop[hidden] {
+  display: none;
+}
+
+.voice-toggle[aria-pressed="true"] {
+  color: var(--primary);
+  border-color: #cfcfff;
+  background: #f5f5ff;
+}
+
+.voice-toggle[aria-busy="true"] {
+  cursor: progress;
+}
+
+/* Always rendered (a live region), empty and zero-height when there is no message. */
+.voice-status {
+  margin: 0 2px;
+  color: var(--muted-dark);
+  font-size: 10px;
+}
+
+.voice-status:not(:empty) {
+  margin-bottom: 8px;
+}
+
 /* =========================================================
    WELCOME SCREEN
    ========================================================= */
@@ -945,6 +982,12 @@ textarea:focus-visible,
   margin: 5px 0 0;
 }
 
+/* Plain text while an answer streams; Markdown replaces it when complete. */
+.bubble .answer-text.streaming {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .bubble a {
   color: var(--primary);
   text-decoration: underline;
@@ -1144,6 +1187,142 @@ textarea:focus-visible,
 .send-btn svg {
   width: 15px;
   height: 15px;
+}
+
+/* Conversation session (A2-7): status line and "not sent" alert */
+.session-notice {
+  margin: 6px 2px 0;
+  color: var(--muted-dark);
+  font-size: 10px;
+}
+
+.session-notice[hidden] {
+  display: none;
+}
+
+.session-alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  padding: 9px 12px;
+  border: 1px solid #f1c9c9;
+  border-radius: 11px;
+  color: #8a2c2c;
+  background: #fdf3f3;
+  font-size: 10px;
+}
+
+.session-alert p {
+  margin: 0;
+}
+
+.session-alert-action {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 0 12px;
+  border: 1px solid currentColor;
+  border-radius: 8px;
+  color: inherit;
+  background: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.session-alert-action:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+/* Voice V3b: "Dictate" button, privacy note and dictation status line */
+.dictate-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 0 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  color: var(--muted-dark);
+  background: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 160ms ease, color 160ms ease;
+}
+
+.dictate-btn:hover:not(:disabled) {
+  color: var(--primary);
+  border-color: #cfcfff;
+}
+
+.dictate-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* .dictate-btn sets display, which would override the hidden attribute. */
+.dictate-btn[hidden],
+.dictation-note[hidden] {
+  display: none;
+}
+
+.dictate-btn[aria-busy="true"] {
+  cursor: progress;
+}
+
+/* Recording: a red dot before the label (the label itself also changes). */
+.dictate-btn[data-state="recording"] {
+  color: #b42318;
+  border-color: #f3b4ad;
+  background: #fff5f4;
+}
+
+.dictate-btn[data-state="recording"]::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: dictation-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes dictation-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.dictation-note {
+  margin: 6px 2px 0;
+  color: var(--muted-dark);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* Always rendered (a live region), empty and zero-height when there is no message. */
+.dictation-status {
+  margin: 0 2px;
+  color: var(--muted-dark);
+  font-size: 10px;
+}
+
+.dictation-status:not(:empty) {
+  margin-top: 6px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dictate-btn[data-state="recording"]::before {
+    animation: none;
+  }
 }
 
 .disclaimer {
@@ -2029,6 +2208,8 @@ textarea:focus-visible,
   }
 
   .conversation-toolbar {
+    flex-wrap: wrap;
+    gap: 8px;
     padding: 12px 0;
   }
 
@@ -2066,6 +2247,11 @@ textarea:focus-visible,
   .send-btn {
     min-height: 35px;
     padding: 0 11px;
+  }
+
+  .dictate-btn {
+    min-height: 35px;
+    padding: 0 10px;
   }
 
   .trace-panel {

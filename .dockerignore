@@ -13,6 +13,10 @@ __pycache__/
 *.pem
 *.key
 *.db
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.db-journal
 *.sqlite
 *.sqlite3
 *.log

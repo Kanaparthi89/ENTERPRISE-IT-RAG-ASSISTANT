@@ -1,0 +1,3 @@
+event: session
+data: {"request_id":"req-1","turn_saved":true,"history_turns_used":1}
+
